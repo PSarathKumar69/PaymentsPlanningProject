@@ -1,0 +1,7 @@
+cd "c:\Users\p.sarathkumar\Desktop\Payments Plan"
+
+python -m uvicorn backend.api.main:app --reload --port 8000
+
+
+python -m scripts.seed_demo
+PAYMENTS_DB_PATH=backend/db/demo.db python -m uvicorn backend.api.main:app --port 8124 --reload

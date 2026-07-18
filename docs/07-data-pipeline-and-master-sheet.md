@@ -1,0 +1,49 @@
+# Data Pipeline & Master Sheet
+
+## Input
+
+The real master Excel has been received: **`data/Vendor's Details.xlsx`** — 83 vendors, 14 months (Apr'25–May'26). This is the actual sheet, not a synthetic stand-in — build and test the database, ingestion, model logic, and weekly/regeneration engine directly against it.
+
+The real sheet has some inherent messiness to design around rather than paper over: month-column headers are a mix of strings (`"Apr-25"`) and Excel datetime objects (a serial date standing in for a month like `"Jun-25"`) — the column-mapping layer (see CLAUDE.md's no-hardcoding rule) needs to normalize both, not assume one type. **Confirmed real typo**: one column is literally labeled `"Nov'26"` but is actually Nov-25 — month header text is not trustworthy; months must be derived by position from the sheet's known start month (Apr-25), not parsed from the header label. The closing-balance column is literally labeled `"As on 31st May'26"` (a moving label, not a fixed name) — map it by position/role, not by matching that exact string. Occasional manual-entry mismatches exist too (e.g. one vendor's weekly split didn't get summed into that row's own Total column) — treat these as known real-world data-entry slips, not bugs to build elaborate reconciliation for; recompute totals from the underlying weekly/monthly figures rather than trusting a hand-typed summary cell.
+
+## Known columns (from the original vendor ledger)
+
+- ERP Code, Vendor Name
+- Opening Balance
+- Monthly Payable (one column per month)
+- Monthly Payment (one column per month)
+- Total Payable, Total Payment
+- Closing Balance
+
+## New columns confirmed present in the real sheet
+
+- **Assigned Week + within-week order** (e.g. `"W2-P3"`): the real sheet packs these into a single column, but they are two different concepts and must be normalized into two separate DB fields at ingestion:
+  - **Assigned Week** (W1-W5) — one column per vendor, not repeated per month. Set manually by Finance; persists until manually changed.
+  - **Within-week execution order** — see `06-weekly-planning-regeneration.md`. This is **always code-computed** (by the scoring/bucket engine), never a manual tag — even though it shows up pre-filled in the current snapshot (Finance filled it in by hand before this tool existed). Going forward, the system computes and writes this, not Finance.
+  - A value of `0` in this column means the vendor wasn't part of that cycle's plan at all (e.g. already fully paid) — not a real week/order value.
+- **Weekly payment breakdown (W1…W5 + Total)**: the real sheet currently shows only **one** such block, for the current/latest cycle — it does not repeat per month yet, because Finance currently builds it by hand once at the start of each month and only keeps the latest. **Going forward, the system generates this breakdown every month, shows it in the UI, and persists every month's version in the database** (not just the latest) — so despite what the current snapshot looks like, treat W1-W5 as repeating per month in both the DB schema and the Excel write-back, matching how Payable/Payment already repeat per month.
+
+## New column NOT in the real sheet, and intentionally not added to Excel
+
+- **Reconsider** (Yes/No) — see `06-weekly-planning-regeneration.md`. Confirmed: this is **database-only**, shown in the UI for Finance to set at each regeneration, and is exempt from the Excel write-back rule in `11-configuration-module.md` — it's scoped to a single regeneration event, not persistent vendor data, so it never gets written into the Excel and no history of past values is kept.
+
+## New column still to be added (not yet in the real sheet)
+
+- **Vendor category** (`Must Pay` / `Commitment` / `Normal`, default `Normal`) — see `05-model3-priority-bucket.md`. Set manually by Finance through the UI once the Configuration module exists; persisted across cycles once set, and written back to Excel per rule 6. `Must Pay` maps to bucket P0, `Commitment` maps to P1, `Normal` vendors get bucketed into P2/P3/P4 by Model 1's score. Don't confuse this with the within-week order value above — they look similar (`P1`, `P2`...) but are unrelated concepts.
+- **Commitment months** — a number, only meaningful for vendors tagged `Commitment`. Set manually by Finance through the UI once the Configuration module exists; used by `04-model2-min-funds-advisory.md` to spread a Commitment vendor's current outstanding balance across that many months. Defaults to `1` (full outstanding due this cycle) until Finance sets it.
+
+**Important**: the weekly (W1-W5) columns that DO go to Excel are a *view* onto the daily payment transaction log (see `12-database.md`'s `payments` table) plus the system's own computed allocation — not an independent figure Finance types in separately. Don't build a parallel path where weekly totals are entered directly and could drift from the daily log.
+
+## Daily updates
+
+Finance pays vendors daily and logs each payment into the system **manually** — there is no file upload, no reconciliation step, and no ERP/accounting-system integration in this build. Don't design the ingestion pipeline around batch file uploads for day-to-day updates; the day-to-day write path is a manual entry action, not a re-upload.
+
+The master Excel itself is re-loaded/refreshed at the start of each month (see `06-weekly-planning-regeneration.md`'s rollover section), not continuously re-uploaded every day.
+
+Separately, Finance can also correct/override vendor data or tags at any time through the Configuration module — those edits write back into the Excel and are logged in an audit trail. See `11-configuration-module.md`. This is distinct from daily payment logging above: one records a payment transaction, the other corrects the underlying data.
+
+## Ledger integrity (applies to every write)
+
+`Closing Balance = Opening Balance + Total Payable − Total Payment` must reconcile exactly, for every vendor, at all times. This held with zero exceptions across 83 vendors and 14 months of real historical data — treat any code path that can violate it as a bug, not an edge case to tolerate.
+
+Payment amount should never exceed `Opening Balance + Payable accrued to date − Payment already made` for a given vendor — i.e., never create a negative liability / effectively "overpay" a vendor.
