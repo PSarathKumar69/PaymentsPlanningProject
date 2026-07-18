@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Databases — generated locally by ingestion/tests, never pushed
+*.db
+*.db.backup_*
+*.db.bak
+demo.db*
+
+# Excel backups the app writes on config edits (docs/11 write-back rule)
+*.xlsx.bak_*
+
+# Real vendor data — never pushed; drop the actual file in data/ locally
+data/*.xlsx
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
