@@ -13,14 +13,27 @@ plan_history.py's is_latest_plan_run()) naturally falls back to treating the
 next-most-recent remaining plan_run as latest once this row is gone — same
 order_by(created_at desc, id desc).first() pattern used everywhere already.
 No special-casing needed here.
+
+Bug fix (this task): deleting a plan_run used to leave any vendor overridden
+IN it still locked (Vendor.override_amount is sticky/vendor-level, untouched
+by deleting the plan_run that reflected it) — so the next generate still
+excluded them, but the "frozen prior Suggested figure" lookup now found no
+plan_run at all to read from and fell back to 0.0, showing a locked vendor
+with nothing allocated. Fix: when the deleted plan_run was the LATEST for
+its model family (i.e. nothing newer still legitimately depends on that
+override), clear Vendor.override_amount for every vendor whose row in THIS
+plan_run actually had an override_amount set. An older plan_run being
+deleted (not the latest) never touches overrides — a newer, undeleted
+plan_run may still be relying on that same override.
 """
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from backend.db.models import AuditLog, PlanAllocation, PlanRun
+from backend.db.models import AuditLog, PlanAllocation, PlanRun, Vendor
 from backend.db.session import SessionLocal
 from backend.shared.enums import ChangeSource
+from backend.shared.plan_history import is_latest_plan_run
 
 from ..schemas.plan_runs import DeletePlanRunResponse
 
@@ -37,6 +50,30 @@ def delete_plan_run(plan_run_id: int):
 
         # Read before the delete below expires/removes these attributes.
         summary = f"model_used={plan_run.model_used}, created_at={plan_run.created_at.isoformat()}"
+        was_latest = is_latest_plan_run(session, plan_run)
+
+        allocations = session.query(PlanAllocation).filter_by(plan_run_id=plan_run_id).all()
+        cleared_override_vendor_ids = []
+        if was_latest:
+            for allocation in allocations:
+                if allocation.override_amount is None:
+                    continue
+                vendor = session.query(Vendor).filter_by(id=allocation.vendor_id).one()
+                if vendor.override_amount is None:
+                    continue
+                old_value = float(vendor.override_amount)
+                vendor.override_amount = None
+                cleared_override_vendor_ids.append(vendor.id)
+                session.add(
+                    AuditLog(
+                        timestamp=datetime.now(),
+                        vendor_id=vendor.id,
+                        field_name="vendor.override_amount",
+                        old_value=str(old_value),
+                        new_value=None,
+                        source=ChangeSource.UI_EDIT.value,
+                    )
+                )
 
         deleted_allocations = (
             session.query(PlanAllocation)
@@ -59,7 +96,11 @@ def delete_plan_run(plan_run_id: int):
             )
         )
         session.commit()
-        return {"plan_run_id": plan_run_id, "deleted_allocations": deleted_allocations}
+        return {
+            "plan_run_id": plan_run_id,
+            "deleted_allocations": deleted_allocations,
+            "cleared_override_vendor_ids": cleared_override_vendor_ids,
+        }
     except Exception:
         session.rollback()
         raise

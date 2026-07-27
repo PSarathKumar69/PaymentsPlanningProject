@@ -10,5 +10,5 @@ router = APIRouter(tags=["payments"])
 
 @router.post("/payments", response_model=LogPaymentResponse)
 def post_payment(body: LogPaymentRequest):
-    status = log_payment(body.vendor_id, body.amount, session=None)
+    status = log_payment(body.vendor_id, body.amount, session=None, note=body.note)
     return {"payment_status": status.value}

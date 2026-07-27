@@ -20,15 +20,14 @@ load_dotenv()
 from .routers import (
     ai_layer,
     audit_log,
+    calendar,
     configuration,
     ingestion,
-    model1,
-    model2,
-    model3,
+    master_data,
+    new_model_2,
     payments,
     plan_allocations,
     plan_runs,
-    regeneration,
     rollover,
     vendors,
     weekly_planning,
@@ -45,16 +44,15 @@ def value_error_handler(request: Request, exc: ValueError):
 
 
 app.include_router(vendors.router)
-app.include_router(model1.router)
-app.include_router(model2.router)
-app.include_router(model3.router)
+app.include_router(calendar.router)
+app.include_router(new_model_2.router)
 app.include_router(weekly_planning.router)
-app.include_router(regeneration.router)
 app.include_router(payments.router)
 app.include_router(plan_allocations.router)
 app.include_router(plan_runs.router)
 app.include_router(configuration.router)
 app.include_router(ingestion.router)
+app.include_router(master_data.router)
 app.include_router(rollover.router)
 app.include_router(audit_log.router)
 app.include_router(ai_layer.router)

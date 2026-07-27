@@ -32,12 +32,21 @@ def model_family_prefix(model_used: str) -> str:
     return match.group(1)
 
 
-def plan_runs_for_model(session, model_number: int):
+def plan_runs_for_model(session, model_number: int, cycle_month=None):
     """Every PlanRun for this model family + the current cycle month
     (_current_cycle_month, same anchor payment_logging.py/rollover.py use),
     oldest first (index 0 = "Plan 1") — the GET history endpoint's ordering
-    contract."""
-    cycle_month = _current_cycle_month(session)
+    contract.
+
+    cycle_month: additive override (docs/14) — every existing caller omits
+    this and gets the exact behavior above, unchanged. New Model 2's own
+    "cycle" is Finance's own picked planning month (backend/api/routers/
+    new_model_2.py), never the ledger-ingestion-anchored
+    _current_cycle_month() every other model still uses — passed in
+    explicitly by that router's own GET /models/5/plan-runs instead of
+    branching on model_number here.
+    """
+    cycle_month = cycle_month if cycle_month is not None else _current_cycle_month(session)
     prefix = f"model{model_number}"
     return (
         session.query(PlanRun)
@@ -47,14 +56,22 @@ def plan_runs_for_model(session, model_number: int):
     )
 
 
-def is_latest_plan_run(session, plan_run: PlanRun) -> bool:
+def is_latest_plan_run(session, plan_run: PlanRun, cycle_month=None) -> bool:
     """Whether plan_run is the latest plan_run in its OWN model family +
     current cycle month — same order_by(created_at desc, id desc).first()
     "latest" pattern used everywhere else (payment_logging.py, model1.py).
     Used by the override-edit guard: editing an override is only allowed on
-    the current latest plan_run for that allocation's model scope."""
+    the current latest plan_run for that allocation's model scope.
+
+    cycle_month: additive override (docs/14), same convention as
+    plan_runs_for_model() above — every existing caller omits this and gets
+    the exact behavior below, unchanged. backend/api/routers/
+    plan_allocations.py passes plan_run.month itself for a New Model 2
+    allocation (whose "cycle" is Finance's own picked planning month, not
+    the ledger-anchored one) instead of special-casing model_number here.
+    """
     prefix = model_family_prefix(plan_run.model_used)
-    cycle_month = _current_cycle_month(session)
+    cycle_month = cycle_month if cycle_month is not None else _current_cycle_month(session)
     latest = (
         session.query(PlanRun)
         .filter(PlanRun.month == cycle_month, PlanRun.model_used.like(f"{prefix}%"))
@@ -66,23 +83,28 @@ def is_latest_plan_run(session, plan_run: PlanRun) -> bool:
 
 def _latest_allocation_any_model(session, vendor_id):
     """The single shared query behind both latest_budget_for_vendor() and
-    latest_priority_for_vendor(): among every plan_run (ANY model family)
-    this cycle month that actually has an allocation row for this vendor,
-    the one with the latest created_at. Returns the PlanAllocation row, or
-    None if this vendor has never appeared in any plan_run this cycle.
+    latest_priority_for_vendor(): among every plan_run that actually has an
+    allocation row for this vendor, the one with the latest created_at.
+    Returns the PlanAllocation row, or None if this vendor has never
+    appeared in any plan_run.
 
     Deliberately per-vendor-aware, not "the single most-recently-created
     plan_run overall regardless of vendor" — a vendor can be absent from
-    the globally-latest plan_run (e.g. override-excluded from Model 1, or
-    already paid_in_full and excluded from a Model 2/3 regeneration), in
-    which case the correct answer is an older run that did include them,
-    not None/zero.
+    the globally-latest plan_run (e.g. override-excluded, or already
+    paid_in_full and excluded from a regeneration), in which case the
+    correct answer is an older run that did include them, not None/zero.
+
+    Deliberately NOT scoped to `_current_cycle_month()` (the ledger-
+    ingestion anchor): New Model 2's own plan_run.month is Finance's picked
+    planning month (docs/14), which can genuinely differ from the ledger's
+    latest ingested month — the single overall-latest allocation for this
+    vendor is always the right one to read, no separate month filter
+    needed (same reasoning as payment_logging.py::_this_cycle_allocation).
     """
-    cycle_month = _current_cycle_month(session)
     latest = (
         session.query(PlanAllocation)
         .join(PlanRun, PlanAllocation.plan_run_id == PlanRun.id)
-        .filter(PlanRun.month == cycle_month, PlanAllocation.vendor_id == vendor_id)
+        .filter(PlanAllocation.vendor_id == vendor_id)
         .order_by(PlanRun.created_at.desc(), PlanRun.id.desc())
         .first()
     )
@@ -122,7 +144,7 @@ def latest_priority_for_vendor(session, vendor_id):
     return allocation.within_week_order if allocation is not None else None
 
 
-def build_plan_run_history_response(session, model_number: int) -> dict:
+def build_plan_run_history_response(session, model_number: int, cycle_month=None) -> dict:
     """Shape returned by GET /models/{n}/plan-runs (model1.py/model2.py/
     model3.py) — see those routers' docstrings for the endpoint contract.
 
@@ -138,10 +160,25 @@ def build_plan_run_history_response(session, model_number: int) -> dict:
     history still has a vendor name/id to look up distribution against.
     (The DB column PlanAllocation.week_distribution_plan still exists
     unchanged, for historical/audit purposes only — just not surfaced here.)
+
+    Bug fix (this task): a vendor Finance has never manually edited a week
+    for (Vendor.week_distribution_plan still None) now falls back to their
+    LATEST plan_run's own row-level default (planner.py/regeneration.py
+    already compute {assigned_week: allocated_amount} fresh every single
+    regeneration — that was always correct, it just never reached this
+    response before). Without this, the planning table's Distribution
+    columns showed nothing at all until Finance manually touched a week,
+    even though a plan had already been suggested. Deliberately still
+    falls back live (not written back onto Vendor.week_distribution_plan
+    anywhere) so it keeps tracking whatever the CURRENT assigned_week/
+    amount is across further regenerations, right up until Finance's own
+    PATCH /plan-allocations/{id}/week-distribution actually sets the sticky
+    field — at which point that frozen value takes over, same as before.
     """
-    plan_runs = plan_runs_for_model(session, model_number)
+    plan_runs = plan_runs_for_model(session, model_number, cycle_month=cycle_month)
 
     vendor_ids: set[int] = set()
+    latest_snapshot_by_vendor: dict[int, dict] = {}
     plan_run_dicts = []
     for plan_run in plan_runs:
         allocations = (
@@ -153,6 +190,10 @@ def build_plan_run_history_response(session, model_number: int) -> dict:
         allocation_dicts = []
         for allocation in allocations:
             vendor_ids.add(allocation.vendor_id)
+            # plan_runs is oldest-first, so this is simply overwritten as we
+            # go — after the loop, only the LATEST plan_run's snapshot per
+            # vendor survives.
+            latest_snapshot_by_vendor[allocation.vendor_id] = allocation.week_distribution_plan
             allocation_dicts.append(
                 {
                     "plan_allocation_id": allocation.id,
@@ -162,6 +203,15 @@ def build_plan_run_history_response(session, model_number: int) -> dict:
                     "allocated_amount": float(allocation.allocated_amount),
                     "override_amount": (
                         float(allocation.override_amount) if allocation.override_amount is not None else None
+                    ),
+                    # Frozen denominator (this task's fix) — lets the
+                    # frontend compute Suggested %/Override % for every
+                    # historical plan_run, not just whichever one is still
+                    # in the browser's live "rich" cache.
+                    "required_amount_snapshot": (
+                        float(allocation.required_amount_snapshot)
+                        if allocation.required_amount_snapshot is not None
+                        else None
                     ),
                 }
             )
@@ -179,6 +229,13 @@ def build_plan_run_history_response(session, model_number: int) -> dict:
     vendor_week_distribution_plans: dict[str, dict[str, float] | None] = {}
     if vendor_ids:
         vendors = session.query(Vendor).filter(Vendor.id.in_(vendor_ids)).all()
-        vendor_week_distribution_plans = {str(v.id): v.week_distribution_plan for v in vendors}
+        vendor_week_distribution_plans = {
+            str(v.id): (
+                v.week_distribution_plan
+                if v.week_distribution_plan is not None
+                else latest_snapshot_by_vendor.get(v.id)
+            )
+            for v in vendors
+        }
 
     return {"plan_runs": plan_run_dicts, "vendor_week_distribution_plans": vendor_week_distribution_plans}

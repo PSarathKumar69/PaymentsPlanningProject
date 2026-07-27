@@ -11,9 +11,9 @@ from fastapi import APIRouter, HTTPException
 
 from backend.db.models import AuditLog, PlanAllocation, Vendor
 from backend.db.session import SessionLocal
-from backend.shared.constants import MONEY_EPSILON
+from backend.shared.constants import MONEY_EPSILON, NEW_MODEL_2_PLAN_RUN_LABEL
 from backend.shared.enums import ChangeSource
-from backend.shared.plan_history import is_latest_plan_run
+from backend.shared.plan_history import is_latest_plan_run, model_family_prefix
 
 from ..schemas.plan_allocations import (
     OverrideRequest,
@@ -44,7 +44,21 @@ def patch_plan_allocation_override(plan_allocation_id: int, body: OverrideReques
         # same family, see backend/shared/plan_history.py) is editable -- an
         # override tied to a past plan_run is rejected with 409, so Finance
         # can't silently rewrite a superseded plan.
-        if not is_latest_plan_run(session, allocation.plan_run):
+        #
+        # New Model 2 (docs/14) is the one family whose "cycle" is Finance's
+        # own picked planning month, not the ledger-ingestion-anchored
+        # _current_cycle_month() is_latest_plan_run() uses by default for
+        # every other model — passing plan_run.month itself here (every row
+        # in one New Model 2 cycle shares that same value, by construction)
+        # gets the right answer without this generic, model-agnostic
+        # endpoint needing to special-case New Model 2's own planning-month
+        # resolution logic.
+        cycle_month_override = (
+            allocation.plan_run.month
+            if model_family_prefix(allocation.plan_run.model_used) == NEW_MODEL_2_PLAN_RUN_LABEL
+            else None
+        )
+        if not is_latest_plan_run(session, allocation.plan_run, cycle_month=cycle_month_override):
             raise HTTPException(
                 status_code=409,
                 detail="Cannot edit override on a past plan - only the latest plan is editable",
@@ -64,6 +78,21 @@ def patch_plan_allocation_override(plan_allocation_id: int, body: OverrideReques
         vendor.override_amount = new_value
         allocation.override_amount = new_value
         allocated_amount = float(allocation.allocated_amount)  # read before commit expires the attribute
+
+        # Bug fix (this task): the Distribution week bucket showed the
+        # ORIGINAL suggested amount even after an override, because nothing
+        # updated the snapshot the week-bucket display falls back to
+        # (plan_history.py's vendor_week_distribution_plans). Only touch it
+        # while Finance hasn't manually distributed this vendor yet
+        # (Vendor.week_distribution_plan still None) — once they have, that
+        # sticky value is theirs alone (docs/06), an override must never
+        # silently rewrite it. Replaces the value under whichever week
+        # key(s) are already there, never changes which week it's under.
+        if vendor.week_distribution_plan is None and allocation.week_distribution_plan:
+            effective_amount = new_value if new_value is not None else allocated_amount
+            allocation.week_distribution_plan = {
+                week: effective_amount for week in allocation.week_distribution_plan
+            }
 
         session.add(
             AuditLog(

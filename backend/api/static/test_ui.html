@@ -93,6 +93,7 @@
   .badge-cat-must_pay   { background: #fdeaea; color: #b42318; }
   .badge-cat-commitment { background: #f2eafd; color: #6b3fa0; }
   .badge-cat-normal     { background: var(--blue-tint); color: var(--blue-strong); }
+  .badge-cat-inactive   { background: #eef1f4; color: #4a5568; }
   .badge-not_paid     { background: #fdeaea; color: #b42318; }
   .badge-partial      { background: #fff4e5; color: #b56a00; }
   .badge-paid_in_full { background: #e6f6ec; color: #1a7f4e; }
@@ -146,7 +147,16 @@
      partially-paid) tranche vs. a fresh one is not yet finalized by Sarath;
      dark blue + italic + footnote is this build's default, flagged for sign-off. */
   .min-funds-table td.leftover { font-style: italic; color: var(--blue-strong); }
-  .min-funds-footnote { font-size: 0.8em; color: var(--muted, #6b7a90); margin-top: 4px; }
+
+  /* "What we're paying this month" table — the Curr row (the one fresh
+     tranche newly picked up this cycle) highlighted so Finance doesn't need
+     to hunt for it; Leftover rows shown italic; the trailing total row
+     bolded with a top border to separate it from the tranche rows above
+     it. Reuses .monthly-breakdown-table's borders/padding/right-align and
+     .row-label's left-align. */
+  .ledger-current-row td { background: var(--blue-tint); }
+  td.ledger-leftover { font-style: italic; color: var(--blue-strong); }
+  .paying-total-row td { font-weight: 700; border-top: 2px solid var(--border); }
   .script-text { white-space: pre-wrap; background: #fff; border-radius: 6px; padding: 10px; font-size: 0.85em; margin: 0; }
   .payment-card { background: #fafcfe; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
   .payment-card h3 { font-size: 0.95em; margin-bottom: 8px; }
@@ -177,16 +187,39 @@
      column positioned right after Aging, not adjacent to Distribution. */
   .dist-input { width: 84px; }
   .dist-input-paid { background: #e6f6ec; border-color: #1a7f4e; color: #1a7f4e; font-weight: 600; }
+  /* Vendor's own associated week (Vendor.assigned_week) — always
+     highlighted here regardless of which week their amount is actually
+     DISPLAYED under this round (a pulled-forward week never gets this
+     border, only their real tag does). Border only, so it composes with
+     dist-input-paid's green fill when a vendor happens to be paid in
+     their own associated week. */
+  .dist-input-associated-week { border: 2px solid #f0b90b; }
 
   /* Plan N history groups (docs/06 plan-history feature) — one Suggested
-     (+Override, Model 1 only) column-group per Generate/Regenerate click,
-     oldest first. Collapsed groups shrink to a single narrow, clickable
-     sliver column instead of their full width. */
+     (+Override) column-group per Generate/Regenerate click, oldest first.
+     Collapsed groups shrink to a single narrow, clickable sliver column
+     instead of their full width. */
   .plan-group-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
   .plan-group-label { cursor: pointer; }
   .plan-delete-btn { background: none; border: none; cursor: pointer; font-size: 0.95em; padding: 0 2px; opacity: 0.55; }
   .plan-delete-btn:hover { opacity: 1; }
   .plan-collapsed { cursor: pointer; text-align: center; color: var(--muted); font-size: 0.85em; }
+
+  /* New Model 2 companion — floating button + guided vendor-talking-points
+     panel (tab 5 only). Revamp (this task): guided pick-a-vendor flow, not
+     free-text chat. */
+  .companion-btn { position: fixed; bottom: 24px; right: 24px; width: 56px; height: 56px; border-radius: 50%;
+                    background: var(--blue-primary); color: #fff; border: none; font-size: 1.5em; cursor: pointer;
+                    box-shadow: 0 4px 14px rgba(12,68,124,0.35); z-index: 900; }
+  .companion-btn:hover { filter: brightness(1.08); }
+  .companion-panel { position: fixed; bottom: 92px; right: 24px; width: 340px; max-height: 460px; background: #fff;
+                      border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 28px rgba(15,23,42,0.25);
+                      display: flex; flex-direction: column; z-index: 900; overflow: hidden; }
+  .companion-header { padding: 10px 14px; background: var(--blue-tint); color: var(--blue-strong); font-weight: 700;
+                       display: flex; justify-content: space-between; align-items: center; }
+  .companion-body { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .companion-match-btn { text-align: left; }
+  .companion-script { white-space: pre-wrap; font-family: inherit; font-size: 0.9em; margin: 0; }
 </style>
 </head>
 <body>
@@ -212,52 +245,60 @@
   <div class="metric-card"><div class="metric-num" id="paid-so-far-figure">—</div><div class="metric-label">Paid so far this month</div></div>
 </div>
 
-<!-- ============ Funds action bar — four cards ============ -->
+<!-- ============ Funds action bar — Available funds / Funds left, shared with
+     New Model 2's own cycle card below (docs/14: "existing input, unchanged") ============ -->
 <section class="card">
   <h2>Funds &amp; plan generation</h2>
   <div class="funds-grid">
-    <div class="funds-col">
-      <button id="calc-funds-btn" class="btn btn-primary" onclick="calcFundsRequired()">Calculate funds required</button>
-      <div class="funds-figure" id="funds-required-figure">—</div>
-    </div>
     <div class="funds-col funds-col-divider">
       <label>Available funds</label>
-      <input id="funds-input" type="text" inputmode="numeric" class="money-input" disabled placeholder="calculate funds required first"
-        oninput="refreshFundsCardsFromOverrides()">
+      <input id="funds-input" type="text" inputmode="numeric" class="money-input" disabled placeholder="calculate minimum funds required first">
     </div>
     <div class="funds-col funds-col-divider">
-      <label>Overridden amount</label>
-      <div class="funds-figure" id="overridden-amount-figure">—</div>
-    </div>
-    <div class="funds-col funds-col-divider">
+      <!-- Money left over, unallocated to anyone, after the last Generate/
+           Regenerate click actually ran — one meaning, always. Blank until
+           that first click happens (see updateFundsCardsForActiveTab()). -->
       <label>Funds left</label>
       <div class="funds-figure" id="funds-left-figure">—</div>
     </div>
   </div>
+</section>
+
+<!-- ============ New Model 2 — its own four-card planning-month flow (docs/14) ============
+     Independent of the shared "Funds & plan generation" card above: New
+     Model 2 needs its own planning month picked before anything else, asked
+     once per cycle and never re-shown on a regeneration (docs/14). Cards
+     3/4 ("Available funds"/"Funds left") are the SAME existing
+     #funds-input/#funds-left-figure elements above — reused unchanged, not
+     duplicated, per docs/14's own wording. -->
+<section class="card" id="nm2-cycle-card">
+  <h2>New Model 2 — planning cycle</h2>
+  <div class="funds-grid">
+    <div class="funds-col" id="nm2-planning-month-col">
+      <label>Planning month</label>
+      <input type="month" id="nm2-planning-month">
+    </div>
+    <div class="funds-col funds-col-divider" id="nm2-calc-funds-col">
+      <button id="nm2-calc-funds-btn" class="btn btn-primary" onclick="nm2CalcFundsRequired()">Calculate Minimum Funds Required</button>
+      <div class="funds-figure" id="nm2-funds-required-figure">—</div>
+    </div>
+  </div>
+  <p class="muted" id="nm2-cycle-locked-note" style="display:none;">
+    Planning month for this cycle: <strong id="nm2-locked-month-label"></strong> — reused for every regeneration this month, not re-asked.
+  </p>
   <div class="funds-generate-row">
-    <!-- One button for both the first-ever generate and every later
-         regenerate — generatePlans() itself already decides which via
-         hasGeneratedThisCycle, and always reads whatever's currently typed
-         into Available funds (always editable, never re-disabled after the
-         first click) rather than any card's already-computed figure. -->
-    <button id="generate-plan-btn" class="btn btn-primary" disabled onclick="generatePlans()">Generate plan</button>
-    <div class="muted" id="generate-plan-result"></div>
+    <button id="nm2-generate-plan-btn" class="btn btn-primary" disabled onclick="nm2GeneratePlan()">Generate plan</button>
+    <div class="muted" id="nm2-generate-plan-result"></div>
   </div>
 </section>
 
-<!-- ============ Model tabs + shared table ============ -->
+<!-- ============ New Model 2 planning table ============ -->
 <section class="card" style="padding-bottom:0;">
   <div class="tabs-row">
     <div class="tabs">
-      <button class="tab active" data-model="1" onclick="setActiveTab(1)">Model 1 · Weighted score</button>
-      <button class="tab" data-model="2" onclick="setActiveTab(2)">Model 2 · Aging Model</button>
-      <button class="tab" data-model="3" onclick="setActiveTab(3)">Model 3 · Priority bucket</button>
+      <button class="tab active" data-model="5" onclick="setActiveTab(5)">New Model 2 · Priority ceiling</button>
     </div>
-    <!-- Snapshots every vendor's current suggested-or-overridden amount
-         (Model 1's, see finalize_plan()) into the Vendor Payment Table's
-         Budget column below — a stable number Finance can pay against
-         across a daily/weekly round, until clicked again. -->
-    <button class="btn btn-primary" onclick="finalizePlan()">Finalize Plan</button>
+    <button class="btn btn-primary" id="finalize-btn" onclick="finalizeNewModel2()">Finalize Plan</button>
   </div>
   <div class="muted" id="finalize-plan-result" style="padding:4px 10px 0;"></div>
   <div class="table-scroll" id="table-wrap"><p class="muted" style="padding:12px;">Loading…</p></div>
@@ -270,6 +311,61 @@
   <h2>Vendor payments this cycle</h2>
   <div class="table-scroll-wide" id="payments-table-wrap"><p class="muted" style="padding:12px;">Loading…</p></div>
 </section>
+
+<!-- ============ Master Data — Excel upload + live grid (data-pipeline-upload task) ============ -->
+<!-- No preview/confirm step (Sarath's course-correction) — one file pick,
+     one button, the upload takes effect immediately. -->
+<section class="card" style="padding-bottom:0;">
+  <div class="metrics-header">
+    <h2>Master Data</h2>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input type="file" id="master-upload-file" accept=".xlsx" onchange="onMasterUploadFilePicked(event)">
+      <button class="btn btn-primary" id="master-upload-btn" onclick="uploadMasterFileNow()" disabled>Upload</button>
+      <!-- Always visible (not tracked client-side per "has a backup ever
+           existed this session") — clicking with no backup yet just
+           surfaces the backend's own clear "no backup available" error
+           below, same as any other action error on this page. -->
+      <button class="btn" onclick="revertMasterUpload()">Revert to previous upload</button>
+      <button class="btn" onclick="loadMasterDataGrid()">↻ Refresh grid</button>
+    </div>
+  </div>
+  <p class="muted" id="master-upload-result" style="padding:0 10px;"></p>
+  <!-- Empty until Refresh grid or a completed upload actually populates it —
+       never fetched/rendered automatically on page load (Fix 2). -->
+  <div class="table-scroll-wide" id="master-grid-wrap"><p class="muted" style="padding:12px;">No data loaded yet — click "Refresh grid" or upload a file.</p></div>
+</section>
+
+<!-- ============ Configuration — New Model 2 priority-bucket structure (docs/11 Task 2 Part C) ============
+     System-level only: ceiling %, floor %, and the bucket set itself
+     (add/edit/remove a bucket). Vendor-specific tags (Category, Commitment
+     Months, Priority Tag, Assigned Week) live on the Planning tab instead
+     (tab 5's inline dropdowns) — nothing vendor-specific stays here. -->
+<section class="card" style="padding-bottom:0;">
+  <div class="metrics-header">
+    <h2>Configuration — New Model 2 priority buckets</h2>
+    <button class="btn" onclick="loadPriorityBuckets()">&#8635; Refresh</button>
+  </div>
+  <p class="muted" id="priority-bucket-result" style="padding:0 10px;"></p>
+  <div class="table-scroll-wide" id="priority-bucket-wrap"><p class="muted" style="padding:12px;">Loading…</p></div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px;">
+    <input type="text" id="pb-new-key" placeholder="Key (e.g. P6)" style="width:90px;">
+    <input type="text" id="pb-new-label" placeholder="Display label" style="width:120px;">
+    <input type="number" id="pb-new-ceiling" placeholder="Ceiling %" style="width:90px;">
+    <input type="number" id="pb-new-floor" placeholder="Floor %" style="width:90px;">
+    <input type="number" id="pb-new-position" placeholder="Rotation pos." style="width:100px;">
+    <button class="btn btn-primary" onclick="addPriorityBucketNow()">+ Add bucket</button>
+  </div>
+</section>
+
+<!-- ============ New Model 2 — three-option shortfall block (docs/14) ============ -->
+<div class="modal-backdrop" id="nm2-shortfall-modal-backdrop" style="display:none;" onclick="if (event.target === this) closeNm2ShortfallModal()">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeNm2ShortfallModal()" aria-label="Close">&times;</button>
+    <h2>Plan exceeds available funds</h2>
+    <div id="nm2-shortfall-summary" class="muted" style="margin:10px 0 14px;"></div>
+    <div id="nm2-shortfall-options" style="display:flex; flex-direction:column; gap:8px; align-items:flex-start;"></div>
+  </div>
+</div>
 
 <!-- ============ Vendor detail — modal, opens where the user already is ============ -->
 <div class="modal-backdrop" id="vendor-modal-backdrop" style="display:none;" onclick="if (event.target === this) closeVendorDetail()">
@@ -287,22 +383,38 @@
   </div>
 </div>
 
+<!-- ============ New Model 2 companion — vendor talking points (tab 5 only) ============ -->
+<!-- Revamp (this task): guided two-step flow, not free-text chat — pick a
+     vendor, get talking points, nothing else. Not persisted across a page
+     reload (reasonable default, flagged not silently decided). -->
+<button class="companion-btn" id="companion-btn" style="display:none;" onclick="toggleCompanionPanel()" title="Vendor talking points" aria-label="Open vendor talking points">💬</button>
+<div class="companion-panel" id="companion-panel" style="display:none;">
+  <div class="companion-header">
+    <span>Vendor talking points</span>
+    <button class="modal-close" style="position:static; font-size:1.2em;" onclick="toggleCompanionPanel()" aria-label="Close">&times;</button>
+  </div>
+  <div class="companion-body" id="companion-body"></div>
+</div>
+
 <script>
 // ---- shared state -----------------------------------------------------
 let vendorsById = {};                         // vendor_id -> merged vendor record (base + score + aging_bucket)
-let activeTab = 1;
+let activeTab = 5;
 // vendor_id -> full allocation row + denom/within_week_order, for whichever
 // plan_run_id richPlanRunId[model] says it reflects — the rich detail
 // (percentages, status/badges) only a fresh generate/regenerate response
 // carries; older Plan N groups render from planHistoryByModel's coarser
 // per-allocation fields instead (see latestAllocationTarget()/planGroupBodyCells()).
-let planDataByModel = { 1: {}, 2: {}, 3: {} };
+let planDataByModel = { 5: {} };
+// "Funds left" card's tab-aware source — one meaning, always: money left
+// over, unallocated to anyone, after the LAST Generate/Regenerate click for
+// that model actually ran (never toggles between an "override total" view
+// and a "residual" view). null until that model's first click this cycle.
+// See updateFundsCardsForActiveTab()/computeResidual().
+let planFundsLeft = { 5: null };
 let selectedVendorId = null;
 let lastRenderedRows = [];                     // {vendor, plan} rows from the last renderModelTable() — reused to
                                                 // re-render a single updated row without a full refetch/resort
-let hasGeneratedThisCycle = false;              // first click this cycle uses generate-plan; later clicks use /regenerate
-                                                 // — derived from real plan-run history on load (see loadVendors()), not
-                                                 // just this flag, so it survives a page reload correctly.
 let reconsiderDecisions = {};                   // vendor_id -> bool, fresh per regeneration event (docs/06 — never carried forward)
 
 // ---- Plan-run history (docs/06 plan-history feature) --------------------
@@ -310,9 +422,9 @@ let reconsiderDecisions = {};                   // vendor_id -> bool, fresh per 
 // overwriting the last one — GET /models/{n}/plan-runs (backend/shared/
 // plan_history.py) is the real source of truth, so this (unlike
 // planDataByModel below) survives a page reload.
-let planHistoryByModel = { 1: null, 2: null, 3: null };   // raw GET /models/{n}/plan-runs response, or null before first fetch
-let richPlanRunId = { 1: null, 2: null, 3: null };        // which plan_run_id planDataByModel[model] actually reflects (see below)
-let collapsedPlanIds = { 1: new Set(), 2: new Set(), 3: new Set() };  // plan_run_ids currently collapsed, per model
+let planHistoryByModel = { 5: null };   // raw GET /models/{n}/plan-runs response, or null before first fetch
+let richPlanRunId = { 5: null };        // which plan_run_id planDataByModel[model] actually reflects (see below)
+let collapsedPlanIds = { 5: new Set() };  // plan_run_ids currently collapsed, per model
 
 // ---- Indian-grouped money inputs ----------------------------------------
 // One live-formatting behavior for every rupee-amount input (funds,
@@ -397,20 +509,31 @@ function updateTotalPaidSoFar() {
   document.getElementById("paid-so-far-figure").textContent = formatMoney(total);
 }
 
-const CATEGORY_LABEL = { must_pay: "Must pay", commitment: "Commitment", normal: "Normal" };
+const CATEGORY_LABEL = { must_pay: "Must pay", commitment: "Commitment", normal: "Normal", inactive: "Inactive" };
 // Row order (both the planning table and the Vendor Payment Table): Must
-// Pay first, then Commitment, then Normal. A stable sort by this rank alone
-// preserves whatever order existed before within each category (e.g. Model
-// 1's score-descending order on tab 1, or plain vendor-id order elsewhere).
-const CATEGORY_ORDER = { must_pay: 0, commitment: 1, normal: 2 };
+// Pay first, then Commitment, then Normal, then Inactive (docs/14 —
+// Inactive, renamed 2026-07-24 from Exit, treated like Normal everywhere
+// except its own P5 bucket, so it sorts right after Normal here too). A
+// stable sort by this rank alone preserves whatever order existed before
+// within each category (plain vendor-id order).
+const CATEGORY_ORDER = { must_pay: 0, commitment: 1, normal: 2, inactive: 3 };
 function byCategoryOrder(a, b) {
   return (CATEGORY_ORDER[a.category] ?? 99) - (CATEGORY_ORDER[b.category] ?? 99);
+}
+
+// New Model 2's own row order (docs/14): P0 (Must Pay), P1 (Commitment),
+// P2, P3, P4, P5 (Inactive) — Vendor.priority_tag order, not category
+// order. A vendor with no tag at all (shouldn't happen once
+// scripts/seed_priority_tags.py has run) sorts last rather than crashing.
+const PRIORITY_TAG_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3, P4: 4, P5: 5 };
+function byPriorityTagOrder(a, b) {
+  return (PRIORITY_TAG_ORDER[a.priority_tag] ?? 99) - (PRIORITY_TAG_ORDER[b.priority_tag] ?? 99);
 }
 const STATUS_LABEL = { not_paid: "Not paid", partial: "Partial", paid_in_full: "Paid in full" };
 function categoryBadge(cat) { return `<span class="badge badge-cat-${cat}">${CATEGORY_LABEL[cat] || cat}</span>`; }
 function statusBadge(status) { return `<span class="badge badge-${status}">${STATUS_LABEL[status] || status}</span>`; }
 
-// Model 1's allocation status (guaranteed/full/partial/zero/override_locked)
+// Allocation status (guaranteed/full/partial/zero/override_locked)
 // isn't shown as a badge anywhere else in this table today — this label map
 // exists so the one place it IS surfaced (the Suggested-amount cell, for a
 // Finance-overridden vendor whose figure is frozen) never falls back to a
@@ -425,14 +548,22 @@ function allocationStatusBadge(status) {
 function agingCell(vendor) {
   const months = vendor.aging_months_back != null ? vendor.aging_months_back : "—";
   const bucket = vendor.aging_bucket || "—";
-  // Total Min Funds = Old Amt (oldest tranche) plus any older leftover
-  // tranche(s) from a prior cycle's shortfall (docs/04 carry-forward fix) —
-  // same figure required_amount()/Min Funds Required now use everywhere.
-  // Equals Old Amt exactly when there's no leftover to carry forward.
+  // Total Min Funds = oldest tranche plus any older leftover tranche(s)
+  // from a prior cycle's shortfall (docs/04 carry-forward fix) — same
+  // figure required_amount()/Min Funds Required use everywhere. "Old Amt"
+  // (the single oldest tranche alone, pre-this-fix) is UI-removed per this
+  // task — the underlying data is still fetched (vendor.aging_bucket_amount),
+  // just no longer rendered as its own column here.
+  //
+  // New Model 2's own tab (fix, this task): this column previously showed
+  // the same OLD carry-forward figure as every other tab, never its own
+  // required_amount_v2 rule — vendor.nm2_min_funds_required is populated by
+  // nm2ApplyAllVendorMinFunds() (called from renderModelTable() whenever
+  // this tab is active) and used here instead, only for tab 5.
+  const minFunds = activeTab === 5 ? vendor.nm2_min_funds_required : vendor.min_funds_required;
   return `<td class="col-divide">${months}</td>` +
     `<td class="aging-divide">${bucket}</td>` +
-    `<td class="aging-divide amt">${formatMoney(vendor.aging_bucket_amount)}</td>` +
-    `<td class="aging-divide amt">${formatMoney(vendor.min_funds_required)}</td>`;
+    `<td class="aging-divide amt">${formatMoney(minFunds)}</td>`;
 }
 
 // Reconsider (Yes/No) — enabled for every vendor EXCEPT one Finance has
@@ -537,7 +668,7 @@ function togglePlanCollapse(model, planRunId) {
 
 async function deletePlanRun(model, planRunId) {
   if (!confirm(`Permanently delete this plan? This cannot be undone.`)) return;
-  await apiCall(null, "DELETE", `/plan-runs/${planRunId}`);
+  const resp = await apiCall(null, "DELETE", `/plan-runs/${planRunId}`);
   if (richPlanRunId[model] === planRunId) {
     // The rich cache described exactly this now-deleted plan_run — degrade
     // to the coarse history view (matching the existing "no plan generated
@@ -546,7 +677,15 @@ async function deletePlanRun(model, planRunId) {
     richPlanRunId[model] = null;
     planDataByModel[model] = {};
   }
+  // Bug fix (this task): deleting the plan a vendor was overridden IN also
+  // clears that override server-side (see plan_runs.py) — sync the client's
+  // own cached vendor record too, or the Reconsider toggle/Overridden-amount
+  // card stay stale until an unrelated full reload happens to touch them.
+  (resp.cleared_override_vendor_ids || []).forEach(vid => {
+    if (vendorsById[vid]) vendorsById[vid].override_amount = null;
+  });
   await refreshPlanHistory(model);
+  updateFundsCardsForActiveTab();
   renderModelTable();
 }
 
@@ -580,10 +719,14 @@ function planGroupHeaderCells(model, planRuns, showOverride) {
 
 // One Plan-N column-group's body cells for a single vendor row. Suggested
 // %/amount uses the rich cache when this specific plan_run is the one it
-// reflects, else just the coarse allocated_amount (no denom -> % is "—").
-// Override is a live, editable input ONLY on the truly-latest plan_run
-// (last in the array) — every older plan_run (or the latest one once no
-// rich data is available, e.g. right after a delete) renders it read-only.
+// reflects, else the coarse history's own frozen denominator
+// (allocRow.required_amount_snapshot — backend/db/models.py's this-task
+// fix) — a historical percentage is always computed against what the
+// denominator actually was AT THAT TIME, never today's live required
+// amount. Override is a live, editable input ONLY on the truly-latest
+// plan_run (last in the array) — every older plan_run (or the latest one
+// once no rich data is available, e.g. right after a delete) renders it
+// read-only, but its % is still shown, same frozen-snapshot source.
 function planGroupBodyCells(vendor, model, planRuns, showOverride) {
   let html = "";
   planRuns.forEach((planRun, idx) => {
@@ -603,16 +746,24 @@ function planGroupBodyCells(vendor, model, planRuns, showOverride) {
         formatMoney(richPlan.allocated_amount) +
         (richPlan.status === "override_locked" ? ` ${allocationStatusBadge(richPlan.status)}` : "");
     } else if (allocRow) {
-      sugAmtText = formatMoney(allocRow.allocated_amount);  // no denom in history -> % stays "—"
+      sugAmtText = formatMoney(allocRow.allocated_amount);
+      const pctRaw = formatPct(allocRow.allocated_amount, allocRow.required_amount_snapshot);
+      sugPctText = pctRaw != null ? pctRaw.toFixed(2) + "%" : "—";
     }
     html += `<td class="col-divide">${sugPctText}</td><td class="amt">${sugAmtText}</td>`;
 
     if (showOverride) {
       if (isLastPlan) {
-        html += overrideInputCells(vendor.id, richPlan, allocRow);
+        html += overrideInputCells(vendor.id, richPlan, allocRow, model);
       } else {
-        const ovrAmtText = allocRow && allocRow.override_amount != null ? formatMoney(allocRow.override_amount) : "—";
-        html += `<td class="col-divide muted">—</td><td class="muted">${ovrAmtText}</td>`;
+        const hasOverride = allocRow && allocRow.override_amount != null;
+        const ovrAmtText = hasOverride ? formatMoney(allocRow.override_amount) : "—";
+        // Same frozen-snapshot source as Suggested % above — a historical
+        // plan_run's Override % must never be recomputed against today's
+        // required amount either.
+        const ovrPctRaw = hasOverride ? formatPct(allocRow.override_amount, allocRow.required_amount_snapshot) : null;
+        const ovrPctText = ovrPctRaw != null ? ovrPctRaw.toFixed(2) + "%" : "—";
+        html += `<td class="col-divide muted">${ovrPctText}</td><td class="muted">${ovrAmtText}</td>`;
       }
     }
   });
@@ -666,6 +817,7 @@ async function applyPaymentTracking() {
     vendorsById[t.vendor_id].actual_paid_this_month = t.actual_paid_this_month;
     vendorsById[t.vendor_id].balance = t.balance;
     vendorsById[t.vendor_id].balance_outstanding = t.balance_outstanding;
+    vendorsById[t.vendor_id].min_funds_required = t.min_funds_required;
     // Planning table's Priority column (weeklyPriority()) reads this —
     // "latest plan_run, any model" (backend/shared/plan_history.py::
     // latest_priority_for_vendor), not whichever tab happens to be active.
@@ -673,42 +825,30 @@ async function applyPaymentTracking() {
   });
 }
 
-// "Finalize Plan" — snapshots every vendor's current suggested-or-overridden
-// amount (Model 1's, see backend/shared/payment_logging.py::finalize_plan)
-// into the Vendor Payment Table's Budget column. A stable number, not a
-// live one: further overrides/regenerations after this click don't move
-// Budget until Finalize is clicked again — lets Finance generate/override
-// across a whole day or week and only "publish" a number to pay against
-// when actually ready, repeatable daily/weekly/monthly.
-async function finalizePlan() {
-  const resultEl = document.getElementById("finalize-plan-result");
-  resultEl.textContent = "Finalizing…";
-  try {
-    const resp = await apiCall(null, "POST", "/vendors/finalize-plan", {});
-    await applyPaymentTracking();
-    renderVendorPaymentsTable();
-    resultEl.textContent = `Plan finalized — Budget updated for ${resp.vendor_count} vendor(s). ` +
-      `See the Vendor payments table below to start paying.`;
-  } catch (e) {
-    resultEl.textContent = `ERROR: ${e.message}`;
-  }
-}
+// Finalize button calls finalizeNewModel2() directly (see below) — New
+// Model 2 is the only plan on this page now.
 
 // Vendor Payment Table — actual-payment tracking, distinct from the
 // planning table's Suggested/Override/Plan-N columns. Strict 9-column list
 // (confirmed): Vendor Name (frozen) | ERP code | Outstanding | Budget |
-// Actual paid this month (Amt | % of Old bill paid | % Outstanding paid) |
+// Actual paid this month (Amt | % Min Funds Paid | % Outstanding paid) |
 // Balance | Balance outstanding | Pay (frozen). Category is kept too
-// (confirmed — small, doesn't conflict). The old Old/New (before vs. after
-// this cycle's payments) comparison pairs are gone — their absolute rupee
-// figures are dropped; only the % view survives, under Actual paid this
-// month.
+// (confirmed — small, doesn't conflict).
 //   Outstanding = opening_balance (cycle-start snapshot, confirmed) — NOT
 //     live/netted, else Balance outstanding below would double-subtract.
-//   Budget = stable snapshot from the last "Finalize Plan" click, Model 1's
-//     override-aware amount (see finalizePlan() above and
+//   Budget = stable snapshot from the last "Finalize Plan" click, New Model
+//     2's override-aware amount (see finalizeNewModel2() above and
 //     backend/shared/plan_history.py::latest_budget_for_vendor) — 0 until
 //     Finance finalizes at least once this cycle.
+//   % Min Funds Paid = Actual paid this month / this vendor's own
+//     min_funds_required (backend/shared/min_funds.py::required_amount(),
+//     same carry-forward-adjusted figure the Aging card/Min Funds Required
+//     badge use, but the PRE-payment snapshot — required_amount() is live
+//     and shrinks the moment a payment lands, which would otherwise push
+//     this percentage past 100% the instant a vendor is paid past their
+//     current oldest tranche) — deliberately independent of Budget/
+//     override, "how much of what's structurally owed has actually been
+//     cleared."
 //   Balance = Budget - Actual paid Amt (can go negative — not an error).
 //   Balance outstanding = Outstanding - Actual paid Amt, clamped at 0
 //     (confirmed) — the live/current outstanding; ledger integrity, never negative.
@@ -716,15 +856,13 @@ function renderVendorPaymentsTable() {
   const sortedVendors = Object.values(vendorsById).sort(byCategoryOrder);  // Must Pay, then Commitment, then Normal
   const rows = sortedVendors.map(v => {
     const outstanding = v.opening_balance;
-    const oldOldest = v.aging_bucket_amount_opening;
-    const newOldest = v.aging_bucket_amount;
-    // actual_paid_this_month/budget/balance/balance_outstanding only exist
-    // once applyPaymentTracking() has run — falls back to
-    // paid_so_far_this_month for actual-paid so the row isn't blank during
-    // the brief window before that call resolves.
+    // actual_paid_this_month/budget/balance/balance_outstanding/
+    // min_funds_required only exist once applyPaymentTracking() has run —
+    // falls back to paid_so_far_this_month for actual-paid so the row
+    // isn't blank during the brief window before that call resolves.
     const actualPaid = v.actual_paid_this_month != null ? v.actual_paid_this_month : v.paid_so_far_this_month;
     const pctOutstandingPaid = formatPct(actualPaid, outstanding);
-    const pctOldBillPaid = oldOldest != null && newOldest != null ? formatPct(oldOldest - newOldest, oldOldest) : null;
+    const pctMinFundsPaid = v.min_funds_required != null ? formatPct(actualPaid, v.min_funds_required) : null;
     return `<tr>` +
       `<td>${escapeHtml(v.vendor_name)}</td>` +
       `<td>${escapeHtml(v.erp_code)}</td>` +
@@ -732,7 +870,7 @@ function renderVendorPaymentsTable() {
       `<td class="amt col-divide">${formatMoney(outstanding)}</td>` +
       `<td class="amt col-divide">${formatMoney(v.budget)}</td>` +
       `<td class="amt col-divide">${formatMoney(actualPaid)}</td>` +
-      `<td class="col-divide">${pctText(pctOldBillPaid)}</td>` +
+      `<td class="col-divide">${pctText(pctMinFundsPaid)}</td>` +
       `<td>${pctText(pctOutstandingPaid)}</td>` +
       `<td class="amt col-divide">${formatMoney(v.balance)}</td>` +
       `<td class="amt col-divide">${formatMoney(v.balance_outstanding)}</td>` +
@@ -756,7 +894,7 @@ function renderVendorPaymentsTable() {
         </tr>
         <tr>
           <th class="col-divide">Amt</th>
-          <th>% of Old bill paid</th>
+          <th>% Min Funds Paid</th>
           <th>% Outstanding paid</th>
         </tr>
       </thead>
@@ -778,28 +916,14 @@ async function loadVendors() {
   document.getElementById("metric-normal").textContent = counts.normal;
   updateTotalPaidSoFar();
 
-  // GET /vendors' own aging_bucket/score fields are never populated by any
-  // ingestion/scoring code path — Model 1's live scores are the real source,
-  // needed for every tab's Aging column regardless of which tab loads first.
-  const scores = await apiCall(null, "GET", "/models/1/scores");
-  scores.forEach(s => {
-    if (vendorsById[s.vendor_id]) {
-      vendorsById[s.vendor_id].aging_bucket = s.aging_bucket;
-      vendorsById[s.vendor_id].score = s.score;
-    }
-  });
-
-  // Months-back + the amount sitting in each vendor's own oldest bucket only
-  // exist on the per-vendor /vendors/{id}/aging call — no bulk endpoint
-  // carries them yet, so this fans out once per vendor at load time.
+  // Months-back + the amount sitting in each vendor's own oldest bucket, and
+  // aging_bucket itself, only exist on the per-vendor /vendors/{id}/aging
+  // call — no bulk endpoint carries them yet, so this fans out once per
+  // vendor at load time.
   await Promise.all(vendors.map(v => applyVendorAging(v.id)));
   await applyPaymentTracking();
-  await Promise.all([1, 2, 3].map(refreshPlanHistory));
-  // Derived from real backend history, not just a client-side flag — this
-  // is what actually lets "Generate plan" correctly route to /regenerate
-  // for Models 2/3 right after a page reload (docs/06 plan-history
-  // feature's whole point: history survives a reload, so this must too).
-  hasGeneratedThisCycle = [1, 2, 3].some(m => (planHistoryByModel[m].plan_runs || []).length > 0);
+  await refreshPlanHistory(5);
+  nm2RefreshCycleCardVisibility();
 
   closeVendorDetail();
   renderModelTable();
@@ -837,39 +961,30 @@ async function applyVendorAging(vendorId) {
 }
 
 // ---- funds bar / rule-4 gate --------------------------------------------
-// Overridden-amount/funds-left cards: total_overridden/funds_left_for_regeneration
-// come straight from Model 1's generate-plan-and-weekly-view response
-// (server-computed, not re-derived here) right after a generation; the
-// override-save path below has no such response field to read, so it's the
-// one place this recomputes client-side from already-known override
-// amounts — a plain display sum, not a re-implementation of the backend's
-// funds-exclusion math.
-function setFundsCards(totalOverridden, fundsLeft) {
-  document.getElementById("overridden-amount-figure").textContent = formatMoney(totalOverridden);
-  document.getElementById("funds-left-figure").textContent = formatMoney(fundsLeft);
+// Funds-left = money left over, unallocated to anyone, after the last
+// Generate/Regenerate click actually ran — one meaning, always, tab-aware
+// (this task). available_funds here is effective_funds (whatever was
+// actually fed into that model's generate_plan() — already net of any
+// overridden vendors' amounts), and summing allocated_amount over every
+// NON-locked row already captures every source of leftover in one number:
+// a %-step/ceiling search that couldn't place the last 1-4%, a headroom cap
+// on either tier freeing money nobody re-picks up, all combined. Locked
+// (override_locked) rows are excluded from that sum on purpose — their
+// row's allocated_amount is a frozen OLD suggested figure, not what's
+// actually committed for them this round (that's vendor.override_amount,
+// already excluded from effective_funds before generate_plan() ran at all)
+// — including it here would double-count. This is why the totals still
+// cancel out correctly with no separate "total overridden" term needed.
+function computeResidual(plan) {
+  const spent = plan.allocations
+    .filter(r => r.status !== "override_locked")
+    .reduce((sum, r) => sum + (r.allocated_amount || 0), 0);
+  return Math.max((plan.available_funds || 0) - spent, 0);
 }
 
-// Also wired to funds-input's own oninput (always editable, never
-// re-disabled after the first generate) so Finance sees Funds Left update
-// live while typing a new figure, before ever clicking Generate again.
-function refreshFundsCardsFromOverrides() {
-  const availableFunds = moneyInputValue(document.getElementById("funds-input"));
-  const totalOverridden = Object.values(planDataByModel[1])
-    .reduce((sum, p) => sum + (p.override_amount != null ? p.override_amount : 0), 0);
-  const fundsLeft = Number.isNaN(availableFunds) ? 0 : Math.max(availableFunds - totalOverridden, 0);
-  setFundsCards(totalOverridden, fundsLeft);
-}
-
-async function calcFundsRequired() {
-  const data = await apiCall(null, "GET", "/models/2/minimum-funds-required");
-  document.getElementById("funds-required-figure").textContent = formatMoney(data.total);
-  document.getElementById("funds-input").disabled = false;
-  document.getElementById("generate-plan-btn").disabled = false;
-  document.getElementById("generate-plan-result").textContent = "";
-  hasGeneratedThisCycle = false;
-  setFundsCards(0, NaN);
-  reconsiderDecisions = {};
-  reconsiderAllValue = false;
+function updateFundsCardsForActiveTab() {
+  const residual = planFundsLeft[activeTab];
+  document.getElementById("funds-left-figure").textContent = residual != null ? formatMoney(residual) : "—";
 }
 
 // Full allocation row is kept (not just a few fields) so a zero-status
@@ -901,134 +1016,143 @@ function _mergeGeneratePlanResponse(model, data) {
     };
   });
   richPlanRunId[model] = data.weekly_view.plan_run_id;
-}
-
-// /regenerate's own allocations already carry within_week_order directly
-// (regeneration.py computes it the same way build_weekly_view does) — no
-// separate weekly-view call needed. Excluded/locked vendors are simply
-// absent from data.allocations — their Suggested cell correctly falls back
-// to "—" via the same undefined-plan handling every other tab already uses.
-function _mergeRegenerateResponse(model, data) {
-  planDataByModel[model] = {};
-  data.allocations.forEach(row => {
-    planDataByModel[model][row.vendor_id] = { ...row, denom: row.required_amount ?? row.outstanding_balance };
-  });
-  richPlanRunId[model] = data.plan_run_id;
-}
-
-// First click this cycle generates Models 1, 2 and 3 together. Model 1 has
-// no real regeneration endpoint (docs/03), so it always re-generates fresh.
-// Subsequent clicks for Models 2/3 call the real /regenerate engine instead
-// of re-calling generate-plan-and-weekly-view — repeatedly re-calling
-// generate-plan created another independent plan_run every time, whose
-// allocation _this_cycle_allocation() (payment_logging.py) added on top of
-// every previous click's instead of replacing it, eventually making
-// PAID_IN_FULL unreachable no matter how much a vendor was actually paid.
-// Reconsider decisions come from the Reconsider column's toggles
-// (reconsiderDecisions) — a vendor absent from that dict is treated
-// server-side as Reconsider=No (locked), matching docs/06's "never
-// defaulted to Yes" rule.
-// Mirrors backend/weekly_planning/calendar_utils.py's week_for_date() (day
-// 1-7 -> W1, 8-14 -> W2, ...) — no manual "current week" input anymore, so
-// this is the only source for /regenerate's eligibility-cutoff week.
-function currentWeekFromToday() {
-  return Math.ceil(new Date().getDate() / 7);
-}
-
-// The one "Generate plan" button (first-ever generate and every later
-// regenerate alike) calls this. Deliberately always reads the raw
-// funds-input value directly, never the Funds Left card's own already-
-// reduced figure: Model 1's endpoint subtracts every currently-overridden
-// vendor's amount from whatever available_funds it's given on EVERY call,
-// first generation or regeneration alike (its own total_overridden is
-// always recomputed fresh from live vendor.override_amount server-side) —
-// sending the already-reduced Funds Left figure back in would
-// double-subtract the overridden total.
-async function generatePlans() {
-  const availableFunds = moneyInputValue(document.getElementById("funds-input"));
-  const currentWeek = currentWeekFromToday();
-  const resultEl = document.getElementById("generate-plan-result");
-  resultEl.textContent = "Generating…";
-
-  const usingRegenerate = hasGeneratedThisCycle;
-  const model1Call = apiCall(null, "POST", "/models/1/generate-plan-and-weekly-view", { available_funds: availableFunds });
-  const model2Call = usingRegenerate
-    ? apiCall(null, "POST", "/regenerate", { model: 2, available_funds: availableFunds, current_week: currentWeek, reconsider_decisions: reconsiderDecisions })
-    : apiCall(null, "POST", "/models/2/generate-plan-and-weekly-view", { available_funds: availableFunds });
-  const model3Call = usingRegenerate
-    ? apiCall(null, "POST", "/regenerate", { model: 3, available_funds: availableFunds, current_week: currentWeek, reconsider_decisions: reconsiderDecisions })
-    : apiCall(null, "POST", "/models/3/generate-plan-and-weekly-view", { available_funds: availableFunds });
-
-  const [m1, m2, m3] = await Promise.all([model1Call, model2Call, model3Call]);
-
-  _mergeGeneratePlanResponse(1, m1);
-  usingRegenerate ? _mergeRegenerateResponse(2, m2) : _mergeGeneratePlanResponse(2, m2);
-  usingRegenerate ? _mergeRegenerateResponse(3, m3) : _mergeGeneratePlanResponse(3, m3);
-  // New "Plan N" column group per click (docs/06 plan-history feature) —
-  // refetch every model's real history so it reflects the plan_run just created.
-  await Promise.all([1, 2, 3].map(refreshPlanHistory));
-
-  // Money reclaimed from a headroom-capped vendor that neither redistribution
-  // tier could absorb (docs/06 fix) — surfaced so it's visible, not silently
-  // unaccounted for, even though the funds-pool total stays correct either way.
-  const surplusNote = usingRegenerate && (m2.unallocated_surplus > 1 || m3.unallocated_surplus > 1)
-    ? ` Unallocated surplus: Model 2 = ${formatMoney(m2.unallocated_surplus)}, Model 3 = ${formatMoney(m3.unallocated_surplus)}.`
-    : "";
-  resultEl.textContent = (usingRegenerate
-    ? `Regenerated Models 2 and 3 for week ${currentWeek} (${m2.pulled_forward.length} pulled forward, ${Object.keys(m2.excluded).length} locked/excluded); Model 1 refreshed fresh (${Object.keys(planDataByModel[1]).length} vendors).`
-    : `Plans generated for Models 1, 2 and 3 (${Object.keys(planDataByModel[1]).length} vendors each).`) + surplusNote;
-  hasGeneratedThisCycle = true;
-  setFundsCards(m1.total_overridden, m1.funds_left_for_regeneration);
-  // Reconsider is scoped to a single regeneration event (docs/06) — never
-  // carried forward, so the next regeneration starts every toggle fresh.
-  reconsiderDecisions = {};
-  reconsiderAllValue = false;
-
-  renderModelTable();
+  planFundsLeft[model] = computeResidual(data.plan);
 }
 
 // ---- model tabs + shared table -------------------------------------------
+// Only one tab (New Model 2) exists today — setActiveTab() still exists as
+// the one place tab-dependent UI state (Finalize label, companion button,
+// funds-left figure) gets refreshed, called once at bootstrap below.
 function setActiveTab(n) {
   activeTab = n;
   document.querySelectorAll(".tab").forEach(btn => btn.classList.toggle("active", parseInt(btn.dataset.model, 10) === n));
+  document.getElementById("finalize-btn").textContent = "Finalize New Model 2 Plan";
+  updateFundsCardsForActiveTab();
   closeVendorDetail();
+  document.getElementById("companion-btn").style.display = "";
   renderModelTable();
+}
+
+// ---- New Model 2 — its own planning-month + min-funds-required flow ------
+// (docs/14). Independent of the shared "Available funds"/"Funds left"
+// inputs above (docs/14: "existing input, unchanged") — New Model 2's own
+// cycle (asked-once-per-cycle planning month) is its own action.
+function nm2HasGeneratedThisCycle() {
+  return !!(planHistoryByModel[5] && (planHistoryByModel[5].plan_runs || []).length > 0);
+}
+
+// Cards 1/2 (calendar + Calculate Minimum Funds Required) are shown only
+// once per cycle, at the very first Generate Plan click of the month
+// (docs/14) — never re-shown on a regeneration. Derived from real plan-run
+// history (nm2HasGeneratedThisCycle()), same convention the shared
+// hasGeneratedThisCycle flag already uses, so this is also correct on a
+// page reload, not just right after a fresh click.
+function nm2RefreshCycleCardVisibility() {
+  const generated = nm2HasGeneratedThisCycle();
+  document.getElementById("nm2-planning-month-col").style.display = generated ? "none" : "";
+  document.getElementById("nm2-calc-funds-col").style.display = generated ? "none" : "";
+  document.getElementById("nm2-cycle-locked-note").style.display = generated ? "" : "none";
+  if (generated) {
+    const runs = planHistoryByModel[5].plan_runs;
+    document.getElementById("nm2-locked-month-label").textContent = (runs[0].month || "").slice(0, 7);
+    document.getElementById("nm2-generate-plan-btn").disabled = false;
+  }
+  nm2SetGenerateButtonLabel(generated);
+}
+
+function nm2SetGenerateButtonLabel(isRegenerate) {
+  document.getElementById("nm2-generate-plan-btn").textContent = isRegenerate ? "Regenerate plan" : "Generate plan";
+}
+
+// Fix: New Model 2's own "Total Min Funds" table column previously showed
+// the OLD carry-forward rule (vendor.min_funds_required, shared with every
+// other tab, from GET /vendors/{id}/aging) instead of this tab's own
+// required_amount_v2. Bulk call, refetched every time tab 5's table
+// renders (renderModelTable()) — same reuse-stored-planning-month rule as
+// every other New Model 2 endpoint. A vendor absent from the breakdown has
+// zero outstanding balance (excluded upstream, same as the old rule);
+// nm2_min_funds_required stays null (renders "—") only when no planning
+// month is resolvable yet at all (no plan_run this cycle).
+async function nm2ApplyAllVendorMinFunds() {
+  const data = await apiCall(null, "GET", "/models/5/vendor-min-funds-required");
+  const byVendor = {};
+  data.breakdown.forEach(r => { byVendor[r.vendor_id] = r.required_amount; });
+  Object.values(vendorsById).forEach(v => {
+    v.nm2_min_funds_required = data.planning_month == null ? null : (byVendor[v.id] != null ? byVendor[v.id] : 0);
+  });
+}
+
+async function nm2CalcFundsRequired() {
+  const month = document.getElementById("nm2-planning-month").value;  // native <input type="month"> -> "YYYY-MM" directly
+  const resultEl = document.getElementById("nm2-generate-plan-result");
+  if (!month) {
+    resultEl.textContent = "Pick a planning month first.";
+    return;
+  }
+  try {
+    const data = await apiCall(null, "GET", `/models/5/minimum-funds-required?planning_month=${month}`);
+    document.getElementById("nm2-funds-required-figure").textContent = formatMoney(data.total);
+    // Available funds is the shared #funds-input above (docs/14: "existing
+    // input, unchanged").
+    document.getElementById("funds-input").disabled = false;
+    document.getElementById("nm2-generate-plan-btn").disabled = false;
+    resultEl.textContent = "";
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+async function nm2GeneratePlan() {
+  const availableFunds = moneyInputValue(document.getElementById("funds-input"));
+  const resultEl = document.getElementById("nm2-generate-plan-result");
+  const usingRegenerate = nm2HasGeneratedThisCycle();
+  const body = { available_funds: availableFunds };
+  if (!usingRegenerate) {
+    const month = document.getElementById("nm2-planning-month").value;
+    if (!month) {
+      resultEl.textContent = "Pick a planning month and calculate Minimum Funds Required first.";
+      return;
+    }
+    body.planning_month = month;  // required on the first Generate Plan of a cycle only (docs/14)
+  }
+  resultEl.textContent = "Generating…";
+  try {
+    const data = await apiCall(null, "POST", "/models/5/generate-plan-and-weekly-view", body);
+    _mergeGeneratePlanResponse(5, data);
+    await refreshPlanHistory(5);
+    nm2RefreshCycleCardVisibility();
+    resultEl.textContent = `New Model 2 plan ${usingRegenerate ? "regenerated" : "generated"} (${Object.keys(planDataByModel[5]).length} vendors).`;
+    if (activeTab === 5) {
+      updateFundsCardsForActiveTab();
+      renderModelTable();
+    }
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
 }
 
 async function renderModelTable() {
   if (Object.keys(vendorsById).length === 0) return;  // vendors not loaded yet
   document.getElementById("table-wrap").innerHTML = '<p class="muted" style="padding:12px;">Loading…</p>';
 
-  let rows;
-  if (activeTab === 1) {
-    const scores = await apiCall(null, "GET", "/models/1/scores");  // sorted by score desc — used for row order only
-    scores.forEach(s => {
-      if (vendorsById[s.vendor_id]) {
-        vendorsById[s.vendor_id].aging_bucket = s.aging_bucket;
-        vendorsById[s.vendor_id].score = s.score;
-      }
-    });
-    rows = scores.map(s => ({ vendor: vendorsById[s.vendor_id] }));
-  } else {
-    rows = Object.values(vendorsById).map(v => ({ vendor: v }));
-  }
-  rows.sort((a, b) => byCategoryOrder(a.vendor, b.vendor));  // Must Pay, then Commitment, then Normal
+  await nm2ApplyAllVendorMinFunds();  // this tab's own "Total Min Funds" column (required_amount_v2)
+  const rows = Object.values(vendorsById).map(v => ({ vendor: v }));
+  // New Model 2's own row order (docs/14): P0 -> P1 -> P2 -> P3 -> P4.
+  rows.sort((a, b) => byPriorityTagOrder(a.vendor, b.vendor));
   lastRenderedRows = rows;
   renderTableRows(rows);
 }
 
-// Override column-group exists only on Model 1's tab (product decision —
-// Models 2/3 stay untouched). Column order: Priority sits right after Aging
-// (a single vendor-level fact — latest plan_run across ANY model, see
-// weeklyPriority() — not tied to whichever Plan-N group is being viewed),
-// then one "Plan N" column-group pair (Suggested, +Override on Model 1) per
-// real plan_run in history (docs/06 plan-history feature) — oldest first,
-// collapsed by default except the latest (see planGroupHeaderCells()/
-// planGroupBodyCells()/togglePlanCollapse()) — then Distribution, then Amt
-// paid (once, not repeated per Plan-N group — a vendor-level fact too), then
-// Reconsider.
+// Column order: Priority sits right after Aging (a single vendor-level fact
+// — latest plan_run across ANY model, see weeklyPriority() — not tied to
+// whichever Plan-N group is being viewed), then one "Plan N" column-group
+// pair (Suggested, +Override) per real plan_run in history (docs/06
+// plan-history feature) — oldest first, collapsed by default except the
+// latest (see planGroupHeaderCells()/planGroupBodyCells()/
+// togglePlanCollapse()) — then Distribution, then Amt paid (once, not
+// repeated per Plan-N group — a vendor-level fact too), then Reconsider.
 function renderTableRows(rows) {
-  const showOverride = activeTab === 1;
+  const showOverride = true;
   const planRuns = (planHistoryByModel[activeTab] && planHistoryByModel[activeTab].plan_runs) || [];
   const { row1: planHeaderRow1, row2: planHeaderRow2 } = planGroupHeaderCells(activeTab, planRuns, showOverride);
 
@@ -1038,7 +1162,8 @@ function renderTableRows(rows) {
       `<td>${i + 1}</td>` +
       `<td>${escapeHtml(v.vendor_name)}</td>` +
       `<td>${escapeHtml(v.erp_code)}</td>` +
-      `<td>${categoryBadge(v.category)}</td>` +
+      categoryCell(v) +
+      (activeTab === 5 ? vPriorityCell(v) + commitmentMonthsCell(v) + assignedWeekCell(v) : "") +
       `<td class="amt col-divide">${formatMoney(v.live_outstanding_balance)}</td>` +
       agingCell(v) +
       priorityCell(v) +
@@ -1057,8 +1182,9 @@ function renderTableRows(rows) {
           <th rowspan="2">Vendor</th>
           <th rowspan="2">ERP code</th>
           <th rowspan="2">Category</th>
+          ${activeTab === 5 ? '<th rowspan="2" class="col-divide">V-Priority</th><th rowspan="2">Commitment Mo.</th><th rowspan="2">Assigned Wk</th>' : ""}
           <th rowspan="2" class="col-divide">Outstanding</th>
-          <th colspan="4" class="col-divide">Aging</th>
+          <th colspan="3" class="col-divide">Aging</th>
           <th rowspan="2" class="col-divide">Priority</th>
           ${planHeaderRow1}
           <th colspan="5" class="col-divide">Distribution</th>
@@ -1068,7 +1194,6 @@ function renderTableRows(rows) {
         <tr>
           <th class="col-divide">Months</th>
           <th>Bucket</th>
-          <th>Old Amt</th>
           <th>Total Min Funds</th>
           ${planHeaderRow2}
           <th class="col-divide">W1</th>
@@ -1087,7 +1212,7 @@ function renderTableRows(rows) {
 // richPlan may be null (viewing coarse/historical data, e.g. right after a
 // delete with no fresh regenerate yet) — allocRow (always available for a
 // vendor with a row in the latest plan_run) is the fallback source.
-function overrideInputCells(vendorId, richPlan, allocRow) {
+function overrideInputCells(vendorId, richPlan, allocRow, model) {
   const planAllocationId = richPlan ? richPlan.plan_allocation_id : allocRow ? allocRow.plan_allocation_id : null;
   if (!planAllocationId) return `<td class="col-divide">—</td><td>—</td>`;
   const suggestedAmount = richPlan ? richPlan.allocated_amount : allocRow.allocated_amount;
@@ -1104,22 +1229,22 @@ function overrideInputCells(vendorId, richPlan, allocRow) {
   // doesn't bubble into the row's selectVendorRow() click handler and pop
   // the detail modal open mid-entry.
   return `<td class="col-divide"><input type="number" class="override-input" id="ov-pct-${vendorId}" value="${pctVal}"
-            placeholder="${suggestedPct}" oninput="onOverridePctInput(${vendorId})" onblur="saveOverride(${vendorId})"
+            placeholder="${suggestedPct}" oninput="onOverridePctInput(${vendorId}, ${model})" onblur="saveOverride(${vendorId}, ${model})"
             onclick="event.stopPropagation()"></td>
           <td><input type="text" inputmode="numeric" class="override-input money-input" id="ov-amt-${vendorId}" value="${amtVal === "" ? "" : amtVal.toLocaleString("en-IN")}"
-            placeholder="${suggestedAmt.toLocaleString("en-IN")}" oninput="onOverrideAmtInput(${vendorId})" onblur="saveOverride(${vendorId})"
+            placeholder="${suggestedAmt.toLocaleString("en-IN")}" oninput="onOverrideAmtInput(${vendorId}, ${model})" onblur="saveOverride(${vendorId}, ${model})"
             onclick="event.stopPropagation()"></td>`;
 }
 
-function onOverridePctInput(vendorId) {
-  const target = latestAllocationTarget(1, vendorId);
+function onOverridePctInput(vendorId, model) {
+  const target = latestAllocationTarget(model, vendorId);
   const pctVal = parseFloat(document.getElementById(`ov-pct-${vendorId}`).value);
   const amtEl = document.getElementById(`ov-amt-${vendorId}`);
   setMoneyInputValue(amtEl, Number.isNaN(pctVal) || !(target.denom > 0) ? NaN : (pctVal / 100) * target.denom);
 }
 
-function onOverrideAmtInput(vendorId) {
-  const target = latestAllocationTarget(1, vendorId);
+function onOverrideAmtInput(vendorId, model) {
+  const target = latestAllocationTarget(model, vendorId);
   const amtVal = moneyInputValue(document.getElementById(`ov-amt-${vendorId}`));
   const pct = Number.isNaN(amtVal) || !target.denom ? null : formatPct(amtVal, target.denom);
   document.getElementById(`ov-pct-${vendorId}`).value = pct != null ? pct.toFixed(2) : "";
@@ -1132,6 +1257,94 @@ function onOverrideAmtInput(vendorId) {
 // Plan-N groups, at the end of the table alongside Amt paid.
 function priorityCell(vendor) {
   return `<td class="col-divide">${weeklyPriority(vendor)}</td>`;
+}
+
+// ---- Task 2 Part B: Planning-screen (tab 5 only) inline vendor-tag edits -
+// Category/Priority Tag/Commitment Months/Assigned Week moved here from the
+// old Master Data grid (docs/11-configuration-module.md's Configuration-
+// module scope decision: system-level New Model 2 thresholds/buckets stay
+// in Configuration, these four vendor-specific fields live on the Planning
+// screen instead). Every dropdown/input below calls the SAME
+// PATCH /vendors/{id} -> update_vendor_field() write-back + audit-log path
+// the old Master Data grid used — reused, not reimplemented. Fires
+// immediately on change (instant-apply, same convention as this page's
+// other inline edits — Reconsider, overrides — no separate "save" step to
+// forget), and reuses loadVendors() for the refresh (same call
+// uploadMasterFileNow() already makes after a category/tag-changing Excel
+// upload) — never navigates away from the Planning tab and never touches
+// planDataByModel[5] (the current cycle's already-generated plan stays put).
+const CATEGORY_OPTIONS = ["must_pay", "commitment", "normal", "inactive"];
+// P0/P1 are Must Pay/Commitment's own auto-derived display tags, never
+// manually pickable (docs/14) — only P2-P5 are real, Finance-assigned
+// buckets, open to Normal AND Inactive vendors alike (docs/11 Task 2).
+const ASSIGNABLE_PRIORITY_TAGS = ["P2", "P3", "P4", "P5"];
+const TAGGABLE_CATEGORIES = ["normal", "inactive"];
+
+async function editVendorTagField(vendorId, field, rawValue) {
+  const resultEl = document.getElementById("override-result");
+  let value = rawValue;
+  if (field === "commitment_months" || field === "assigned_week") {
+    value = rawValue === "" ? null : parseInt(rawValue, 10);
+  }
+  try {
+    await apiCall(null, "PATCH", `/vendors/${vendorId}`, { field, new_value: value });
+    await loadVendors(); // same full refresh uploadMasterFileNow() already uses after a tag-changing edit
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+    renderTableRows(lastRenderedRows); // reset any control that got ahead of the DB on a failed edit
+  }
+}
+
+// Category itself — plain badge on every other tab, an editable dropdown on
+// tab 5 (Planning screen) only.
+function categoryCell(vendor) {
+  if (activeTab !== 5) return `<td>${categoryBadge(vendor.category)}</td>`;
+  const opts = CATEGORY_OPTIONS
+    .map(c => `<option value="${c}" ${vendor.category === c ? "selected" : ""}>${CATEGORY_LABEL[c] || c}</option>`)
+    .join("");
+  return `<td><select onclick="event.stopPropagation()"
+            onchange="event.stopPropagation(); editVendorTagField(${vendor.id}, 'category', this.value)">${opts}</select></td>`;
+}
+
+// New Model 2's own tab only (docs/14) — the vendor's Finance-assigned
+// P2/P3/P4/P5 priority TAG (Vendor.priority_tag), a completely different
+// concept from the "Priority" column above (which is the week-assignment
+// Wn-Pm fact, untouched here) — labeled "V-Priority" specifically so the
+// two are never confused. Editable only for Normal/Inactive vendors (P0/P1
+// are auto-derived, never manually picked here).
+function vPriorityCell(vendor) {
+  if (!TAGGABLE_CATEGORIES.includes(vendor.category)) {
+    return `<td class="col-divide">${vendor.priority_tag || "—"}</td>`;
+  }
+  const opts = ASSIGNABLE_PRIORITY_TAGS
+    .map(t => `<option value="${t}" ${vendor.priority_tag === t ? "selected" : ""}>${t}</option>`)
+    .join("");
+  return `<td class="col-divide"><select onclick="event.stopPropagation()"
+            onchange="event.stopPropagation(); editVendorTagField(${vendor.id}, 'priority_tag', this.value)">${opts}</select></td>`;
+}
+
+// Tab 5 only — Commitment vendors' amortization-month count. Same
+// validation as before (server-side: positive integer), just relocated;
+// left enabled for every category (not just Commitment) so switching a
+// vendor's category here and setting its months takes one row edit, not two.
+function commitmentMonthsCell(vendor) {
+  const value = vendor.commitment_months == null ? "" : vendor.commitment_months;
+  return `<td class="col-divide"><input type="number" min="1" step="1" style="width:60px;" value="${value}"
+            onclick="event.stopPropagation()"
+            onchange="event.stopPropagation(); editVendorTagField(${vendor.id}, 'commitment_months', this.value)"></td>`;
+}
+
+// Tab 5 only — Assigned Week (W1-W5). Options are always 1-5 here; the
+// server still enforces the real calendar-derived max for the current
+// month (CLAUDE.md rule 7) and rejects an out-of-range week the same way
+// it always has — this dropdown doesn't re-implement that check.
+function assignedWeekCell(vendor) {
+  const opts = [1, 2, 3, 4, 5]
+    .map(w => `<option value="${w}" ${vendor.assigned_week === w ? "selected" : ""}>W${w}</option>`)
+    .join("");
+  return `<td class="col-divide"><select onclick="event.stopPropagation()"
+            onchange="event.stopPropagation(); editVendorTagField(${vendor.id}, 'assigned_week', this.value)">
+            <option value="" ${vendor.assigned_week == null ? "selected" : ""}>—</option>${opts}</select></td>`;
 }
 
 // Distribution is Finance's own free-form planned split across W1-W5 —
@@ -1173,10 +1386,16 @@ function distributionCells(vendor) {
     const plannedVal = planned[key] != null ? Math.round(planned[key]) : "";
     const isPaid = paidVal != null;
     const displayVal = isPaid ? paidVal : plannedVal;
+    // Always the vendor's own real tag (Vendor.assigned_week) — never the
+    // pulled-forward display week their amount might currently be grouped
+    // under this round (see planner.py's own note on that distinction).
+    const isAssociatedWeek = w === vendor.assigned_week;
+    const cellClass = ["dist-input", "money-input", isPaid ? "dist-input-paid" : "", isAssociatedWeek ? "dist-input-associated-week" : ""]
+      .filter(Boolean).join(" ");
     return `<td${w === 1 ? ' class="col-divide"' : ""}>
-        <input type="text" inputmode="numeric" class="dist-input money-input ${isPaid ? "dist-input-paid" : ""}" id="dist-${vendor.id}-${w}"
+        <input type="text" inputmode="numeric" class="${cellClass}" id="dist-${vendor.id}-${w}"
           value="${displayVal === "" ? "" : displayVal.toLocaleString("en-IN")}"
-          title="${isPaid ? "Paid — read-only, the plan for this week is unaffected" : ""}"
+          title="${isPaid ? "Paid — read-only, the plan for this week is unaffected" : isAssociatedWeek ? "This vendor's own associated week" : ""}"
           ${isPaid ? "readonly" : `onblur="saveWeekDistribution(${vendor.id}, ${w})"`}
           onclick="event.stopPropagation()"></td>`;
   }).join("");
@@ -1210,7 +1429,7 @@ async function saveWeekDistribution(vendorId, week) {
       );
       // Shared/vendor-level, not scoped to one model's own cache — every
       // tab's copy of the map needs the same fresh value.
-      [1, 2, 3].forEach(m => {
+      [1, 2, 3, 4, 5].forEach(m => {
         const h = planHistoryByModel[m];
         if (h) h.vendor_week_distribution_plans[String(vendorId)] = resp.week_distribution_plan;
       });
@@ -1232,12 +1451,12 @@ let pendingOverrideSave = null;
 // Blur-triggered save (fires when Finance tabs/clicks away from either field).
 // Server response is the source of truth for the re-render — a clamped or
 // rejected value must show up as visibly correct, not just what was typed.
-// Override editing only exists on Model 1's tab (product decision, Models
-// 2/3 stay untouched) — always targets the truly-latest plan_run's row
+// Always targets the truly-latest plan_run's row
 // (backend/api/routers/plan_allocations.py's own guard rejects anything
-// else with a 409, docs/06 plan-history feature).
-async function saveOverride(vendorId) {
-  const target = latestAllocationTarget(1, vendorId);
+// else with a 409, docs/06 plan-history feature). `model` selects which
+// model's cache this save reads/writes back into (New Model 2 = 5).
+async function saveOverride(vendorId, model) {
+  const target = latestAllocationTarget(model, vendorId);
   const resultEl = document.getElementById("override-result");
   const vendorName = vendorsById[vendorId] ? vendorsById[vendorId].vendor_name : vendorId;
   if (!target.plan_allocation_id) {
@@ -1258,13 +1477,13 @@ async function saveOverride(vendorId) {
       const resp = await apiCall(null, "PATCH", `/plan-allocations/${target.plan_allocation_id}/override`, { override_amount: overrideAmount });
       // Keep both caches (rich + history snapshot) in sync so an immediate
       // re-render (no refetch) reflects the save right away.
-      const richPlan = planDataByModel[1][vendorId];
+      const richPlan = planDataByModel[model][vendorId];
       if (richPlan && richPlan.plan_allocation_id === target.plan_allocation_id) {
         richPlan.override_amount = resp.override_amount;
         richPlan.effective_amount = resp.effective_amount;
         richPlan.allocated_amount = resp.allocated_amount;
       }
-      const lastRun = latestPlanRun(1);
+      const lastRun = latestPlanRun(model);
       const allocRow = lastRun ? lastRun.allocations.find(a => a.vendor_id === vendorId) : null;
       if (allocRow) {
         allocRow.override_amount = resp.override_amount;
@@ -1292,11 +1511,93 @@ async function saveOverride(vendorId) {
     } catch (e) {
       resultEl.textContent = `ERROR: ${e.message}`;
     }
-    refreshFundsCardsFromOverrides();
     renderTableRows(lastRenderedRows);
   })();
   await pendingOverrideSave;
   pendingOverrideSave = null;
+}
+
+// ---- New Model 2 — Finalize + three-option shortfall block (docs/14) -----
+// Reached directly from the Finalize button's onclick.
+async function finalizeNewModel2() {
+  const resultEl = document.getElementById("finalize-plan-result");
+  resultEl.textContent = "Checking…";
+  try {
+    const data = await apiCall(null, "POST", "/models/5/finalize", {});
+    if (data.ok) {
+      await applyPaymentTracking();
+      renderVendorPaymentsTable();
+      resultEl.textContent =
+        `New Model 2 plan finalized — within available funds (${formatMoney(data.total_committed)} of ${formatMoney(data.available_funds)}). ` +
+        `Budget updated for ${data.vendor_count} vendor(s).`;
+      return;
+    }
+    showNm2ShortfallModal(data);
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+let _nm2ShortfallData = null;
+
+function showNm2ShortfallModal(data) {
+  _nm2ShortfallData = data;
+  document.getElementById("nm2-shortfall-summary").innerHTML =
+    `Committed amount ${formatMoney(data.total_committed)} exceeds available funds ` +
+    `${formatMoney(data.available_funds)} by <strong>${formatMoney(data.over_by)}</strong>.` +
+    (data.responsible_vendors.length
+      ? `<br>Responsible override(s): ${data.responsible_vendors.map(v => escapeHtml(v.vendor_name)).join(", ")}.`
+      : "");
+  document.getElementById("nm2-shortfall-options").innerHTML = [
+    `<button type="button" class="btn btn-primary" onclick="nm2ReduceToSuggested()">1. Reduce ${
+      data.responsible_vendors.length > 1 ? "these overrides" : "this override"
+    } back to the suggested amount</button>`,
+    `<button type="button" class="btn" onclick="nm2PickAnotherVendor()">2. Reduce another vendor's amount to free up the difference</button>`,
+    `<button type="button" class="btn" onclick="nm2IncreaseFunds()">3. Increase available funds to cover the gap</button>`,
+  ].join("");
+  document.getElementById("nm2-shortfall-modal-backdrop").style.display = "flex";
+}
+
+function closeNm2ShortfallModal() {
+  document.getElementById("nm2-shortfall-modal-backdrop").style.display = "none";
+}
+
+async function nm2ReduceToSuggested() {
+  const data = _nm2ShortfallData;
+  const resultEl = document.getElementById("finalize-plan-result");
+  for (const v of data.responsible_vendors) {
+    const target = latestAllocationTarget(5, v.vendor_id);
+    if (!target.plan_allocation_id) continue;
+    const resp = await apiCall(null, "PATCH", `/plan-allocations/${target.plan_allocation_id}/override`, { override_amount: null });
+    const richPlan = planDataByModel[5][v.vendor_id];
+    if (richPlan) {
+      richPlan.override_amount = resp.override_amount;
+      richPlan.effective_amount = resp.effective_amount;
+      richPlan.allocated_amount = resp.allocated_amount;
+    }
+    if (vendorsById[v.vendor_id]) vendorsById[v.vendor_id].override_amount = resp.override_amount;
+  }
+  await refreshPlanHistory(5);
+  closeNm2ShortfallModal();
+  renderModelTable();
+  resultEl.textContent =
+    "Override(s) reset to suggested. Click Generate plan to redistribute the freed funds among other vendors, then Finalize again.";
+}
+
+function nm2PickAnotherVendor() {
+  closeNm2ShortfallModal();
+  document.getElementById("finalize-plan-result").textContent =
+    "Edit another vendor's Override cell in the table below to free up the difference, then click Finalize again.";
+}
+
+function nm2IncreaseFunds() {
+  const data = _nm2ShortfallData;
+  const el = document.getElementById("funds-input");
+  const current = moneyInputValue(el);
+  setMoneyInputValue(el, (Number.isNaN(current) ? data.available_funds : current) + data.over_by);
+  closeNm2ShortfallModal();
+  document.getElementById("finalize-plan-result").textContent =
+    "Available funds increased to cover the gap — click Generate plan, then Finalize again.";
 }
 
 // ---- vendor detail (modal — opens right where the user is, no scrolling) --
@@ -1310,6 +1611,71 @@ function closeVendorDetail() {
 // anymore); true from the payments table's own "Pay" button (the one place
 // logging a payment is meant to happen). Same shared modal either way —
 // this only toggles whether its payment-card section is visible.
+// New Model 2's own vendor detail card panel (docs/14, tab 5 only) — live,
+// real-computed from GET /models/5/vendors/{id}/min-funds-required, never
+// hardcoded. planning_month is omitted once a cycle's plan_run already
+// exists (the endpoint reuses its stored month); before that, whatever's
+// currently picked on the "New Model 2 — planning cycle" card is used, so
+// this still works while Finance is browsing before ever clicking Generate.
+async function nm2MinFundsPanel(vendorId) {
+  let url = `/models/5/vendors/${vendorId}/min-funds-required`;
+  if (!nm2HasGeneratedThisCycle()) {
+    const month = document.getElementById("nm2-planning-month").value;
+    if (!month) {
+      return `<div class="detail-panel aging-panel-full"><h3>Min Funds Required</h3>` +
+        `<p class="muted">Pick a planning month on the New Model 2 card above first.</p></div>`;
+    }
+    url += `?planning_month=${month}`;
+  }
+  try {
+    const detail = await apiCall(null, "GET", url);
+    return `<div class="detail-panel aging-panel-full"><h3>Min Funds Required</h3>` +
+      `<p>${escapeHtml(nm2MinFundsSentence(detail))}</p></div>`;
+  } catch (e) {
+    return `<div class="detail-panel aging-panel-full"><h3>Min Funds Required</h3>` +
+      `<p class="muted">ERROR: ${escapeHtml(e.message)}</p></div>`;
+  }
+}
+
+// Deterministic template, one sentence per docs/14 rule branch — NOT
+// AI/Gemini-generated (this is describing deterministic arithmetic, CLAUDE.md
+// rule 3's deterministic/AI boundary). Selected by which branch the backend
+// actually applied (`detail.rule`), filled in with the real computed numbers.
+function nm2MinFundsSentence(detail) {
+  const fmt = formatMoney;
+  if (detail.rule.startsWith("commitment_")) {
+    return `Opening balance ${fmt(detail.opening_balance)} ÷ ${detail.commitment_months} months remaining = ${fmt(detail.total)}.`;
+  }
+  const cur = detail.current_month ? formatMonthShortYear(detail.current_month) : null;
+  const old = detail.oldest_month ? formatMonthShortYear(detail.oldest_month) : null;
+  switch (detail.rule) {
+    case "v2_only_current":
+      return `This month's bill: ${cur}, ${fmt(detail.current_amount)}. No older leftover outstanding. Min Funds Required: ${fmt(detail.total)}.`;
+    case "v2_current_zero_oldest_only":
+      return `No bill this cycle (${cur}). Oldest outstanding bill: ${old}, ${fmt(detail.oldest_amount)}. Min Funds Required: ${fmt(detail.total)}.`;
+    case "v2_oldest_and_current":
+      // Adjacent case (docs/14): the second month picked genuinely IS the
+      // current month — nothing outstanding sits between them.
+      return `Oldest bill: ${old}, ${fmt(detail.oldest_amount)}. This month's bill: ${cur}, ${fmt(detail.current_amount)}. ` +
+        `${fmt(detail.oldest_amount)} is 50% or less of ${fmt(detail.current_amount)}, so both are included. Min Funds Required: ${fmt(detail.total)}.`;
+    case "v2_oldest_and_second": {
+      // Gap case (docs/14, this task's fix): the second month picked is a
+      // REAL nonzero month found by walking forward from the oldest,
+      // skipping zero-balance months — it is NOT the current month, whose
+      // own bill is deliberately excluded (named explicitly, not implied).
+      const second = formatMonthShortYear(detail.second_month);
+      return `Oldest bill: ${old}, ${fmt(detail.oldest_amount)}. Next outstanding bill: ${second}, ${fmt(detail.second_amount)}. ` +
+        `${fmt(detail.oldest_amount)} is 50% or less of this month's ${fmt(detail.current_amount)} bill, so the oldest and next ` +
+        `outstanding bill are included — this month's own ${fmt(detail.current_amount)} bill is not. Min Funds Required: ${fmt(detail.total)}.`;
+    }
+    case "v2_oldest_only":
+      return `Oldest bill: ${old}, ${fmt(detail.oldest_amount)}. This is more than 50% of this month's ${fmt(detail.current_amount)} bill, ` +
+        `so only the oldest is included. Min Funds Required: ${fmt(detail.total)}.`;
+    default:  // v2_no_outstanding
+      return `No outstanding balance. Min Funds Required: ${fmt(0)}.`;
+  }
+}
+
 async function selectVendorRow(vendorId, showPayment = true) {
   if (pendingOverrideSave) await pendingOverrideSave;  // don't read plan data mid-save
   if (pendingDistributionSave) await pendingDistributionSave;
@@ -1326,8 +1692,9 @@ async function selectVendorRow(vendorId, showPayment = true) {
 
   const aging = await apiCall(null, "GET", `/vendors/${vendorId}/aging`);
   // Original single-row bucket view — month header, day-range label, still-
-  // owed amount only. Kept separate from Vendor Details below (confirmed
-  // with Sarath — three distinct tables, not merged).
+  // owed amount only, no status/tags of any kind (confirmed with Sarath —
+  // stays a plain read of the outstanding amounts, kept separate from
+  // "What we're paying this month" below).
   const monthlyBreakdownTable = aging.monthly_breakdown.length
     ? `<table class="monthly-breakdown-table">
          <tr>${aging.monthly_breakdown.map(m => `<th class="month-header">${formatMonthShortYear(m.month)}</th>`).join("")}</tr>
@@ -1345,54 +1712,65 @@ async function selectVendorRow(vendorId, showPayment = true) {
       <div class="aging-scroll">${monthlyBreakdownTable || '<p class="muted">No outstanding balance.</p>'}</div>
     </div>`;
 
-  // Vendor Details — Payable | Payment, one column per calendar month, its
-  // own separate card (confirmed with Sarath — not merged into Aging
-  // above). Owed is deliberately not repeated here — it already lives in
-  // the Aging table above.
-  const vendorDetailsTable = aging.monthly_breakdown.length
+  // "What we're paying this month" (2026-07-20, confirmed with Sarath,
+  // replaces the old cascading "Vendor Details" ledger entirely — Finance
+  // found Payable/B-F/Total due/Paid/Balance c/f across every calendar
+  // month confusing; this is the plain answer to "which bill are we
+  // actually paying, and what leftovers ride along with it").
+  //
+  // Walks aging.monthly_breakdown oldest -> newest (already fetched above
+  // for the Aging block — nothing hardcoded, nothing from a separate
+  // endpoint) and mirrors, on purpose, the exact same carry-forward rule
+  // backend/shared/min_funds.py's _carry_forward_normal_amount() uses for
+  // Min Funds Required: every tranche that still has a balance AND has
+  // already received some payment is a leftover riding along; the walk
+  // stops the moment it hits the first tranche that's still fully
+  // untouched (amount == payable) — that one and only that one is tagged
+  // "Curr". Two enum values only, exactly as confirmed: Curr, Leftover.
+  // If _carry_forward_normal_amount()'s rule ever changes, this walk must
+  // change with it — it isn't called directly only because
+  // monthly_breakdown already carries everything this needs (payable +
+  // amount per tranche) without adding a new endpoint for a UI-only read.
+  const MONEY_EPSILON = 1; // same "under a rupee" money-equality convention used elsewhere (e.g. the -0 balance fix)
+  const payingRows = [];
+  for (const m of aging.monthly_breakdown) {
+    if (m.amount <= MONEY_EPSILON) continue; // fully cleared — not part of this cycle at all
+    const isFresh = m.amount >= m.payable - MONEY_EPSILON;
+    payingRows.push({ month: m.month, label: m.label, amount: m.amount, type: isFresh ? "Curr" : "Leftover" });
+    if (isFresh) break; // only one fresh tranche is ever picked up per cycle
+  }
+  const totalPayingThisMonth = payingRows.reduce((sum, r) => sum + r.amount, 0);
+  // Curr is always pushed last (it's the walk's stopping point), but
+  // Sarath wants it on top — no scrolling to find it as the leftover chain
+  // grows over time — so reverse purely for display; the total row still
+  // sums payingRows itself, order doesn't affect the math.
+  const payingRowsForDisplay = payingRows.slice().reverse();
+  const payingTable = payingRows.length
     ? `<table class="monthly-breakdown-table">
-         <tr><th class="row-label"></th>${aging.monthly_breakdown.map(m => `<th class="month-header">${formatMonthShortYear(m.month)}</th>`).join("")}</tr>
-         <tr><th class="row-label"></th>${aging.monthly_breakdown.map(m => `<th>${m.label}</th>`).join("")}</tr>
-         <tr><td class="row-label">Payable</td>${aging.monthly_breakdown.map(m => `<td class="amt">${formatMoney(m.payable)}</td>`).join("")}</tr>
-         <tr><td class="row-label">Payment</td>${aging.monthly_breakdown.map(m => `<td class="amt">${formatMoney(m.payment)}</td>`).join("")}</tr>
+         <tr><th class="row-label">Month</th><th>Type</th><th>Amount</th></tr>
+         ${payingRowsForDisplay.map(r => `
+           <tr class="${r.type === "Curr" ? "ledger-current-row" : ""}">
+             <td class="row-label">${formatMonthShortYear(r.month)} ${r.label}</td>
+             <td>${r.type === "Curr" ? '<span class="badge badge-cat-normal">Curr</span>' : '<span class="badge badge-partial">Leftover</span>'}</td>
+             <td class="amt${r.type === "Leftover" ? " ledger-leftover" : ""}">${formatMoney(r.amount)}</td>
+           </tr>`).join("")}
+         <tr class="paying-total-row"><td class="row-label">Total being paid this month</td><td></td><td class="amt">${formatMoney(totalPayingThisMonth)}</td></tr>
        </table>`
-    : "";
-  const vendorDetailsBlock = `
+    : '<p class="muted">No outstanding balance.</p>';
+  // New Model 2's own tab (docs/14, this task) gets a different second
+  // panel entirely — Min Funds Required under the NEW required_amount_v2
+  // rule (backend/shared/min_funds_v2.py), a deterministic template
+  // sentence per situation, not the old Curr/Leftover carry-forward walk
+  // above (which mirrors the OLD, now-superseded rule and stays exactly
+  // as-is for every other tab). Applies to every category now (Must Pay/
+  // Normal/Inactive share the template above; Commitment gets its own).
+  const vendorDetailsBlock = activeTab === 5
+    ? await nm2MinFundsPanel(vendorId)
+    : `
     <div class="detail-panel aging-panel-full">
-      <h3>Vendor Details</h3>
-      <div class="aging-scroll">${vendorDetailsTable || '<p class="muted">No outstanding balance.</p>'}</div>
+      <h3>What we're paying this month</h3>
+      <div class="aging-scroll">${payingTable}</div>
     </div>`;
-
-  // Leftovers — docs/04 carry-forward fix, third and final table (confirmed
-  // with Sarath). ONLY the leftover tranche(s) (a prior cycle's partially-
-  // paid bill), oldest -> newest, with their own Total — the fresh/next
-  // tranche is NOT a row here, it's folded into the summary line below
-  // instead: Min Funds Required = leftover total + this month's own bill.
-  // Shown ONLY before this cycle's plan exists (CLAUDE.md's two-step Model 2
-  // flow) — reuses the same /vendors/{id}/aging fetch, nothing extra
-  // requested from the backend.
-  const minFundsBlock = (!hasGeneratedThisCycle && aging.min_funds_tranches.length)
-    ? (() => {
-        const leftovers = aging.min_funds_tranches.filter(t => t.is_leftover);
-        const fresh = aging.min_funds_tranches.find(t => !t.is_leftover);
-        const leftoverTotal = leftovers.reduce((sum, t) => sum + t.remaining_amount, 0);
-        const leftoversTable = leftovers.length
-          ? `<table class="min-funds-table">
-               <tr>${leftovers.map(t => `<th class="month-label">${formatMonth(t.month)}</th>`).join("")}<th class="month-label">Total</th></tr>
-               <tr>${leftovers.map(t => `<td class="amt leftover">${formatMoney(t.remaining_amount)}</td>`).join("")}<td class="amt"><strong>${formatMoney(leftoverTotal)}</strong></td></tr>
-             </table>`
-          : '<p class="muted">No leftover from a prior shortfall.</p>';
-        const summaryLine = fresh
-          ? `Min Funds Required = ${formatMoney(leftoverTotal)} (leftover) + ${formatMoney(fresh.remaining_amount)} (${formatMonth(fresh.month)}, this month's bill) = <strong>${formatMoney(leftoverTotal + fresh.remaining_amount)}</strong>`
-          : `Min Funds Required = <strong>${formatMoney(leftoverTotal)}</strong> (leftover only — nothing further due yet)`;
-        return `<div class="detail-panel aging-panel-full">
-         <h3>Leftovers</h3>
-         <div class="aging-scroll">${leftoversTable}</div>
-         ${leftovers.length ? '<p class="min-funds-footnote">*italic = leftover from a prior shortfall, carried forward on top of this month’s own bill</p>' : ""}
-         <p class="min-funds-footnote">${summaryLine}</p>
-       </div>`;
-      })()
-    : "";
 
   // AI talking script panel: present only for a zero-status vendor on the
   // active model's latest generated plan. Absent entirely (no empty box)
@@ -1411,7 +1789,7 @@ async function selectVendorRow(vendorId, showPayment = true) {
     : "";
 
   document.getElementById("detail-row1").innerHTML =
-    `${agingBlock}${vendorDetailsBlock}${minFundsBlock}${rightPanel ? `<div class="detail-row1">${rightPanel}</div>` : ""}`;
+    `${agingBlock}${vendorDetailsBlock}${rightPanel ? `<div class="detail-row1">${rightPanel}</div>` : ""}`;
 
   if (showPayment) {
     // FIFO always pays the oldest outstanding tranche first (backend/shared/
@@ -1504,7 +1882,352 @@ async function submitDetailPayment() {
   }
 }
 
+// ---- Master Data grid — Excel upload/commit/revert + generic passthrough
+// field editing (data-pipeline-upload task, docs/07 + 11). No preview/
+// confirm step (Sarath's course-correction) — one file pick, one button,
+// the upload takes effect immediately. Known/mapped editable fields
+// (category, commitment_months, assigned_week) call the existing
+// PATCH /vendors/{id} route (update_vendor_field) — no validation/writeback
+// re-implemented here. Unmapped columns call the new
+// PATCH /master-data/extra-fields/{vendor_id} route instead.
+let masterUploadPickedFile = null;
+let masterGridState = null; // last /master-data/grid response — re-render source after any edit
+
+function onMasterUploadFilePicked(event) {
+  masterUploadPickedFile = event.target.files[0] || null;
+  document.getElementById("master-upload-btn").disabled = !masterUploadPickedFile;
+}
+
+// FormData upload, not apiCall() — that helper always JSON-encodes its body,
+// which can't carry a real file. Same error-surfacing contract as apiCall
+// otherwise (throws on a non-2xx response).
+async function uploadMasterFile(path, file) {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(path, { method: "POST", body: formData });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+async function uploadMasterFileNow() {
+  if (!masterUploadPickedFile) return;
+  const resultEl = document.getElementById("master-upload-result");
+  resultEl.textContent = "Uploading…";
+  try {
+    const result = await uploadMasterFile("/master-data/commit-upload", masterUploadPickedFile);
+    resultEl.textContent =
+      `Upload committed — ${result.vendors_changed} vendor(s) changed ` +
+      `(${result.new_vendor_count} new, ${result.vendors_with_changed_ledger_count} with a changed ledger figure).`;
+    masterUploadPickedFile = null;
+    document.getElementById("master-upload-file").value = "";
+    document.getElementById("master-upload-btn").disabled = true;
+    await loadMasterDataGrid();
+    await loadVendors(); // category/tags may have changed via the upload — refresh everywhere they're shown
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+async function revertMasterUpload() {
+  const resultEl = document.getElementById("master-upload-result");
+  resultEl.textContent = "Reverting…";
+  try {
+    const result = await apiCall(null, "POST", "/master-data/revert");
+    resultEl.textContent = `Reverted. ${result.warning}`;
+    await loadMasterDataGrid();
+    await loadVendors();
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+async function editMasterKnownField(vendorId, field, value) {
+  try {
+    await apiCall(null, "PATCH", `/vendors/${vendorId}`, { field, new_value: value });
+  } catch (e) {
+    document.getElementById("master-upload-result").textContent = `ERROR: ${e.message}`;
+  }
+  await loadMasterDataGrid();
+}
+
+async function editMasterExtraField(vendorId, columnName, value) {
+  try {
+    await apiCall(null, "PATCH", `/master-data/extra-fields/${vendorId}`, { column_name: columnName, new_value: value });
+  } catch (e) {
+    document.getElementById("master-upload-result").textContent = `ERROR: ${e.message}`;
+  }
+  await loadMasterDataGrid();
+}
+
+function handleMasterDropdownChange(select, vendorId, columnName) {
+  if (select.value !== "__add_new__") {
+    editMasterExtraField(vendorId, columnName, select.value);
+    return;
+  }
+  const newValue = (prompt("New value for this column:") || "").trim();
+  if (!newValue) {
+    loadMasterDataGrid(); // reset the <select> back to its real current value
+    return;
+  }
+  editMasterExtraField(vendorId, columnName, newValue);
+}
+
+function masterExtraFieldWidgetHtml(columnName, vendorId, value) {
+  const widgetInfo = (masterGridState.extra_field_widgets || {})[columnName] || { widget: "text", options: null };
+  const safeCol = escapeHtml(columnName);
+  if (widgetInfo.widget === "toggle" && widgetInfo.options && widgetInfo.options.length === 2) {
+    const opts = widgetInfo.options
+      .map(o => `<option value="${escapeHtml(o)}" ${value === o ? "selected" : ""}>${escapeHtml(o)}</option>`)
+      .join("");
+    return `<select onchange="editMasterExtraField(${vendorId}, '${safeCol}', this.value)">${opts}</select>`;
+  }
+  if (widgetInfo.widget === "dropdown") {
+    // Always offers "+ Add new value" (decision #5) — Finance is never
+    // limited to whatever happened to already be in the file.
+    const opts = (widgetInfo.options || [])
+      .map(o => `<option value="${escapeHtml(o)}" ${value === o ? "selected" : ""}>${escapeHtml(o)}</option>`)
+      .join("");
+    return `<select onchange="handleMasterDropdownChange(this, ${vendorId}, '${safeCol}')">${opts}<option value="__add_new__">+ Add new value</option></select>`;
+  }
+  return `<input type="text" value="${value === null || value === undefined ? "" : escapeHtml(value)}"
+    onchange="editMasterExtraField(${vendorId}, '${safeCol}', this.value)">`;
+}
+
+function masterGridCellHtml(col, vendorRow) {
+  const value = vendorRow.values[col.header];
+  const display = value === null || value === undefined ? "—" : escapeHtml(value);
+  if (!col.editable) {
+    return `<td>${display}</td>`;
+  }
+  if (col.kind === "extra") {
+    return `<td>${masterExtraFieldWidgetHtml(col.column_name, vendorRow.vendor_id, value)}</td>`;
+  }
+  // category / commitment_months / assigned_week — existing update_vendor_field() API, not re-implemented here.
+  return `<td><input type="text" style="width:90px;" value="${value === null || value === undefined ? "" : escapeHtml(value)}"
+    onchange="editMasterKnownField(${vendorRow.vendor_id}, '${col.field}', this.value)"></td>`;
+}
+
+async function loadMasterDataGrid() {
+  const wrap = document.getElementById("master-grid-wrap");
+  try {
+    const grid = await apiCall(null, "GET", "/master-data/grid");
+    masterGridState = grid;
+    const headerRow = grid.columns.map(c => `<th>${escapeHtml(c.header)}</th>`).join("");
+    const bodyRows = grid.vendors
+      .map(v => `<tr>${grid.columns.map(c => masterGridCellHtml(c, v)).join("")}</tr>`)
+      .join("");
+    wrap.innerHTML = `<table><thead><tr>${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+  } catch (e) {
+    wrap.innerHTML = `<p class="muted" style="padding:12px;">ERROR: ${e.message}</p>`;
+  }
+}
+
+// ---- Configuration — New Model 2 priority-bucket CRUD (docs/11 Task 2 Part C) ----
+// System-level only (ceiling %/floor %/bucket set) — vendor-specific tags
+// are the Planning tab's job (tab 5's inline dropdowns above), never this
+// section's. Every add/edit/remove hits GET/config/priority-buckets'
+// sibling routes directly (backend/configuration/priority_bucket_edits.py),
+// each one its own already-audited, already-validated call — no separate
+// client-side validation duplicated here beyond what the inputs' own
+// type="number" gives for free.
+let priorityBucketState = []; // last GET /config/priority-buckets response
+
+function priorityBucketRowHtml(b) {
+  return `<tr>
+    <td>${escapeHtml(b.bucket_key)}</td>
+    <td><input type="text" value="${escapeHtml(b.display_label)}" style="width:110px;"
+          onchange="editPriorityBucketNow('${b.bucket_key}', 'display_label', this.value)"></td>
+    <td><input type="number" value="${(b.ceiling_pct * 100).toFixed(2)}" style="width:80px;"
+          onchange="editPriorityBucketNow('${b.bucket_key}', 'ceiling_pct', this.value)"> %</td>
+    <td><input type="number" value="${(b.floor_pct * 100).toFixed(2)}" style="width:80px;"
+          onchange="editPriorityBucketNow('${b.bucket_key}', 'floor_pct', this.value)"> %</td>
+    <td><input type="number" value="${b.rotation_position}" style="width:60px;"
+          onchange="editPriorityBucketNow('${b.bucket_key}', 'rotation_position', this.value)"></td>
+    <td><button class="btn" onclick="removePriorityBucketNow('${b.bucket_key}')">Remove</button></td>
+  </tr>`;
+}
+
+async function loadPriorityBuckets() {
+  const wrap = document.getElementById("priority-bucket-wrap");
+  try {
+    priorityBucketState = await apiCall(null, "GET", "/config/priority-buckets");
+    const rows = priorityBucketState.map(priorityBucketRowHtml).join("");
+    wrap.innerHTML = `<table>
+      <thead><tr><th>Key</th><th>Display label</th><th>Ceiling</th><th>Floor</th><th>Rotation position</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    wrap.innerHTML = `<p class="muted" style="padding:12px;">ERROR: ${e.message}</p>`;
+  }
+}
+
+async function editPriorityBucketNow(bucketKey, field, rawValue) {
+  const resultEl = document.getElementById("priority-bucket-result");
+  const body = {};
+  if (field === "display_label") {
+    body.display_label = rawValue;
+  } else if (field === "rotation_position") {
+    body.rotation_position = parseInt(rawValue, 10);
+  } else {
+    // ceiling_pct/floor_pct: the table/inputs show Finance-facing percent
+    // (95), the API stores/expects a fraction (0.95) — same convention as
+    // system_config_edits.py's update_config_value().
+    body[field] = parseFloat(rawValue) / 100;
+  }
+  try {
+    await apiCall(null, "PUT", `/config/priority-buckets/${bucketKey}`, body);
+    resultEl.textContent = `Updated ${escapeHtml(bucketKey)}.`;
+    await loadPriorityBuckets();
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+    await loadPriorityBuckets(); // reset the input back to its real current value
+  }
+}
+
+async function addPriorityBucketNow() {
+  const resultEl = document.getElementById("priority-bucket-result");
+  const bucketKey = document.getElementById("pb-new-key").value.trim();
+  const displayLabel = document.getElementById("pb-new-label").value.trim();
+  const ceilingPct = parseFloat(document.getElementById("pb-new-ceiling").value);
+  const floorPct = parseFloat(document.getElementById("pb-new-floor").value);
+  const rotationPosition = parseInt(document.getElementById("pb-new-position").value, 10);
+  try {
+    await apiCall(null, "POST", "/config/priority-buckets", {
+      bucket_key: bucketKey,
+      display_label: displayLabel,
+      ceiling_pct: ceilingPct / 100,
+      floor_pct: floorPct / 100,
+      rotation_position: rotationPosition,
+    });
+    resultEl.textContent = `Added bucket ${escapeHtml(bucketKey)}.`;
+    ["pb-new-key", "pb-new-label", "pb-new-ceiling", "pb-new-floor", "pb-new-position"].forEach(id => {
+      document.getElementById(id).value = "";
+    });
+    await loadPriorityBuckets();
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+async function removePriorityBucketNow(bucketKey) {
+  const resultEl = document.getElementById("priority-bucket-result");
+  if (!confirm(`Remove bucket ${bucketKey}? This can't be undone.`)) return;
+  try {
+    await apiCall(null, "DELETE", `/config/priority-buckets/${bucketKey}`);
+    resultEl.textContent = `Removed bucket ${escapeHtml(bucketKey)}.`;
+    await loadPriorityBuckets();
+  } catch (e) {
+    resultEl.textContent = `ERROR: ${e.message}`;
+  }
+}
+
+// ---- New Model 2 companion — vendor talking points, guided flow (tab 5) --
+// Revamp (this task): a guided "pick a vendor -> auto-generate" flow, not
+// free-text chat — this widget does exactly one job. Session-only state,
+// lost on a page reload (reasonable default, flagged not silently decided).
+// Matches against planDataByModel[5] — the active New Model 2 plan's own
+// per-vendor cache already loaded for the Planning table — no second
+// vendor-fetch call added for this.
+let companionStep = "pick";           // "pick" | "loading" | "result" | "error"
+let companionSelectedVendor = null;   // vendorsById[id] of the vendor currently shown
+let companionResult = "";
+let companionError = "";
+
+function toggleCompanionPanel() {
+  const panel = document.getElementById("companion-panel");
+  const opening = panel.style.display === "none";
+  panel.style.display = opening ? "flex" : "none";
+  if (opening) {
+    companionStep = "pick";
+    companionSelectedVendor = null;
+    renderCompanionPanel();
+  }
+}
+
+function companionPlanVendors() {
+  // Only vendors in THIS cycle's New Model 2 plan are eligible — talking
+  // points need this cycle's own allocation/min-funds facts, which only
+  // exist once a plan has been generated (docs/14).
+  return Object.keys(planDataByModel[5])
+    .map(id => vendorsById[id])
+    .filter(Boolean);
+}
+
+function renderCompanionPanel() {
+  const body = document.getElementById("companion-body");
+
+  if (companionStep === "loading") {
+    body.innerHTML = `<p class="muted">Generating talking points for ${escapeHtml(companionSelectedVendor.vendor_name)}…</p>`;
+    return;
+  }
+
+  if (companionStep === "result") {
+    body.innerHTML = `
+      <button class="btn" onclick="companionStartOver()">&larr; Back</button>
+      <h3 style="margin:0;">${escapeHtml(companionSelectedVendor.vendor_name)} (${escapeHtml(companionSelectedVendor.erp_code)})</h3>
+      <p class="companion-script">${escapeHtml(companionResult)}</p>`;
+    return;
+  }
+
+  if (companionStep === "error") {
+    body.innerHTML = `
+      <button class="btn" onclick="companionStartOver()">&larr; Back</button>
+      <p class="muted" style="margin-top:8px;">ERROR: ${escapeHtml(companionError)}</p>`;
+    return;
+  }
+
+  // "pick" — the widget's one and only prompt.
+  if (companionPlanVendors().length === 0) {
+    body.innerHTML = '<p class="muted">Generate a New Model 2 plan first, then come back for talking points.</p>';
+    return;
+  }
+  body.innerHTML = `
+    <p class="muted" style="margin:0;">Which vendor do you want talking points for?</p>
+    <input id="companion-vendor-search" type="text" placeholder="Vendor name or ERP code…" oninput="renderCompanionMatches(this.value)">
+    <div id="companion-matches" style="display:flex; flex-direction:column; gap:4px;"></div>`;
+  document.getElementById("companion-vendor-search").focus();
+  renderCompanionMatches("");
+}
+
+function renderCompanionMatches(query) {
+  const matchesEl = document.getElementById("companion-matches");
+  const q = query.trim().toLowerCase();
+  const pool = companionPlanVendors();
+  const matches = q
+    ? pool.filter(v => v.vendor_name.toLowerCase().includes(q) || v.erp_code.toLowerCase().includes(q)).slice(0, 8)
+    : [];
+  matchesEl.innerHTML = matches.length
+    ? matches.map(v => `<button class="btn companion-match-btn" onclick="pickCompanionVendor(${v.id})">${escapeHtml(v.vendor_name)} (${escapeHtml(v.erp_code)})</button>`).join("")
+    : (q ? '<p class="muted" style="margin:0;">No matching vendor.</p>' : "");
+}
+
+async function pickCompanionVendor(vendorId) {
+  companionSelectedVendor = vendorsById[vendorId];
+  companionStep = "loading";
+  renderCompanionPanel();
+  try {
+    const resp = await apiCall(null, "POST", "/ai/vendor-talking-points", { vendor_id: vendorId });
+    companionResult = resp.script_text;
+    companionStep = "result";
+  } catch (e) {
+    companionError = e.message;
+    companionStep = "error";
+  }
+  renderCompanionPanel();
+}
+
+function companionStartOver() {
+  companionStep = "pick";
+  companionSelectedVendor = null;
+  renderCompanionPanel();
+}
+
+setActiveTab(5); // only tab on this page — sets Finalize label/companion button visibility up front
 loadVendors();
+loadPriorityBuckets(); // small, static-ish config table — unlike Master Data's grid (Fix 2 below), safe to auto-load
+// loadMasterDataGrid() deliberately NOT called here (Fix 2, Sarath) — the
+// grid stays empty until Finance clicks "Refresh grid" or completes an
+// upload, never fetched/rendered automatically on page load.
 </script>
 </body>
 </html>

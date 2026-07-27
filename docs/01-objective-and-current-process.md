@@ -17,7 +17,7 @@ This tool does not need to replicate this process faithfully — the goal is to 
 ## Success metrics
 
 1. **Planning time** — reduction in time Finance spends building a payment plan each cycle, compared to today's manual process.
-2. **Adoption** — percentage of payment cycles where Finance uses at least one model's suggestion as the basis for their plan.
+2. **Adoption** — percentage of payment cycles where Finance uses the model's suggestion as the basis for their plan.
 3. **Plan relevance** — percentage of suggested payments Finance accepts as-is or with only minor adjustment.
 4. **Payables trend** — whether the growth rate of total outstanding dues slows down compared to the historical trend (only relevant if Finance chooses to act on suggestions aimed at reducing it; the tool itself doesn't force this).
 

@@ -1,28 +1,21 @@
-"""Configuration router — Model 1 weights, Model 3 thresholds/bucket-target
-percentages, and a plain listing of the raw config table."""
+"""Configuration router — a plain listing of the raw config table, plus New
+Model 2's own priority-bucket structure (ceiling/floor/rotation order).
+Model 1 weights and Model 3 thresholds/bucket-target endpoints were removed
+once New Model 2 became the sole model — their config values had no
+remaining caller."""
 from fastapi import APIRouter
 
-from backend.configuration.system_config_edits import (
-    update_config_value,
-    update_model1_weights,
-    update_model3_score_thresholds,
-)
+from backend.configuration.priority_bucket_edits import add_bucket, list_buckets, remove_bucket, update_bucket
 from backend.db.models import Config
 from backend.db.session import SessionLocal
-from backend.models.model1_weighted_scoring.scorer import read_weights
-from backend.models.model3_priority_bucket.bucketer import SCORE_THRESHOLD_SPEC, TARGET_PCT_SPEC, _seed_and_read
 from backend.shared.enums import ChangeSource
 
 from ..schemas.configuration import (
-    BucketPctUpdateRequest,
-    BucketPctUpdateResponse,
     ConfigRowOut,
-    Model1WeightsOut,
-    Model1WeightsUpdateRequest,
-    Model1WeightsUpdateResponse,
-    Model3ThresholdsAndTargetsOut,
-    Model3ThresholdsUpdateRequest,
-    Model3ThresholdsUpdateResponse,
+    PriorityBucketCreateRequest,
+    PriorityBucketOut,
+    PriorityBucketUpdateRequest,
+    PriorityBucketUpdateResponse,
 )
 
 router = APIRouter(tags=["configuration"])
@@ -38,57 +31,51 @@ def list_config():
         session.close()
 
 
-@router.get("/config/model1-weights", response_model=Model1WeightsOut)
-def get_model1_weights():
-    # read_weights(session) takes no default — this route owns a plain,
-    # short-lived session itself rather than a request-scoped Depends().
-    session = SessionLocal()
-    try:
-        weights = read_weights(session)
-        session.commit()  # persist any newly-seeded default rows
-        return weights
-    finally:
-        session.close()
+# ---- New Model 2 priority-bucket structure (docs/11 Task 2 Part C) --------
+# The only New-Model-2-specific, non-vendor-specific things Configuration
+# owns (docs/11's scope decision): which buckets exist, their ceiling/floor,
+# and their rotation order — not any vendor's own category/tag (those moved
+# to the Planning screen, see docs/11 Task 2 Part A/B).
 
 
-@router.put("/config/model1-weights", response_model=Model1WeightsUpdateResponse)
-def put_model1_weights(body: Model1WeightsUpdateRequest):
-    changed = update_model1_weights(
-        body.aging, body.outstanding, body.consistency, body.trend, source=ChangeSource.UI_EDIT, session=None
+@router.get("/config/priority-buckets", response_model=list[PriorityBucketOut])
+def get_priority_buckets():
+    return list_buckets()
+
+
+@router.post("/config/priority-buckets", response_model=PriorityBucketOut)
+def post_priority_bucket(body: PriorityBucketCreateRequest):
+    add_bucket(
+        body.bucket_key,
+        body.display_label,
+        body.ceiling_pct,
+        body.floor_pct,
+        body.rotation_position,
+        source=ChangeSource.UI_EDIT,
+    )
+    return {
+        "bucket_key": body.bucket_key,
+        "display_label": body.display_label,
+        "ceiling_pct": body.ceiling_pct,
+        "floor_pct": body.floor_pct,
+        "rotation_position": body.rotation_position,
+    }
+
+
+@router.put("/config/priority-buckets/{bucket_key}", response_model=PriorityBucketUpdateResponse)
+def put_priority_bucket(bucket_key: str, body: PriorityBucketUpdateRequest):
+    changed = update_bucket(
+        bucket_key,
+        display_label=body.display_label,
+        ceiling_pct=body.ceiling_pct,
+        floor_pct=body.floor_pct,
+        rotation_position=body.rotation_position,
+        source=ChangeSource.UI_EDIT,
     )
     return {"changed": changed}
 
 
-@router.get("/config/model3-thresholds-and-targets", response_model=Model3ThresholdsAndTargetsOut)
-def get_model3_thresholds_and_targets():
-    # No read helper existed for these — reusing bucketer.py's own
-    # _seed_and_read (its de-facto read helper, same seed-then-read
-    # behavior as read_weights above) rather than duplicating that logic.
-    session = SessionLocal()
-    try:
-        thresholds = _seed_and_read(session, SCORE_THRESHOLD_SPEC)
-        targets = _seed_and_read(session, TARGET_PCT_SPEC)
-        session.commit()
-        return {
-            "p2_min_score": thresholds["model3.threshold.p2_min_score"],
-            "p3_min_score": thresholds["model3.threshold.p3_min_score"],
-            "p2_target_pct": targets["model3.target_pct.p2"],
-            "p3_target_pct": targets["model3.target_pct.p3"],
-            "p4_target_pct": targets["model3.target_pct.p4"],
-        }
-    finally:
-        session.close()
-
-
-@router.put("/config/model3-thresholds", response_model=Model3ThresholdsUpdateResponse)
-def put_model3_thresholds(body: Model3ThresholdsUpdateRequest):
-    changed = update_model3_score_thresholds(
-        body.p2_threshold, body.p3_threshold, source=ChangeSource.UI_EDIT, session=None
-    )
-    return {"changed": changed}
-
-
-@router.put("/config/model3-bucket-pct/{key}", response_model=BucketPctUpdateResponse)
-def put_model3_bucket_pct(key: str, body: BucketPctUpdateRequest):
-    old_fraction, new_fraction = update_config_value(key, body.value, source=ChangeSource.UI_EDIT, session=None)
-    return {"old_fraction": old_fraction, "new_fraction": new_fraction}
+@router.delete("/config/priority-buckets/{bucket_key}")
+def delete_priority_bucket(bucket_key: str):
+    remove_bucket(bucket_key, source=ChangeSource.UI_EDIT)
+    return {"removed": bucket_key}

@@ -1,12 +1,9 @@
 """Tests against the real ingested database (backend/db/app.db) — no synthetic data.
 
-Confirms backend.shared.min_funds works standalone, imported from nowhere
-inside backend/models/ — this is the module Model 1 depends on directly
-instead of Model 2's package (see scorer.py). Model 2's own test_advisor.py
-still covers required_amount()/calculate_minimum_funds_required()'s
-behavior in detail (byte-identical, since it's the same function object,
-just re-exported) — these tests only need to prove the relocation itself
-didn't change anything.
+Canonical coverage for backend.shared.min_funds's required_amount()/
+calculate_minimum_funds_required()/min_funds_tranche_breakdown() — genuinely
+shared logic used by New Model 2 (transitively, via planner.py/vendors.py)
+and, historically, by the now-removed old models.
 """
 from dataclasses import dataclass
 from datetime import date
@@ -15,7 +12,7 @@ import pytest
 
 from backend.db.models import Vendor
 from backend.db.session import SessionLocal
-from backend.models.model1_weighted_scoring.scorer import score_vendors
+from backend.shared.scoring import score_vendors
 from backend.shared.enums import VendorCategory
 from backend.shared.min_funds import (
     calculate_minimum_funds_required,
@@ -65,24 +62,6 @@ def test_calculate_minimum_funds_required_from_shared_location():
     assert result["total"] > 0
     assert result["total"] == result["breakdown"]["required_amount"].sum()
     assert len(result["breakdown"]) == 83
-
-
-def test_model2_advisor_reexports_the_same_function_objects():
-    """Proves the relocation is a re-export, not a duplicate reimplementation
-    — Model 2's advisor.required_amount IS backend.shared.min_funds.required_amount,
-    not a second copy that could drift out of sync. Both re-imported locally
-    (not via this file's module-level import) so the comparison is always
-    against whatever's currently in sys.modules — other test files in this
-    suite (e.g. test_api.py) deliberately pop/re-import backend.* modules
-    against a fresh temp DB mid-session, which would otherwise compare a
-    stale cached reference against a freshly re-imported one and fail on
-    object identity for reasons that have nothing to do with this code.
-    """
-    from backend.models.model2_min_funds_advisory import advisor
-    from backend.shared import min_funds
-
-    assert advisor.required_amount is min_funds.required_amount
-    assert advisor.calculate_minimum_funds_required is min_funds.calculate_minimum_funds_required
 
 
 # ---- Live-payment-aware aging/required-amount/score (bug fix) -------------
@@ -368,17 +347,39 @@ def test_min_funds_tranche_breakdown_has_no_tranche_list_but_a_real_total_for_mu
     assert tranches == []
 
 
-def test_model1_scorer_does_not_import_model2_package():
-    """Confirms Model 1 has zero dependency on Model 2's package after the
-    relocation — inspects scorer.py's own module globals rather than
-    asserting on scorer.py's source text, so a refactor that keeps the
-    guarantee true wouldn't spuriously break this. Local imports — see the
-    test above for why."""
-    from backend.models.model1_weighted_scoring import scorer
-    from backend.shared import min_funds
+def test_inactive_vendor_required_amount_matches_normal_carry_forward():
+    """docs/14 Inactive design (renamed 2026-07-24 from Exit): an
+    Inactive-category vendor is treated exactly like Normal for
+    required_amount() — same carry-forward walk, not the Must
+    Pay/Commitment formulas. Identical ledger, only category differs."""
+    ledger_rows = [
+        _FakeLedgerRow(date(2025, 3, 1), payable=20_000_000, payment=15_000_000, opening_balance=0),
+        _FakeLedgerRow(date(2025, 4, 1), payable=30_000_000, payment=0, opening_balance=0),
+    ]
+    normal = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    inactive_vendor = _FakeVendor(category=VendorCategory.INACTIVE, opening_balance=0.0, paid_so_far_this_month=0.0)
 
-    assert scorer.required_amount is min_funds.required_amount  # same shared-module function object
-    assert not any(
-        getattr(value, "__module__", "").startswith("backend.models.model2_min_funds_advisory")
-        for value in vars(scorer).values()
-    )
+    normal_amount, normal_rule = required_amount(normal, ledger_rows)
+    inactive_amount, inactive_rule = required_amount(inactive_vendor, ledger_rows)
+    assert inactive_amount == pytest.approx(normal_amount)
+    assert inactive_rule == normal_rule
+    assert inactive_rule.startswith("normal_carry_forward")  # not a must_pay_/commitment_ rule
+
+
+def test_inactive_vendor_tranche_breakdown_matches_normal():
+    """Same parity check as required_amount above, for the tranche-breakdown
+    helper — Inactive gets the full leftover+fresh tranche table, not the
+    empty-tranches Must Pay/Commitment shortcut."""
+    ledger_rows = [
+        _FakeLedgerRow(date(2025, 3, 1), payable=20_000_000, payment=15_000_000, opening_balance=0),
+        _FakeLedgerRow(date(2025, 4, 1), payable=30_000_000, payment=0, opening_balance=0),
+    ]
+    normal = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    inactive_vendor = _FakeVendor(category=VendorCategory.INACTIVE, opening_balance=0.0, paid_so_far_this_month=0.0)
+
+    normal_total, normal_tranches = min_funds_tranche_breakdown(normal, ledger_rows)
+    inactive_total, inactive_tranches = min_funds_tranche_breakdown(inactive_vendor, ledger_rows)
+    assert inactive_total == pytest.approx(normal_total)
+    assert inactive_tranches == normal_tranches
+
+

@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from backend.shared.enums import VendorCategory
+from backend.shared.enums import VendorCategory, VendorPriorityTag
 
 HEADER_ROW = 3
 DATA_START_ROW = 4
@@ -30,18 +30,66 @@ DATA_START_ROW = 4
 # not recompute a default — CLAUDE.md rule 6). Lives here, not in
 # vendor_edits.py, so load_excel.py can import it without a circular import
 # (vendor_edits.py already imports EXCEL_PATH from load_excel.py).
+#
+# priority_tag (AI-mapping task's Part A prerequisite): mirrors
+# category/commitment_months/assigned_week exactly — a dedicated column,
+# found by header text, safe-defaults to None (unchanged/unset) when the
+# column or a value is missing, never crashes the upload. Sheet values are
+# expected to already be the literal enum labels (P0-P5, confirmed in
+# real test sheets), so no separate label-translation dict is needed the
+# way CATEGORY_EXCEL_LABEL is for category below.
 FIELD_TO_EXCEL_HEADER = {
     "category": "Category",
     "commitment_months": "Commitment Months",
     "assigned_week": "Assigned Week",
+    "priority_tag": "Priority Tag",
 }
 
 CATEGORY_EXCEL_LABEL = {
     VendorCategory.MUST_PAY: "Must Pay",
     VendorCategory.COMMITMENT: "Commitment",
     VendorCategory.NORMAL: "Normal",
+    VendorCategory.INACTIVE: "Inactive",
 }
 CATEGORY_FROM_EXCEL_LABEL = {label: category for category, label in CATEGORY_EXCEL_LABEL.items()}
+
+# REQUIRED_HEADER_DEFAULTS: the sheet's structural, single-header-lookup
+# fields — the ones build_sheet_map() has always fail-fast raised on if
+# missing (never had a safe default, unlike category/commitment_months/
+# assigned_week/priority_tag above). These plus FIELD_TO_EXCEL_HEADER
+# together are every logical field the AI-mapping task's gap-filler can
+# possibly resolve — anything positional/regex-derived (Closing Balance,
+# the monthly Payable/Payment blocks, W1-W5) has no single fixed header to
+# search for and is deliberately out of scope for that mechanism.
+REQUIRED_HEADER_DEFAULTS = {
+    "erp_code": "ERP Code",
+    "entity": "Entity",
+    "vendor_name": "Vendor Name",
+    "opening_balance": "Op. Balance",
+    "total_payable": "Total Payable",
+    "total_payment": "Total Payment",
+}
+REQUIRED_FIELDS = frozenset(REQUIRED_HEADER_DEFAULTS)
+
+ALL_MAPPABLE_FIELDS = {**REQUIRED_HEADER_DEFAULTS, **FIELD_TO_EXCEL_HEADER}
+
+# One-line, finance-analyst-readable description per field — fed verbatim
+# into the AI column-mapper's prompt (ai_column_mapper.py) so it gets the
+# same context a human would need, not just a bare field name.
+FIELD_DESCRIPTIONS = {
+    "erp_code": "Unique vendor/ERP identifier code — one row per vendor, values are short alphanumeric codes.",
+    "entity": "The legal entity/business unit this vendor's bills are booked under.",
+    "vendor_name": "The vendor's business/company name.",
+    "opening_balance": "The vendor's outstanding balance carried forward, BEFORE this sheet's monthly Payable/Payment columns are applied.",
+    "total_payable": "The sum total of every monthly Payable column for this vendor.",
+    "total_payment": "The sum total of every monthly Payment column for this vendor.",
+    "category": "Finance's vendor category tag — one of exactly: Must Pay, Commitment, Normal, Inactive.",
+    "commitment_months": "For Commitment-category vendors only: an integer, the number of months their balance amortizes over.",
+    "assigned_week": "Which week (an integer, typically 1-5) of the current payment cycle this vendor is assigned to.",
+    "priority_tag": "Finance's assigned urgency tag for this vendor — one of exactly: P0, P1, P2, P3, P4, P5.",
+}
+
+PRIORITY_TAG_VALUES = {tag.value for tag in VendorPriorityTag}
 
 # ponytail: start of the historical month block in this specific sheet.
 # Flagged for Sarath — confirm this if a future re-upload shifts the month
@@ -109,12 +157,55 @@ class SheetMap:
     data_start_row: int = DATA_START_ROW
 
 
-def build_sheet_map(ws) -> SheetMap:
+class MissingRequiredColumnsError(ValueError):
+    """Raised by build_sheet_map() when one of REQUIRED_HEADER_DEFAULTS'
+    headers can't be found under either a persisted override or its fixed
+    default text. `missing_fields` names every one that failed (all of
+    them, not just the first — the AI-mapping gap-filler needs the full
+    list in one shot, not one Gemini call per field)."""
+
+    def __init__(self, missing_fields):
+        self.missing_fields = list(missing_fields)
+        super().__init__(
+            f"Required column(s) not found in the sheet: {', '.join(self.missing_fields)}"
+        )
+
+
+def resolve_header(field, header_overrides=None):
+    """The header text to search for `field` — a persisted AI/config
+    override if one exists for it, else the fixed default. Pure text
+    lookup, never touches the workbook."""
+    default = ALL_MAPPABLE_FIELDS[field]
+    if header_overrides and field in header_overrides:
+        return header_overrides[field]
+    return default
+
+
+def missing_mappable_fields(ws, fields, header_overrides=None):
+    """Non-raising pre-flight check: which of `fields` (a subset of
+    ALL_MAPPABLE_FIELDS) can't currently be resolved on this sheet, given
+    `header_overrides`. Used by the AI-mapping gap-filler to discover every
+    unresolved field before calling build_sheet_map() (which still fails
+    fast on the first missing required field, same as it always has)."""
+    return [f for f in fields if find_column(ws, resolve_header(f, header_overrides)) is None]
+
+
+def build_sheet_map(ws, header_overrides=None) -> SheetMap:
+    """header_overrides: optional {logical_field: header_text}, sourced from
+    column_mapping_store.py's persisted AI-mapping table — consulted before
+    falling back to each required field's fixed default header text. None
+    (the default) reproduces the exact behavior this function has always
+    had."""
     headers = _header_cells(ws)
 
-    opening_balance_col = _find_col(headers, "Op. Balance")
-    total_payable_col = _find_col(headers, "Total Payable")
-    total_payment_col = _find_col(headers, "Total Payment")
+    try:
+        opening_balance_col = _find_col(headers, resolve_header("opening_balance", header_overrides))
+        total_payable_col = _find_col(headers, resolve_header("total_payable", header_overrides))
+        total_payment_col = _find_col(headers, resolve_header("total_payment", header_overrides))
+    except ValueError:
+        raise MissingRequiredColumnsError(
+            missing_mappable_fields(ws, REQUIRED_FIELDS, header_overrides)
+        ) from None
 
     payable_start = opening_balance_col + 1
     payable_n = total_payable_col - payable_start
@@ -140,10 +231,19 @@ def build_sheet_map(ws) -> SheetMap:
     week_total_col = max(c for _, c in week_cols) + 1
     assigned_week_order_col = week_total_col + 1
 
+    try:
+        erp_code_col = _find_col(headers, resolve_header("erp_code", header_overrides))
+        entity_col = _find_col(headers, resolve_header("entity", header_overrides))
+        vendor_name_col = _find_col(headers, resolve_header("vendor_name", header_overrides))
+    except ValueError:
+        raise MissingRequiredColumnsError(
+            missing_mappable_fields(ws, REQUIRED_FIELDS, header_overrides)
+        ) from None
+
     return SheetMap(
-        erp_code_col=_find_col(headers, "ERP Code"),
-        entity_col=_find_col(headers, "Entity"),
-        vendor_name_col=_find_col(headers, "Vendor Name"),
+        erp_code_col=erp_code_col,
+        entity_col=entity_col,
+        vendor_name_col=vendor_name_col,
         opening_balance_col=opening_balance_col,
         payable_cols=payable_cols,
         total_payable_col=total_payable_col,
@@ -170,6 +270,47 @@ def parse_assigned_week_order(raw):
     if not m:
         raise ValueError(f"Unrecognized assigned-week/order value: {raw!r}")
     return int(m.group(1)), int(m.group(2))
+
+
+def known_column_indices(sheet_map, extra_cols=()):
+    """Every column index build_sheet_map()/load() already understands.
+    `extra_cols`: the dedicated Finance-edit columns (Category, Commitment
+    Months, Assigned Week) — found via find_column() by the caller (they may
+    not exist yet on a sheet nobody's edited through the UI yet), passed in
+    rather than re-found here to avoid a second lookup. Feeds
+    unmapped_header_columns() below — the data-pipeline-upload task's
+    generic-passthrough-field detection (docs/11's "store and show it, never
+    feed it into any model" rule)."""
+    known = {
+        sheet_map.erp_code_col,
+        sheet_map.entity_col,
+        sheet_map.vendor_name_col,
+        sheet_map.opening_balance_col,
+        sheet_map.total_payable_col,
+        sheet_map.total_payment_col,
+        sheet_map.closing_balance_col,
+        sheet_map.week_total_col,
+        sheet_map.assigned_week_order_col,
+    }
+    known.update(c for _, c in sheet_map.payable_cols)
+    known.update(c for _, c in sheet_map.payment_cols)
+    known.update(c for _, c in sheet_map.week_cols)
+    known.update(c for c in extra_cols if c is not None)
+    return known
+
+
+def unmapped_header_columns(ws, sheet_map, extra_cols=()):
+    """[(col_index, header_text), ...] for every header cell NOT already
+    understood by the mapping above, in column order — these become
+    VendorExtraField generic-passthrough columns (load_excel.py), never fed
+    into any model (CLAUDE.md rule 3). Skips blank headers (trailing empty
+    columns past the sheet's real content)."""
+    known = known_column_indices(sheet_map, extra_cols)
+    return [
+        (cell.column, str(cell.value).strip())
+        for cell in _header_cells(ws)
+        if cell.column not in known and cell.value is not None and str(cell.value).strip() != ""
+    ]
 
 
 def to_number(raw):

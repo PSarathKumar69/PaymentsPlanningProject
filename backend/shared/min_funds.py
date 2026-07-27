@@ -1,11 +1,17 @@
-"""Minimum-funds-required calculation (docs/04-model2-min-funds-advisory.md).
+"""Minimum-funds-required calculation — shared infra.
 
-Lives here, not inside Model 2's package, because Model 1 (now the sole
-driver of payment_status/cycle_allocation — see payment_logging.py) needs
-required_amount()/calculate_minimum_funds_required() without depending on
-Model 2's package at all. Model 2 is slated for removal later; Model 3 and
-the regeneration/weekly-planning modules also import from here (relocated,
-not duplicated).
+Lives here, not inside any one model's package, because it's used across
+several live call paths: backend/api/routers/vendors.py's vendor list/aging
+endpoint, and backend/weekly_planning/planner.py's build_weekly_view()
+(which New Model 2's own generate-plan-and-weekly-view calls). The earlier
+candidate models that also used to import from here are gone; this module
+was never part of their removal.
+
+New Model 2 has its own, newer minimum-funds rule — see
+backend/shared/min_funds_v2.py — which the Planning table uses today. This
+module's required_amount()/calculate_minimum_funds_required() is the OLDER
+rule, still live via build_weekly_view() (see the known Planning-table-vs-
+weekly-view discrepancy this creates, flagged in CLAUDE.md/docs/14).
 
 Two distinct, independently-triggerable actions — a hard sequencing rule,
 not a preference. Both call the same required_amount() so the numbers
@@ -13,8 +19,8 @@ can't drift apart:
 
   - calculate_minimum_funds_required(): shown to Finance BEFORE any funds
     figure is entered or usable.
-  - generate_plan(available_funds) (Model 1/2's own): runs only after
-    Finance has entered that figure.
+  - generate_plan(available_funds): runs only after Finance has entered
+    that figure.
 """
 from collections import defaultdict
 
@@ -30,9 +36,9 @@ from backend.shared.enums import VendorCategory
 def live_outstanding_balance(vendor):
     """The one definition of "what a vendor still actually owes right now" —
     same figure backend/api/routers/vendors.py's live_outstanding_balance and
-    backend/models/model1_weighted_scoring/scorer.py's outstanding_balance
-    column already compute inline. Shared here so the zero-outstanding
-    exclusion below (and every other caller) can't drift from either of them.
+    backend/shared/scoring.py's outstanding_balance column already compute
+    inline. Shared here so the zero-outstanding exclusion below (and every
+    other caller) can't drift from either of them.
     """
     return max(float(vendor.opening_balance) - float(vendor.paid_so_far_this_month), 0.0)
 
@@ -48,14 +54,21 @@ def _load_vendors_and_ledger(session):
     """Shared by Model 1/2/3's generate_plan() and regeneration.py — a
     zero-outstanding vendor is excluded here, upstream of every model's
     funds math, so it's consistently absent everywhere this feeds into."""
-    vendors = [v for v in session.query(Vendor).order_by(Vendor.id).all() if has_outstanding_balance(v)]
+    # is_active.isnot(False), not ==True: a vendor row that predates that
+    # column (data-pipeline-upload Bug #1 fix, models.py) reads NULL, which
+    # must count as active.
+    vendors = [
+        v
+        for v in session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all()
+        if has_outstanding_balance(v)
+    ]
     ledger_by_vendor = defaultdict(list)
     for row in session.query(MonthlyLedger).order_by(MonthlyLedger.vendor_id, MonthlyLedger.month):
         ledger_by_vendor[row.vendor_id].append(row)
     return vendors, ledger_by_vendor
 
 
-def required_amount(vendor, ledger_rows, as_of=None):
+def required_amount(vendor, ledger_rows, as_of=None, paid_so_far_override=None):
     """The one definition of a vendor's "required amount" (docs/04), by category.
 
     Returns (amount, rule_label). Shared by calculate_minimum_funds_required
@@ -68,6 +81,19 @@ def required_amount(vendor, ledger_rows, as_of=None):
     Pay is unaffected: its required amount is last month's payable, never a
     function of outstanding balance (confirmed simplification, unchanged).
 
+    paid_so_far_override: every caller above (every model, every
+    regeneration) omits this and gets the live behavior described above,
+    unchanged. The one exception — GET /vendors/payment-tracking's "%
+    Min Funds Paid" column — needs the figure as it stood BEFORE this
+    cycle's payments moved it (else a live, shrinking denominator gets
+    compared against a growing cumulative payment total, which mechanically
+    produces >100% the moment a vendor is paid past its current oldest
+    tranche). Passing 0.0 here reconstructs that pre-payment snapshot
+    on demand — same "recompute fresh from the real ledger, never store a
+    second copy" convention _carry_forward_normal_amount already uses, and
+    the same already_paid_this_cycle override compute_vendor_aging() already
+    exposes for the Aging card's own opening-vs-live split.
+
     Normal vendors: carries forward every older tranche that was only
     partially paid in a previous cycle's shortfall, plus exactly one fresh
     (never-paid) tranche after them — not just the single oldest tranche.
@@ -77,16 +103,18 @@ def required_amount(vendor, ledger_rows, as_of=None):
     that figure had nowhere to go in the actual suggested plan. One number,
     used everywhere — see _carry_forward_normal_amount for the tranche walk.
     """
+    paid_so_far = float(vendor.paid_so_far_this_month) if paid_so_far_override is None else float(paid_so_far_override)
+
     if vendor.category == VendorCategory.MUST_PAY:
         amount = float(ledger_rows[-1].payable) if ledger_rows else 0.0
         return amount, "must_pay_last_month_payable"
 
     if vendor.category == VendorCategory.COMMITMENT:
         months = vendor.commitment_months or 1
-        live_balance = max(float(vendor.opening_balance) - float(vendor.paid_so_far_this_month), 0.0)
+        live_balance = max(float(vendor.opening_balance) - paid_so_far, 0.0)
         return live_balance / months, f"commitment_outstanding_over_{months}_months"
 
-    amount, included = _carry_forward_normal_amount(ledger_rows, float(vendor.paid_so_far_this_month))
+    amount, included = _carry_forward_normal_amount(ledger_rows, paid_so_far)
     if not included:
         return 0.0, "normal_no_outstanding"
     rule = f"normal_carry_forward_{len(included)}_tranche" + ("" if len(included) == 1 else "s")
@@ -150,7 +178,7 @@ def min_funds_tranche_breakdown(vendor, ledger_rows):
     breakdown; `total` there equals plain Old Amt whenever there's no
     leftover to carry forward.
     """
-    if vendor.category != VendorCategory.NORMAL:
+    if vendor.category in (VendorCategory.MUST_PAY, VendorCategory.COMMITMENT):
         amount, _ = required_amount(vendor, ledger_rows)
         return amount, []
     total, included = _carry_forward_normal_amount(ledger_rows, float(vendor.paid_so_far_this_month))
@@ -190,7 +218,10 @@ def _vendor_required_rows(vendors, ledger_by_vendor, as_of=None):
             "required_amount": amount,
             "rule": rule,
         }
-        if vendor.category == VendorCategory.NORMAL:
+        if vendor.category not in (VendorCategory.MUST_PAY, VendorCategory.COMMITMENT):
+            # Normal and Inactive alike get the tranche-aging detail (docs/14:
+            # Inactive is treated exactly like Normal here) — only Must Pay/
+            # Commitment have no tranche concept at all.
             aging = compute_vendor_aging(ledger_rows, as_of=as_of, already_paid_this_cycle=paid_so_far)
             row["oldest_bucket"] = aging.oldest_bucket
             row["oldest_bucket_age_days"] = (

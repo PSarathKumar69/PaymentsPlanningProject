@@ -9,12 +9,10 @@ from sqlalchemy import func
 
 from backend.db.models import MonthlyLedger, Payment, PlanAllocation, PlanRun, Vendor
 from backend.db.session import SessionLocal
-from backend.models.model1_weighted_scoring.scorer import recompute_and_persist_scores
-from backend.shared.constants import MODEL_1_PLAN_RUN_LABEL
+from backend.shared.scoring import recompute_and_persist_scores
+from backend.shared.constants import MONEY_EPSILON
 from backend.shared.enums import PaymentStatus
 from backend.weekly_planning.calendar_utils import week_for_date
-
-MONEY_EPSILON = 1.0  # rounding tolerance for money comparisons, matches aging.py/advisor.py
 
 
 def _current_cycle_month(session):
@@ -25,43 +23,53 @@ def _current_cycle_month(session):
     return session.query(func.max(MonthlyLedger.month)).scalar()
 
 
-def _this_cycle_allocation(session, vendor_id):
-    """What Model 1's CURRENT plan allocates this vendor — confirmed
-    decision: Model 1 (plus a Finance override on top) is now the sole
-    driver of payment_status/cycle_allocation. Models 2/3's plan_runs are
-    never considered here, even when they exist and have a larger/smaller
-    allocation for the same vendor this cycle — Finance picks whichever
-    model's suggestion fits the situation (CLAUDE.md), but only Model 1's
-    number is ever acted on for payment-status purposes.
+def _this_cycle_allocation(session, vendor_id, model_number=5):
+    """What model `model_number`'s CURRENT plan allocates this vendor.
+    Defaults to 5 (New Model 2) — the sole remaining model since Models
+    1/2/3 and New Model 1 were retired; this was Model-1-only back when
+    Model 1 was the flagship model log_payment() anchored payment_status
+    to, but that anchor point has to move with whichever model is
+    actually in use, or payment_status/regeneration-eligibility silently
+    breaks the moment the old anchor model is deleted.
 
-    Finds this vendor's PlanAllocation row on Model 1's latest plan_run this
-    cycle month, and returns vendor.override_amount if Finance has set one —
-    the sticky, per-vendor, whole-month source of truth (docs/06 fix; no
+    Finds this vendor's PlanAllocation row on that model's latest plan_run
+    (family-matched via a "model{n}%" prefix, so a "model{n}_regeneration"-
+    style label still counts as the same family — plan_history.py's own
+    convention), and returns vendor.override_amount if Finance has set one
+    — the sticky, per-vendor, whole-month source of truth (docs/06 fix; no
     longer the per-row PlanAllocation.override_amount, which is now just a
-    historical snapshot) — else the model's own allocated_amount. No Model 1
-    plan_run this cycle at all (or no allocation row for this vendor within
-    it, e.g. no assigned_week) -> 0.0, same "nothing to be in full against
-    yet" semantics as before, UNLESS Finance has set an override anyway (a
-    sticky override applies regardless of whether a plan_run/allocation row
-    exists for this vendor this cycle).
+    historical snapshot) — else the model's own allocated_amount. No
+    plan_run at all for that model (or no allocation row for this vendor
+    within it, e.g. no assigned_week) -> 0.0, same "nothing to be in full
+    against yet" semantics as before, UNLESS Finance has set an override
+    anyway (a sticky override applies regardless of whether a plan_run/
+    allocation row exists for this vendor).
+
+    Deliberately NOT scoped to `_current_cycle_month()` (the ledger-
+    ingestion anchor): New Model 2's own "cycle" is Finance's picked
+    planning month, stamped directly onto its own plan_run.month, which can
+    genuinely differ from the ledger's latest ingested month (docs/14) —
+    the single overall-latest plan_run for the model's family is always the
+    right one to read, with no separate month filter needed.
     """
     vendor = session.query(Vendor).filter_by(id=vendor_id).one()
     if vendor.override_amount is not None:
         return float(vendor.override_amount)
 
-    cycle_month = _current_cycle_month(session)
-    latest_model1_run = (
+    prefix = f"model{model_number}"
+    latest_run = (
         session.query(PlanRun)
-        .filter(PlanRun.month == cycle_month, PlanRun.model_used == MODEL_1_PLAN_RUN_LABEL)
+        .filter(PlanRun.model_used.like(f"{prefix}%"))
         .order_by(PlanRun.created_at.desc(), PlanRun.id.desc())
         .first()
     )
-    if latest_model1_run is None:
+
+    if latest_run is None:
         return 0.0
 
     allocation = (
         session.query(PlanAllocation)
-        .filter(PlanAllocation.plan_run_id == latest_model1_run.id, PlanAllocation.vendor_id == vendor_id)
+        .filter(PlanAllocation.plan_run_id == latest_run.id, PlanAllocation.vendor_id == vendor_id)
         .first()
     )
     if allocation is None:
@@ -69,12 +77,12 @@ def _this_cycle_allocation(session, vendor_id):
     return float(allocation.allocated_amount)
 
 
-def finalize_plan(session):
+def finalize_plan(session, model_number=5):
     """"Finalize Plan" — snapshots every vendor's CURRENT effective amount
-    (Finance's override if set, else Model 1's latest plan_run allocation —
-    same precedence _this_cycle_allocation() already uses) into
-    Vendor.finalized_budget_amount, the Vendor Payment Table's "Budget"
-    column (see plan_history.py::latest_budget_for_vendor).
+    for model `model_number` (Finance's override if set, else that model's
+    latest plan_run allocation — same precedence _this_cycle_allocation()
+    already uses) into Vendor.finalized_budget_amount, the Vendor Payment
+    Table's "Budget" column (see plan_history.py::latest_budget_for_vendor).
 
     Deliberately a snapshot, not a live figure: Finance can generate plans
     and tweak overrides repeatedly across a day/week/month, paying vendors
@@ -84,7 +92,7 @@ def finalize_plan(session):
     """
     vendors = session.query(Vendor).order_by(Vendor.id).all()
     for vendor in vendors:
-        vendor.finalized_budget_amount = _this_cycle_allocation(session, vendor.id)
+        vendor.finalized_budget_amount = _this_cycle_allocation(session, vendor.id, model_number=model_number)
     return len(vendors)
 
 
@@ -137,9 +145,13 @@ def _status_for(paid_so_far, cycle_allocation, opening_balance):
     return PaymentStatus.PARTIAL
 
 
-def log_payment(vendor_id, amount, today=None, session=None):
+def log_payment(vendor_id, amount, today=None, session=None, note=None):
     """Records one payment, updates the vendor's running paid-so-far total
     and payment_status.
+
+    note: optional free-text Finance can attach (vendor detail modal's Pay
+    flow) — purely descriptive (Payment.note), never read by any model or
+    ledger-integrity check.
 
     Finance no longer supplies payment_date/week — both are determined here:
     payment_date is the real current date at the moment of logging (never
@@ -191,8 +203,11 @@ def log_payment(vendor_id, amount, today=None, session=None):
 
         payment_date = today or date.today()
         week = week_for_date(payment_date)
-        session.add(Payment(vendor_id=vendor_id, payment_date=payment_date, amount=amount, week=week))
+        session.add(Payment(vendor_id=vendor_id, payment_date=payment_date, amount=amount, week=week, note=note))
         vendor.paid_so_far_this_month = new_total
+        # Defaults to model_number=5 (New Model 2, the sole model) —
+        # payment_status is always anchored to whichever model is actually
+        # in use, not a specific tab Finance happens to be viewing.
         cycle_allocation = _this_cycle_allocation(session, vendor_id)
         vendor.payment_status = _status_for(new_total, cycle_allocation, outstanding)
         session.flush()  # paid_so_far_this_month must be visible to the rescore query below

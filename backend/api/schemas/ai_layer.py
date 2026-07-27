@@ -17,3 +17,14 @@ class TalkingScript(BaseModel):
 
 class TalkingScriptsResponse(BaseModel):
     scripts: list[TalkingScript]
+
+
+class VendorTalkingPointsRequest(BaseModel):
+    vendor_id: int
+
+
+class VendorTalkingPointsResponse(BaseModel):
+    vendor_id: int
+    erp_code: str
+    vendor_name: str
+    script_text: str

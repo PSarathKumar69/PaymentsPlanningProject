@@ -4,10 +4,10 @@
 
 Two different categories of things are editable through this module — keep them conceptually and technically separate:
 
-1. **Vendor data and tags** (lives in the master Excel): vendor category (`Must Pay` / `Commitment` / `Normal` — see `05-model3-priority-bucket.md`), commitment months (Commitment vendors only — see `04-model2-min-funds-advisory.md`), Assigned Week, individual vendor field corrections (opening balance, payable, payment values, etc.). Editable two ways:
+1. **Vendor data and tags** (lives in the master Excel): vendor category (`Must Pay` / `Commitment` / `Normal` — see `14-new-model-2.md`), priority tag for Normal vendors (P2/P3/P4, Finance-assigned directly), commitment months (Commitment vendors only — see `14-new-model-2.md`), Assigned Week, individual vendor field corrections (opening balance, payable, payment values, etc.). Editable two ways:
    - Directly in the UI, field by field.
    - By uploading a replacement Excel with the same column structure.
-2. **System configuration** (does not live in the Excel, has no natural "row"): Model 1's factor weights (aging/outstanding/consistency/trend), Model 3's bucket score thresholds (P2/P3/P4 cutoffs). Editable only through the UI — there's no Excel equivalent for these.
+2. **System configuration** (does not live in the Excel, has no natural "row"): New Model 2's bucket ceiling percentages (P2/P3/P4, `14-new-model-2.md`). Editable only through the UI — there's no Excel equivalent for these.
 
 ## Write-back rule — non-negotiable
 
@@ -35,4 +35,4 @@ No user/login system has been discussed yet for this project — it's been descr
 
 - Never let a UI edit succeed silently without also writing to the Excel and the audit log — treat "edit accepted, write-back failed" as an error state to surface, not something to retry silently or ignore.
 - A replacement Excel upload should also be diffed and logged the same way as individual UI edits (what changed, old → new), not just accepted wholesale with no record of what was different from the prior version.
-- This module's vendor-tag edits (vendor category, Assigned Week) interact directly with `05-model3-priority-bucket.md` and `06-weekly-planning-regeneration.md` — an edit made here should be reflected the next time either of those runs, with no separate sync step needed.
+- This module's vendor-tag edits (vendor category, priority tag, Assigned Week) interact directly with `14-new-model-2.md` and `06-weekly-planning-regeneration.md` — an edit made here should be reflected the next time either of those runs, with no separate sync step needed.

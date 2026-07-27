@@ -15,6 +15,12 @@ class PlanRunAllocationOut(BaseModel):
     # live value; that's vendor_week_distribution_plans on the parent
     # response, keyed by vendor_id.
     override_amount: float | None
+    # Frozen required_amount/denominator this row's allocated_amount was
+    # computed against, at creation time (this task's fix) — lets the
+    # frontend compute a historical Suggested %/Override % for every
+    # plan_run, not just the latest one. None for the rare ingestion-seeded
+    # row (see backend/db/models.py).
+    required_amount_snapshot: float | None
 
 
 class PlanRunOut(BaseModel):
@@ -41,3 +47,7 @@ class PlanRunHistoryResponse(BaseModel):
 class DeletePlanRunResponse(BaseModel):
     plan_run_id: int
     deleted_allocations: int
+    # Vendors whose override_amount got cleared as a side effect of this
+    # delete (bug fix, this task) — only when the deleted plan_run was the
+    # latest for its model family; see the router's own docstring.
+    cleared_override_vendor_ids: list[int] = []

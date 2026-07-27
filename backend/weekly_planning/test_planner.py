@@ -1,25 +1,94 @@
 """Tests against the real ingested database (backend/db/app.db) — no synthetic data."""
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from backend.db.models import MonthlyLedger, PlanAllocation, Vendor
 from backend.db.session import SessionLocal
-from backend.models.model2_min_funds_advisory.advisor import (
+from backend.shared.constants import MONEY_EPSILON
+from backend.shared.enums import AllocationStatus, VendorCategory
+from backend.shared.min_funds import (
+    _load_vendors_and_ledger,
+    _vendor_required_rows,
     calculate_minimum_funds_required,
-    generate_plan,
     required_amount,
 )
-from backend.shared.enums import VendorCategory
 from backend.shared.payment_logging import log_payment
-from backend.weekly_planning.calendar_utils import weeks_in_month
+from backend.weekly_planning.calendar_utils import week_for_date, weeks_in_month
 from backend.weekly_planning.planner import build_weekly_view
+
+
+def _generate_plan_for_test(available_funds, session=None, as_of=None, eligible_vendor_ids=None):
+    """These tests exercise build_weekly_view() (model-agnostic — it only
+    groups an already-computed allocations DataFrame by week, per its own
+    docstring), not any one model's allocation algorithm. This is the old
+    Model 2 (`backend/models/model2_min_funds_advisory/advisor.py`, deleted
+    once New Model 2 became the sole model) `generate_plan()`, copied
+    in-place so this file's tests keep the exact vehicle they were written
+    against — every function it calls (`_load_vendors_and_ledger`,
+    `_vendor_required_rows`) still lives in backend/shared/min_funds.py."""
+    owns_session = session is None
+    session = session or SessionLocal()
+    try:
+        vendors, ledger_by_vendor = _load_vendors_and_ledger(session)
+        if eligible_vendor_ids is not None:
+            vendors = [v for v in vendors if v.id in eligible_vendor_ids]
+        rows = _vendor_required_rows(vendors, ledger_by_vendor, as_of=as_of)
+
+        guaranteed = [r for r in rows if r["category"] != VendorCategory.NORMAL.value]
+        normal = [r for r in rows if r["category"] == VendorCategory.NORMAL.value]
+
+        guaranteed_total = sum(r["required_amount"] for r in guaranteed)
+        remaining = available_funds - guaranteed_total
+        escalation = remaining < 0
+
+        normal.sort(key=lambda r: (-r["oldest_bucket_age_days"], -r["required_amount"]))
+
+        allocations = []
+        for r in guaranteed:
+            allocated = r["required_amount"]
+            status = AllocationStatus.GUARANTEED.value
+            if allocated > r["outstanding_balance"] + MONEY_EPSILON:
+                allocated = max(r["outstanding_balance"], 0.0)
+                status = AllocationStatus.PARTIAL.value
+            allocations.append({**r, "allocated_amount": allocated, "status": status})
+
+        funds_left = max(remaining, 0.0)
+        for r in normal:
+            if funds_left <= 0:
+                allocations.append({**r, "allocated_amount": 0.0, "status": AllocationStatus.ZERO.value})
+                continue
+            if funds_left >= r["required_amount"]:
+                allocated, status = r["required_amount"], AllocationStatus.FULL.value
+            else:
+                allocated, status = funds_left, AllocationStatus.PARTIAL.value
+            if allocated > r["outstanding_balance"] + MONEY_EPSILON:
+                allocated = max(r["outstanding_balance"], 0.0)
+                status = (
+                    AllocationStatus.FULL.value
+                    if allocated >= r["required_amount"] - MONEY_EPSILON
+                    else AllocationStatus.PARTIAL.value
+                )
+            funds_left -= allocated
+            allocations.append({**r, "allocated_amount": allocated, "status": status})
+
+        return {
+            "available_funds": available_funds,
+            "guaranteed_total": guaranteed_total,
+            "escalation": escalation,
+            "escalation_shortfall": max(-remaining, 0.0),
+            "allocations": pd.DataFrame(allocations),
+        }
+    finally:
+        if owns_session:
+            session.close()
 
 
 def test_weekly_numbers_correct_for_a_real_vendor():
     session = SessionLocal()
     try:
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         detail = view["detail"]
         row = detail.iloc[0]
@@ -35,7 +104,7 @@ def test_funding_exactly_minimum_matches_every_week():
     session = SessionLocal()
     try:
         total = calculate_minimum_funds_required(session=session)["total"]
-        plan = generate_plan(available_funds=total, session=session)
+        plan = _generate_plan_for_test(available_funds=total, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         ws = view["weekly_summary"]
         assert (ws["minimum_required"] - ws["actual_planned"]).abs().max() < 1
@@ -48,7 +117,7 @@ def test_funding_below_minimum_shows_shortfall_in_at_least_one_week():
     session = SessionLocal()
     try:
         total = calculate_minimum_funds_required(session=session)["total"]
-        plan = generate_plan(available_funds=total * 0.5, session=session)
+        plan = _generate_plan_for_test(available_funds=total * 0.5, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         ws = view["weekly_summary"]
         assert (ws["actual_planned"] < ws["minimum_required"] - 1).any()
@@ -60,7 +129,7 @@ def test_funding_below_minimum_shows_shortfall_in_at_least_one_week():
 def test_within_week_order_follows_score_descending():
     session = SessionLocal()
     try:
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         detail = view["detail"]
         for week, group in detail.groupby("assigned_week"):
@@ -74,7 +143,7 @@ def test_within_week_order_follows_score_descending():
 def test_persisted_plan_allocations_match_detail():
     session = SessionLocal()
     try:
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, model_used="model2", funds_figure=100_000_000)
         persisted = (
             session.query(PlanAllocation).filter_by(plan_run_id=view["plan_run_id"]).order_by(PlanAllocation.vendor_id).all()
@@ -111,7 +180,7 @@ def test_weekly_view_inherits_must_pay_commitment_guarantee_under_severe_shortfa
         tagged[1].commitment_months = 2
         session.flush()
 
-        plan = generate_plan(available_funds=1, session=session)  # severe shortfall
+        plan = _generate_plan_for_test(available_funds=1, session=session)  # severe shortfall
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         detail = view["detail"]
 
@@ -137,7 +206,7 @@ def test_weekly_view_inherits_must_pay_commitment_guarantee_under_severe_shortfa
 def test_week_distribution_plan_defaults_to_full_amount_in_assigned_week_when_persisted():
     session = SessionLocal()
     try:
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, model_used="model2", funds_figure=100_000_000)
         detail = view["detail"]
         assert not detail.empty
@@ -174,7 +243,7 @@ def test_week_distribution_plan_carries_forward_from_vendor_level_sticky_value()
         vendor.week_distribution_plan = custom_distribution
         session.flush()
 
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, model_used="model2", funds_figure=100_000_000)
         detail = view["detail"]
         row = detail[detail["vendor_id"] == vendor.id].iloc[0]
@@ -192,7 +261,7 @@ def test_week_distribution_plan_carries_forward_from_vendor_level_sticky_value()
 def test_week_distribution_plan_defaults_to_full_amount_when_not_persisted():
     session = SessionLocal()
     try:
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
         detail = view["detail"]
         row = detail.iloc[0]
@@ -214,11 +283,16 @@ def test_week_actual_paid_reflects_a_real_payment_under_its_own_week():
         vendor.assigned_week = 2
         session.flush()
 
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, model_used="model2", funds_figure=100_000_000)
         row = view["detail"][view["detail"]["vendor_id"] == vendor.id].iloc[0]
         planned_before = row["week_distribution_plan"]
-        assert planned_before == {"2": pytest.approx(row["actual_planned"])}
+        # Pulled-forward week fix: assigned_week=2 only survives as-is if
+        # week 2 hasn't already elapsed relative to today's real date —
+        # otherwise build_weekly_view() correctly pulls it forward to
+        # today's real week (planner.py's own documented behavior).
+        expected_week = str(max(2, week_for_date(date.today())))
+        assert planned_before == {expected_week: pytest.approx(row["actual_planned"])}
 
         log_payment(vendor.id, 12345.0, today=date(2026, 7, 22), session=session)  # July 22, 2026 -> week 4
 
@@ -242,7 +316,7 @@ def test_build_weekly_view_returns_cleanly_when_no_vendor_has_assigned_week():
         session.query(Vendor).update({Vendor.assigned_week: None})
         session.flush()
 
-        plan = generate_plan(available_funds=100_000_000, session=session)
+        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
         view = build_weekly_view(plan["allocations"], session=session, persist=False)
 
         assert view["detail"].empty

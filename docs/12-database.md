@@ -16,13 +16,13 @@
 
 The real master Excel columns are now confirmed (see `9-open-questions.md` and `07-data-pipeline-and-master-sheet.md`) — this shape reflects that, though it's still a starting sketch to refine during implementation, not a final schema.
 
-- **`vendors`** — current-state master data: vendor code, name, current opening balance, current tags (P0/P1 tag, Assigned Week — both persistent and Excel-backed), the **Reconsider** flag (DB-only, overwritten fresh at each regeneration, never historized — see `06-weekly-planning-regeneration.md`), the **monthly payment status** (`NOT_PAID` / `PARTIAL` / `PAID_IN_FULL`, confirmed new — `06-weekly-planning-regeneration.md`), a running **paid-so-far-this-month** total, computed fields (score, current aging bucket).
+- **`vendors`** — current-state master data: vendor code, name, current opening balance, current tags (category, priority tag P0-P4, Assigned Week — all persistent and Excel-backed), the **Reconsider** flag (DB-only, overwritten fresh at each regeneration, never historized — see `06-weekly-planning-regeneration.md`), the **monthly payment status** (`NOT_PAID` / `PARTIAL` / `PAID_IN_FULL`, confirmed new — `06-weekly-planning-regeneration.md`), a running **paid-so-far-this-month** total, computed fields (current aging bucket).
 - **`monthly_ledger`** — one row per vendor per month: month, payable, payment, opening balance, closing balance for that month. Normalizes the Excel's wide per-month columns into a queryable shape; this is what the tranche-based FIFO aging logic reads.
 - **`payments`** — the daily transaction log Finance enters manually (see `07-data-pipeline-and-master-sheet.md`): vendor, date, amount, which week it was recorded against. This is the single source of truth for weekly totals — the master Excel's W1…W5 columns are computed from this table and written back, not stored as an independent input. **Confirmed: a small write function (log a payment → insert here → update the vendor's paid-so-far total and status) is a prerequisite for the regeneration engine, built alongside it.**
 - **`plan_runs`** — a record of each plan generation or regeneration event: which model(s), the funds figure used, timestamp. Needed so a regenerated plan can be compared against what it replaced.
 - **`plan_allocations`** — per `plan_run`, per vendor: assigned week, the code-computed within-week execution order (distinct from the P0-P4 bucket — see `07-data-pipeline-and-master-sheet.md`), allocated amount. This is what persists every month's W1-W5 breakdown, not just the latest one (the Excel snapshot only ever shows the latest; the database keeps all of them).
 - **`audit_log`** — from the Configuration module (`11-configuration-module.md`): timestamp, vendor/field or system setting changed, old value, new value, source (UI edit vs. Excel re-upload).
-- **`config`** — system-level settings: Model 1's factor weights, Model 3's bucket score thresholds.
+- **`config`** — system-level settings: New Model 2's bucket ceiling percentages for P2/P3/P4 (`14-new-model-2.md`).
 
 ## Guardrails
 

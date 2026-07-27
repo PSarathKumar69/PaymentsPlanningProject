@@ -76,7 +76,7 @@ def test_list_and_get_vendor(seeded_client):
     assert resp.json()["id"] == vendor_id
 
 
-def test_vendor_aging_and_payments_and_required_amount(seeded_client):
+def test_vendor_aging_and_payments(seeded_client):
     vendor_id = seeded_client.get("/vendors").json()[0]["id"]
 
     resp = seeded_client.get(f"/vendors/{vendor_id}/aging")
@@ -86,10 +86,6 @@ def test_vendor_aging_and_payments_and_required_amount(seeded_client):
     resp = seeded_client.get(f"/vendors/{vendor_id}/payments")
     assert resp.status_code == 200
     assert resp.json() == []  # nothing logged yet
-
-    resp = seeded_client.get(f"/vendors/{vendor_id}/required-amount")
-    assert resp.status_code == 200
-    assert "amount" in resp.json() and "rule" in resp.json()
 
 
 def test_patch_vendor_writes_db_and_audit_log(seeded_client, tmp_path):
@@ -122,6 +118,23 @@ def test_patch_vendor_invalid_field_is_400(seeded_client):
 # ---- AI layer — talking scripts (Gemini mocked, never a real network call) --------
 
 
+def _seed_zero_status_vendor(client):
+    """New Model 2's floor percentages (10%/25%) mean a real vendor's
+    allocation almost never rounds to literal zero purely from a tiny
+    available_funds figure (unlike the old score-based models) — a vendor
+    with a near-zero required_amount is what actually clamps to "zero"
+    status. Tags one real vendor Normal/P2 with a tiny (2.0) balance --
+    above has_outstanding_balance()'s MONEY_EPSILON floor (so it isn't
+    filtered out of the plan entirely) but small enough that
+    `allocated = required_amount * floor_pct(25%) = 0.5` still lands under
+    MONEY_EPSILON, regardless of what the rest of the real dataset looks
+    like."""
+    vendor_id = _seed_known_balance_vendor(client, amount=2.0)
+    client.patch(f"/vendors/{vendor_id}", json={"field": "category", "new_value": "normal"})
+    client.patch(f"/vendors/{vendor_id}", json={"field": "priority_tag", "new_value": "P2"})
+    return vendor_id
+
+
 def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch):
     import backend.ai_layer.gemini_client as gemini_client
 
@@ -130,10 +143,14 @@ def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch
         "generate_text",
         lambda prompt: "**Why we're not paying this cycle**\n- test\n\n**Talking points (step by step)**\n- test",
     )
+    _seed_zero_status_vendor(seeded_client)
 
-    plan_resp = seeded_client.post("/models/2/generate-plan", json={"available_funds": 1})
+    plan_resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 0, "planning_month": "2026-08"},
+    )
     assert plan_resp.status_code == 200
-    allocations = plan_resp.json()["allocations"]
+    allocations = plan_resp.json()["plan"]["allocations"]
     zero_count = sum(1 for a in allocations if a["status"] == "zero")
     assert zero_count > 0
 
@@ -147,9 +164,13 @@ def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch
 def test_ai_talking_scripts_missing_key_is_400(seeded_client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "your-gemini-api-key-here")
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    _seed_zero_status_vendor(seeded_client)
 
-    plan_resp = seeded_client.post("/models/2/generate-plan", json={"available_funds": 1})
-    zero_row = next(a for a in plan_resp.json()["allocations"] if a["status"] == "zero")
+    plan_resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 0, "planning_month": "2026-08"},
+    )
+    zero_row = next(a for a in plan_resp.json()["plan"]["allocations"] if a["status"] == "zero")
 
     resp = seeded_client.post("/ai/talking-scripts", json={"vendor_allocations": [zero_row]})
     assert resp.status_code == 400
@@ -159,35 +180,31 @@ def test_ai_talking_scripts_missing_key_is_400(seeded_client, monkeypatch):
 def test_patch_vendor_invalid_category_value_is_400(seeded_client):
     """Proves the global ValueError->400 handler (main.py), not a per-route
     try/except: a real validation failure inside update_vendor_field's
-    _validate() surfaces as 400 with its message, same as any other route's
-    ValueError (see test_config_model1_weights_invalid_sum_is_400 below for
-    a second, independent route hitting the same handler)."""
+    _validate() surfaces as 400 with its message, same as any other route
+    hitting the same handler."""
     vendor_id = seeded_client.get("/vendors").json()[0]["id"]
     resp = seeded_client.patch(f"/vendors/{vendor_id}", json={"field": "category", "new_value": "not_a_real_category"})
     assert resp.status_code == 400
     assert "invalid category" in resp.json()["detail"]
 
 
-# ---- Model 1 ------------------------------------------------------------
+# ---- New Model 2 (router-level, generic contract — see also
+# test_new_model_2_router.py for planning-month-specific coverage) ----------
+# Model 1/2/3 and New Model 1's own generate-plan/scores/buckets endpoints
+# were removed once New Model 2 became the sole model — their tests went
+# with them. What's below re-targets the tests that were really proving
+# generic, model-agnostic router contracts (build_weekly_view's shape,
+# override/plan-history/week-distribution behavior) at New Model 2 instead
+# of deleting that coverage outright.
+
+NM2_PLANNING_MONTH = "2026-08"  # arbitrary but fixed, matches test_new_model_2_router.py's own convention
 
 
-def test_model1_scores(seeded_client):
-    resp = seeded_client.get("/models/1/scores")
-    assert resp.status_code == 200
-    scores = resp.json()
-    assert len(scores) == 83
-    assert "score" in scores[0]
-
-
-def test_model1_generate_plan(seeded_client):
-    resp = seeded_client.post("/models/1/generate-plan", json={"available_funds": 100_000})
-    assert resp.status_code == 200
-    plan = resp.json()
-    assert "allocations" in plan and len(plan["allocations"]) == 83
-
-
-def test_model1_generate_plan_and_weekly_view_returns_both_pieces(seeded_client):
-    resp = seeded_client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": 100_000})
+def test_new_model_2_generate_plan_and_weekly_view_returns_both_pieces(seeded_client):
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert "plan" in body and "weekly_view" in body
@@ -195,12 +212,15 @@ def test_model1_generate_plan_and_weekly_view_returns_both_pieces(seeded_client)
     assert "detail" in body["weekly_view"] and "weekly_summary" in body["weekly_view"]
 
 
-def test_model1_weekly_view_detail_rows_carry_plan_allocation_id_and_effective_amount(seeded_client):
+def test_new_model_2_weekly_view_detail_rows_carry_plan_allocation_id_and_effective_amount(seeded_client):
     """The override endpoint needs a plan_allocation_id to target — confirms
     every persisted detail row has one, and a freshly-generated plan (no
     override yet) has override_amount=null and effective_amount ==
     allocated_amount."""
-    resp = seeded_client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": 100_000})
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     assert resp.status_code == 200
     detail = resp.json()["weekly_view"]["detail"]
     assert len(detail) > 0
@@ -210,11 +230,14 @@ def test_model1_weekly_view_detail_rows_carry_plan_allocation_id_and_effective_a
         assert row["effective_amount"] == pytest.approx(row["actual_planned"])
 
 
-def test_model1_weekly_view_detail_rows_carry_week_distribution_plan_and_actual_paid(seeded_client):
+def test_new_model_2_weekly_view_detail_rows_carry_week_distribution_plan_and_actual_paid(seeded_client):
     """week_distribution_plan (display-only, Finance-editable) defaults to
     the full suggested amount under the vendor's own assigned_week; a fresh
     plan with no payments logged yet has an empty week_actual_paid."""
-    resp = seeded_client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": 100_000})
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     assert resp.status_code == 200
     detail = resp.json()["weekly_view"]["detail"]
     assert len(detail) > 0
@@ -223,55 +246,14 @@ def test_model1_weekly_view_detail_rows_carry_week_distribution_plan_and_actual_
         assert row["week_actual_paid"] == {}
 
 
-# ---- Model 2 --------------------------------------------------------------
-
-
-def test_model2_minimum_funds_required_and_generate_plan(seeded_client):
-    resp = seeded_client.get("/models/2/minimum-funds-required")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "total" in body and "breakdown" in body
-
-    resp = seeded_client.post("/models/2/generate-plan", json={"available_funds": body["total"]})
-    assert resp.status_code == 200
-    plan = resp.json()
-    assert "allocations" in plan and len(plan["allocations"]) == 83
-
-
-def test_model2_generate_plan_and_weekly_view_returns_both_pieces(seeded_client):
-    resp = seeded_client.post("/models/2/generate-plan-and-weekly-view", json={"available_funds": 100_000})
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "plan" in body and "weekly_view" in body
-    assert "allocations" in body["plan"]
-    assert "detail" in body["weekly_view"] and "weekly_summary" in body["weekly_view"]
-
-
-# ---- Model 3 --------------------------------------------------------------
-
-
-def test_model3_buckets(seeded_client):
-    resp = seeded_client.get("/models/3/buckets")
-    assert resp.status_code == 200
-    buckets = resp.json()
-    assert len(buckets) == 83
-    assert "bucket" in buckets[0]
-
-
-def test_model3_generate_plan_and_weekly_view_returns_both_pieces(seeded_client):
-    resp = seeded_client.post("/models/3/generate-plan-and-weekly-view", json={"available_funds": 100_000})
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "plan" in body and "weekly_view" in body
-    assert "allocations" in body["plan"]
-    assert "detail" in body["weekly_view"] and "weekly_summary" in body["weekly_view"]
-
-
 # ---- Plan allocation overrides ---------------------------------------------
 
 
-def _first_model1_allocation_row(client, available_funds=100_000):
-    resp = client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds})
+def _first_nm2_allocation_row(client, available_funds=100_000, planning_month=NM2_PLANNING_MONTH):
+    resp = client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": planning_month},
+    )
     weekly_view = resp.json()["weekly_view"]
     detail = weekly_view["detail"]
     assert detail, "need at least one vendor with an assigned_week to have a plan_allocation row"
@@ -280,21 +262,22 @@ def _first_model1_allocation_row(client, available_funds=100_000):
     return {**detail[0], "plan_run_id": weekly_view["plan_run_id"]}
 
 
-def _model1_row_for_vendor(client, vendor_id, available_funds=100_000):
+def _nm2_row_for_vendor(client, vendor_id, available_funds=100_000):
     """Same generate-plan-and-weekly-view call as above, but for a SPECIFIC
     vendor — needed to build a "Plan 1, Plan 2, ..." sequence for one vendor
     across repeated calls, since detail[0] isn't guaranteed to stay the same
-    vendor once funds/overrides change between calls."""
-    resp = client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds})
+    vendor once funds/overrides change between calls. No planning_month —
+    New Model 2 reuses whatever was stored on the first call this cycle."""
+    resp = client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": available_funds})
     weekly_view = resp.json()["weekly_view"]
     detail = weekly_view["detail"]
     row = next((r for r in detail if r["vendor_id"] == vendor_id), None)
-    assert row is not None, f"vendor {vendor_id} missing from Model 1's detail this round"
+    assert row is not None, f"vendor {vendor_id} missing from New Model 2's detail this round"
     return {**row, "plan_run_id": weekly_view["plan_run_id"]}
 
 
 def test_override_endpoint_valid_override_succeeds_and_audit_logs(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     override_amount = float(vendor["opening_balance"]) * 0.9  # within bounds, above the suggested amount
 
@@ -317,7 +300,7 @@ def test_override_endpoint_valid_override_succeeds_and_audit_logs(seeded_client)
 
 
 def test_override_endpoint_rejects_above_opening_balance(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     too_much = float(vendor["opening_balance"]) * 1.5
 
@@ -330,7 +313,7 @@ def test_override_endpoint_rejects_above_opening_balance(seeded_client):
 
 
 def test_override_endpoint_null_clears_override(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     override_amount = float(vendor["opening_balance"]) * 0.9
 
@@ -347,7 +330,7 @@ def test_override_endpoint_funds_warning_present_when_committed_exceeds_funds(se
     """docs/06 fix: non-blocking — the save still succeeds (200), but the
     response flags that this plan_run's total committed amount now exceeds
     its funds_figure."""
-    row = _first_model1_allocation_row(seeded_client, available_funds=100_000)
+    row = _first_nm2_allocation_row(seeded_client, available_funds=100_000)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     override_amount = float(vendor["opening_balance"]) * 0.9  # alone exceeds the round's 100,000 funds figure
 
@@ -365,7 +348,10 @@ def test_override_endpoint_funds_warning_present_when_committed_exceeds_funds(se
 
 
 def test_override_endpoint_funds_warning_absent_when_comfortably_under(seeded_client):
-    resp = seeded_client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": 1_000_000_000})
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 1_000_000_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     row = resp.json()["weekly_view"]["detail"][0]
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     override_amount = min(float(vendor["opening_balance"]) * 0.01, 1000.0)  # tiny, comfortably under the huge funds pool
@@ -381,11 +367,11 @@ def test_override_endpoint_funds_warning_absent_when_comfortably_under(seeded_cl
 
 
 def test_plan_runs_history_endpoint_orders_plans_oldest_first_and_numbers_them(seeded_client):
-    first = _first_model1_allocation_row(seeded_client, available_funds=100_000)
+    first = _first_nm2_allocation_row(seeded_client, available_funds=100_000)
     vendor_id = first["vendor_id"]
-    second = _model1_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
+    second = _nm2_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
 
-    history = seeded_client.get("/models/1/plan-runs").json()
+    history = seeded_client.get("/models/5/plan-runs").json()
     plan_run_ids = [p["plan_run_id"] for p in history["plan_runs"]]
     assert plan_run_ids.index(first["plan_run_id"]) < plan_run_ids.index(second["plan_run_id"])
 
@@ -400,31 +386,31 @@ def test_plan_runs_history_endpoint_orders_plans_oldest_first_and_numbers_them(s
 
 
 def test_plan_runs_history_treats_generate_and_regenerate_as_one_continuous_sequence(seeded_client):
-    """Model 2's first Generate Plan is "Plan 1"; each subsequent Regenerate
-    (a DIFFERENT model_used label, "model2_regeneration") is Plan 2, Plan
-    3... — one continuous numbered sequence, not split by label."""
-    gen = seeded_client.post("/models/2/generate-plan-and-weekly-view", json={"available_funds": 100_000})
+    """New Model 2's first Generate Plan is "Plan 1"; every subsequent
+    Regenerate (same endpoint, no planning_month needed after the first
+    call — docs/14) is Plan 2, Plan 3... — one continuous numbered
+    sequence."""
+    gen = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     plan_1_id = gen.json()["weekly_view"]["plan_run_id"]
 
-    regen1 = seeded_client.post(
-        "/regenerate", json={"model": 2, "available_funds": 120_000, "current_week": 1, "reconsider_decisions": {}}
-    )
-    plan_2_id = regen1.json()["plan_run_id"]
+    regen1 = seeded_client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": 120_000})
+    plan_2_id = regen1.json()["weekly_view"]["plan_run_id"]
 
-    regen2 = seeded_client.post(
-        "/regenerate", json={"model": 2, "available_funds": 140_000, "current_week": 1, "reconsider_decisions": {}}
-    )
-    plan_3_id = regen2.json()["plan_run_id"]
+    regen2 = seeded_client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": 140_000})
+    plan_3_id = regen2.json()["weekly_view"]["plan_run_id"]
 
-    history = seeded_client.get("/models/2/plan-runs").json()
+    history = seeded_client.get("/models/5/plan-runs").json()
     ids = [p["plan_run_id"] for p in history["plan_runs"]]
     assert ids == [plan_1_id, plan_2_id, plan_3_id]
 
 
 def test_delete_plan_run_hard_deletes_audits_and_latest_falls_back(seeded_client):
-    first = _first_model1_allocation_row(seeded_client, available_funds=100_000)
+    first = _first_nm2_allocation_row(seeded_client, available_funds=100_000)
     vendor_id = first["vendor_id"]
-    second = _model1_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
+    second = _nm2_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
 
     audit_before = len(seeded_client.get("/audit-log").json())
 
@@ -434,7 +420,7 @@ def test_delete_plan_run_hard_deletes_audits_and_latest_falls_back(seeded_client
     assert body["plan_run_id"] == second["plan_run_id"]
     assert body["deleted_allocations"] >= 1
 
-    history = seeded_client.get("/models/1/plan-runs").json()
+    history = seeded_client.get("/models/5/plan-runs").json()
     ids = [p["plan_run_id"] for p in history["plan_runs"]]
     assert second["plan_run_id"] not in ids  # hard-deleted, not soft-flagged
     assert first["plan_run_id"] in ids  # untouched
@@ -459,9 +445,9 @@ def test_delete_plan_run_404_for_unknown_id(seeded_client):
 
 
 def test_override_patch_rejected_on_non_latest_plan_run_succeeds_on_latest(seeded_client):
-    first = _first_model1_allocation_row(seeded_client, available_funds=100_000)
+    first = _first_nm2_allocation_row(seeded_client, available_funds=100_000)
     vendor_id = first["vendor_id"]
-    second = _model1_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
+    second = _nm2_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
     assert first["plan_allocation_id"] != second["plan_allocation_id"]
 
     stale_resp = seeded_client.patch(
@@ -479,7 +465,7 @@ def test_override_patch_rejected_on_non_latest_plan_run_succeeds_on_latest(seede
 
 
 def test_week_distribution_patch_partial_update_only_touches_specified_weeks(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     default_plan = row["week_distribution_plan"]  # {assigned_week: full suggested amount}
 
     resp = seeded_client.patch(
@@ -506,7 +492,7 @@ def test_week_distribution_patch_has_no_ledger_integrity_or_sum_validation(seede
     """Confirmed decision 1: purely additive, non-enforced — a distribution
     that doesn't sum to the allocated/suggested amount, or numbers with no
     real-world basis, must still succeed."""
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     huge = row["actual_planned"] * 100 + 999_999_999  # deliberately absurd, far above anything owed
 
     resp = seeded_client.patch(
@@ -519,7 +505,7 @@ def test_week_distribution_patch_has_no_ledger_integrity_or_sum_validation(seede
 
 
 def test_week_distribution_patch_writes_an_audit_log_entry(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     resp = seeded_client.patch(
         f"/plan-allocations/{row['plan_allocation_id']}/week-distribution", json={"updates": {"2": 42.0}}
     )
@@ -534,7 +520,7 @@ def test_week_distribution_patch_writes_an_audit_log_entry(seeded_client):
 def test_week_distribution_patch_never_changes_payment_status_or_override_math(seeded_client):
     """Confirmed decision: purely additive — editing the planned split must
     never touch payment_status, ledger-integrity, or override math."""
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor_before = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
 
     seeded_client.patch(
@@ -560,23 +546,24 @@ def test_week_distribution_patch_never_changes_payment_status_or_override_math(s
         session.close()
 
 
-# ---- Model 1 override exclusion on regeneration (this task) ---------------
+# ---- New Model 2 override exclusion on regeneration ------------------------
 
 
-def test_model1_no_overrides_totals_are_zero_and_funds_unreduced(seeded_client):
+def test_new_model_2_no_overrides_totals_are_zero_and_funds_unreduced(seeded_client):
     """Edge case: nothing overridden -> total_overridden is 0.0 and
     funds_left_for_regeneration equals available_funds exactly, same as
     today's behavior."""
     available_funds = 5_000_000.0
     resp = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": NM2_PLANNING_MONTH},
     ).json()
     assert resp["total_overridden"] == 0.0
     assert resp["funds_left_for_regeneration"] == pytest.approx(available_funds)
     assert all(row["status"] != "override_locked" for row in resp["plan"]["allocations"])
 
 
-def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(seeded_client):
+def test_new_model_2_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(seeded_client):
     """Full scenario: generate with available_funds, override one vendor,
     regenerate -- the overridden vendor's Suggested figure freezes at their
     pre-override amount (not recomputed, not mirroring the override), every
@@ -586,7 +573,8 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     available_funds = 5_000_000.0
 
     first = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": NM2_PLANNING_MONTH},
     ).json()
     assert first["total_overridden"] == 0.0
     assert first["funds_left_for_regeneration"] == pytest.approx(available_funds)
@@ -595,7 +583,7 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     assert detail, "need at least one assigned-week vendor to override"
     row = detail[0]
     vendor_id = row["vendor_id"]
-    suggested_before_override = row["actual_planned"]  # Model 1's original suggested figure, before any override
+    suggested_before_override = row["actual_planned"]  # original suggested figure, before any override
 
     vendor = seeded_client.get(f"/vendors/{vendor_id}").json()
     override_amount = min(suggested_before_override * 1.5, float(vendor["opening_balance"]))
@@ -604,7 +592,7 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     )
 
     second = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view", json={"available_funds": available_funds}
     ).json()
 
     assert second["total_overridden"] == pytest.approx(override_amount)
@@ -623,14 +611,20 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     # with the overridden vendor excluded from the eligible set entirely --
     # then compare against the API's own figure for a sampled vendor.
     from backend.db.session import SessionLocal
-    from backend.models.model1_weighted_scoring.scorer import generate_plan
+    from backend.models.new_model_2.allocator import generate_plan
 
     session = SessionLocal()
     try:
         all_vendor_ids = {v["id"] for v in seeded_client.get("/vendors").json()}
+        # as_of must match what the router itself resolved (planning_month
+        # minus one calendar month, docs/14) — NM2_PLANNING_MONTH="2026-08"
+        # -> as_of=2026-07-01. Passing the default as_of=None here would
+        # compute required_amount_v2 against a different "current" bucket
+        # than the router just used, comparing two different numbers.
         expected = generate_plan(
             available_funds - override_amount,
             session=session,
+            as_of=date(2026, 7, 1),
             eligible_vendor_ids=all_vendor_ids - {vendor_id},
         )
     finally:
@@ -659,7 +653,7 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     )
 
     third = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view", json={"available_funds": available_funds}
     ).json()
     assert third["total_overridden"] == pytest.approx(new_override_amount)
     assert third["funds_left_for_regeneration"] == pytest.approx(available_funds - new_override_amount)
@@ -670,15 +664,16 @@ def test_model1_override_excludes_vendor_and_reduces_funds_pool_on_regeneration(
     assert third_overridden_row["allocated_amount"] == pytest.approx(suggested_before_override, abs=1)
 
 
-def test_model1_override_alone_exceeding_funds_clamps_effective_funds_to_zero(seeded_client):
+def test_new_model_2_override_alone_exceeding_funds_clamps_effective_funds_to_zero(seeded_client):
     """Edge case: the overridden vendor's amount alone exceeds available_funds
-    -- effective_funds must clamp at 0, not go negative, and Model 1's
-    existing escalation/escalation_shortfall machinery must reflect the
-    shortfall naturally rather than erroring."""
+    -- effective_funds must clamp at 0, not go negative, and the existing
+    escalation/escalation_shortfall machinery must reflect the shortfall
+    naturally rather than erroring."""
     available_funds = 100_000.0
 
     first = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": NM2_PLANNING_MONTH},
     ).json()
     detail = first["weekly_view"]["detail"]
     row = detail[0]
@@ -692,7 +687,7 @@ def test_model1_override_alone_exceeding_funds_clamps_effective_funds_to_zero(se
     )
 
     resp = seeded_client.post(
-        "/models/1/generate-plan-and-weekly-view", json={"available_funds": available_funds}
+        "/models/5/generate-plan-and-weekly-view", json={"available_funds": available_funds}
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -707,37 +702,45 @@ def test_model1_override_alone_exceeding_funds_clamps_effective_funds_to_zero(se
 
 
 def test_week_distribution_plan_untouched_by_a_payment_in_a_different_week(seeded_client):
-    """The concrete planned-W2/paid-W4 scenario end to end: Finance's
-    planning note for a vendor's week stays exactly as edited even after a
-    real payment lands under a completely different week, and
+    """The concrete planned-Wx/paid-in-a-different-week scenario end to end:
+    Finance's planning note for a vendor's week stays exactly as edited even
+    after a real payment lands under a completely different week, and
     week_actual_paid correctly reflects that payment under its own week."""
     from backend.db.models import PlanAllocation, Vendor
     from backend.db.session import SessionLocal
+    from backend.weekly_planning.calendar_utils import week_for_date, weeks_in_month
 
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor_id = row["vendor_id"]
 
-    # Force this vendor's assigned_week to 2 so the scenario matches
-    # "planned W2" exactly, regardless of whatever real week they started at.
+    # Force this vendor's assigned_week to a week STILL IN THE FUTURE
+    # relative to today — not a hardcoded "2" — so the pulled-forward-week
+    # fix (build_weekly_view(): a week that's already elapsed relative to
+    # today gets pulled forward to today's real week) doesn't collapse this
+    # into the same week the real payment below lands in, which would defeat
+    # the whole "planned vs. paid in a different week" premise.
+    today = date.today()
+    current_week = week_for_date(today)
+    target_week = min(current_week + 1, weeks_in_month(today.year, today.month))
     session = SessionLocal()
     try:
         vendor = session.query(Vendor).filter_by(id=vendor_id).one()
-        vendor.assigned_week = 2
+        vendor.assigned_week = target_week
         session.commit()
     finally:
         session.close()
 
-    fresh = seeded_client.post("/models/1/generate-plan-and-weekly-view", json={"available_funds": 100_000}).json()
+    fresh = seeded_client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": 100_000}).json()
     fresh_row = next(r for r in fresh["weekly_view"]["detail"] if r["vendor_id"] == vendor_id)
-    assert fresh_row["assigned_week"] == 2
+    assert fresh_row["assigned_week"] == target_week
     planned_before = fresh_row["week_distribution_plan"]
-    assert planned_before == {"2": pytest.approx(fresh_row["actual_planned"])}
+    assert planned_before == {str(target_week): pytest.approx(fresh_row["actual_planned"])}
     assert fresh_row["week_actual_paid"] == {}
     plan_allocation_id = fresh_row["plan_allocation_id"]
 
     # Finance logs a real payment today — server-determined date/week
     # (contract from an earlier task), which lands wherever "today" falls,
-    # not week 2.
+    # not target_week.
     pay_resp = seeded_client.post("/payments", json={"vendor_id": vendor_id, "amount": 1000.0})
     assert pay_resp.status_code == 200
 
@@ -755,7 +758,10 @@ def test_week_distribution_plan_untouched_by_a_payment_in_a_different_week(seede
 
     paid_week = next(iter(replan_row["week_actual_paid"]))
     assert replan_row["week_actual_paid"][paid_week] == pytest.approx(1000.0)
-    assert paid_week != "2", "test setup coincidence: today's real week landed on week 2 too — not a real cross-week proof"
+    assert paid_week != str(target_week), (
+        "test setup coincidence: today's real week already IS the last week of the month, "
+        "so no distinct future week exists — not a real cross-week proof"
+    )
 
     # The ORIGINAL persisted row's planned figure is completely untouched by the payment.
     session = SessionLocal()
@@ -770,49 +776,25 @@ def test_week_distribution_plan_untouched_by_a_payment_in_a_different_week(seede
 
 
 def test_standalone_weekly_view(seeded_client):
-    plan = seeded_client.post("/models/2/generate-plan", json={"available_funds": 100_000}).json()
+    plan = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    ).json()["plan"]
     resp = seeded_client.post(
         "/weekly-view",
-        json={"vendor_allocations": plan["allocations"], "model_used": "model2", "funds_figure": 100_000, "persist": False},
+        json={"vendor_allocations": plan["allocations"], "model_used": "new_model_2", "funds_figure": 100_000, "persist": False},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["plan_run_id"] is None  # persist=False
     assert "detail" in body and "weekly_summary" in body
 
-
 # ---- Regeneration -----------------------------------------------------------
-
-
-def test_regenerate_invalid_model_is_400(seeded_client):
-    # Model 1 is now a valid /regenerate target (it drives payment_status) —
-    # 4 is the genuinely invalid case now, not 1.
-    resp = seeded_client.post(
-        "/regenerate", json={"model": 4, "available_funds": 10_000, "current_week": 1, "reconsider_decisions": None}
-    )
-    assert resp.status_code == 400
-    assert "model must be 1, 2, or 3" in resp.json()["detail"]
-
-
-def test_regenerate_happy_path(seeded_client):
-    resp = seeded_client.post(
-        "/regenerate", json={"model": 2, "available_funds": 50_000, "current_week": 1, "reconsider_decisions": {}}
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "plan_run_id" in body and "allocations" in body and "excluded" in body and "pulled_forward" in body
-
-
-def test_regenerate_model1_happy_path(seeded_client):
-    """Model 1 is now a genuine /regenerate participant (it's the sole
-    driver of payment_status/cycle_allocation) — confirms the route accepts
-    model=1 and produces a real plan, not just that 2/3 still work."""
-    resp = seeded_client.post(
-        "/regenerate", json={"model": 1, "available_funds": 50_000, "current_week": 1, "reconsider_decisions": {}}
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "plan_run_id" in body and "allocations" in body and "excluded" in body and "pulled_forward" in body
+# The old /regenerate endpoint (eligibility-filtering/reconsider engine for
+# Models 2/3) was removed once New Model 2 became the sole model — New
+# Model 2 has no separate regeneration step at all (docs/14: the same
+# generate-plan-and-weekly-view endpoint handles every "Regenerate" click,
+# already covered above by test_plan_runs_history_treats_generate_and_regenerate_as_one_continuous_sequence).
 
 
 # ---- Payments ---------------------------------------------------------------
@@ -926,13 +908,13 @@ def test_vendor_payment_tracking_balance_outstanding_never_negative_even_if_over
 def test_vendor_payment_tracking_budget_stays_zero_until_finalized(seeded_client):
     """Budget is a stable snapshot, not a live-following figure: generating
     a plan alone must NOT move it — only an explicit "Finalize Plan" click
-    (POST /vendors/finalize-plan) does."""
-    row = _first_model1_allocation_row(seeded_client, available_funds=5_000_000)
+    (POST /vendors/finalize-plan, model=5 for New Model 2) does."""
+    row = _first_nm2_allocation_row(seeded_client, available_funds=5_000_000)
 
     before = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"])
     assert before["budget"] == 0.0  # plan generated, but never finalized yet
 
-    resp = seeded_client.post("/vendors/finalize-plan")
+    resp = seeded_client.post("/vendors/finalize-plan", json={"model": 5})
     assert resp.status_code == 200
     assert resp.json()["vendor_count"] > 0
 
@@ -940,29 +922,13 @@ def test_vendor_payment_tracking_budget_stays_zero_until_finalized(seeded_client
     assert after["budget"] == pytest.approx(row["actual_planned"], abs=1)
 
 
-def test_vendor_payment_tracking_budget_reads_model1_not_other_models(seeded_client):
-    """Confirmed: Budget always snapshots Model 1's figure specifically
-    (Model 1 is the sole driver of payment_status/cycle_allocation
-    elsewhere too, payment_logging.py::_this_cycle_allocation) — a plan
-    generated only on Model 2/3 must not leak into Budget."""
-    resp = seeded_client.post("/models/2/generate-plan-and-weekly-view", json={"available_funds": 5_000_000})
-    assert resp.status_code == 200
-    detail = resp.json()["weekly_view"]["detail"]
-    assert detail
-    row = detail[0]
-
-    seeded_client.post("/vendors/finalize-plan")
-    tracking = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"])
-    # Model 2 was never generated for Model 1's own plan_run, so Finalize
-    # (Model 1-only) has nothing to snapshot for this vendor -> stays 0,
-    # regardless of what Model 2 suggested.
-    assert tracking["budget"] == 0.0
-
-
-def test_vendor_payment_tracking_within_week_order_reads_latest_plan_run_across_any_model(seeded_client):
-    """Priority (planning table) reuses this same field — confirms it's not
-    hardcoded to Model 1 either, mirroring the Budget test above."""
-    resp = seeded_client.post("/models/2/generate-plan-and-weekly-view", json={"available_funds": 5_000_000})
+def test_vendor_payment_tracking_within_week_order_reads_latest_new_model_2_plan_run(seeded_client):
+    """Priority (planning table) reuses this same field, sourced from
+    whichever plan_run is actually latest."""
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 5_000_000, "planning_month": NM2_PLANNING_MONTH},
+    )
     assert resp.status_code == 200
     detail = resp.json()["weekly_view"]["detail"]
     assert detail
@@ -973,13 +939,13 @@ def test_vendor_payment_tracking_within_week_order_reads_latest_plan_run_across_
 
 
 def test_vendor_payment_tracking_budget_prefers_sticky_override_over_plan_run(seeded_client):
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     override_amount = float(vendor["opening_balance"]) * 0.5
     seeded_client.patch(
         f"/plan-allocations/{row['plan_allocation_id']}/override", json={"override_amount": override_amount}
     )
-    seeded_client.post("/vendors/finalize-plan")
+    seeded_client.post("/vendors/finalize-plan", json={"model": 5})
 
     tracking = next(
         r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"]
@@ -992,7 +958,7 @@ def test_vendor_payment_tracking_budget_reflects_latest_override_across_repeated
     finalizes, pays some vendors, then comes back and overrides again later
     — Budget must reflect the LATEST override at each Finalize click, not
     the first one."""
-    row = _first_model1_allocation_row(seeded_client)
+    row = _first_nm2_allocation_row(seeded_client)
     vendor = seeded_client.get(f"/vendors/{row['vendor_id']}").json()
     opening = float(vendor["opening_balance"])
 
@@ -1000,7 +966,7 @@ def test_vendor_payment_tracking_budget_reflects_latest_override_across_repeated
     seeded_client.patch(
         f"/plan-allocations/{row['plan_allocation_id']}/override", json={"override_amount": first_override}
     )
-    seeded_client.post("/vendors/finalize-plan")
+    seeded_client.post("/vendors/finalize-plan", json={"model": 5})
     tracking = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"])
     assert tracking["budget"] == pytest.approx(first_override)
 
@@ -1013,7 +979,7 @@ def test_vendor_payment_tracking_budget_reflects_latest_override_across_repeated
     tracking = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"])
     assert tracking["budget"] == pytest.approx(first_override)  # unchanged — not finalized yet
 
-    seeded_client.post("/vendors/finalize-plan")
+    seeded_client.post("/vendors/finalize-plan", json={"model": 5})
     tracking = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == row["vendor_id"])
     assert tracking["budget"] == pytest.approx(second_override)  # now reflects the latest override
 
@@ -1313,62 +1279,72 @@ def test_suggested_allocation_reflects_a_logged_payment(seeded_client):
     rewritten; this is about what the NEXT generate-plan call computes.
     """
     vendor_id = _seed_known_balance_vendor(seeded_client, amount=1_200_000.0)
-    before = seeded_client.post("/models/2/generate-plan", json={"available_funds": 100_000}).json()
+    before = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": NM2_PLANNING_MONTH},
+    ).json()["plan"]
     before_row = next(a for a in before["allocations"] if a["vendor_id"] == vendor_id)
 
     payment = 1.0
     seeded_client.post("/payments", json={"vendor_id": vendor_id, "amount": payment})
 
-    after = seeded_client.post("/models/2/generate-plan", json={"available_funds": 100_000}).json()
+    after = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view", json={"available_funds": 100_000}
+    ).json()["plan"]
     after_row = next(a for a in after["allocations"] if a["vendor_id"] == vendor_id)
 
     assert after_row["required_amount"] == pytest.approx(before_row["required_amount"] - payment, abs=1e-6)
-    assert after_row["allocated_amount"] == before_row["allocated_amount"]
+    # New Model 2's bucket-ceiling search is a global optimization across
+    # every Normal/Inactive vendor's required_amount at once (unlike a
+    # simple per-vendor cutoff) -- a ~₹1 change in this vendor's own
+    # required_amount can shift the shared percentage search by a
+    # fraction of a rupee for everyone, itself included. abs=1 tolerance,
+    # not exact equality, is the right bar here.
+    assert after_row["allocated_amount"] == pytest.approx(before_row["allocated_amount"], abs=1)
     assert after_row["status"] == before_row["status"]
 
 
 # ---- Configuration ------------------------------------------------------
 
 
-def test_config_list_and_model1_weights_roundtrip(seeded_client):
+def test_config_list(seeded_client):
     resp = seeded_client.get("/config")
     assert resp.status_code == 200
 
-    resp = seeded_client.get("/config/model1-weights")
-    assert resp.status_code == 200
-    weights = resp.json()
-    assert abs(sum(weights.values()) - 1.0) < 1e-6
 
-    resp = seeded_client.put(
-        "/config/model1-weights", json={"aging": 0.4, "outstanding": 0.3, "consistency": 0.2, "trend": 0.1}
+def test_config_priority_buckets_crud_round_trip(seeded_client):
+    """New Model 2 priority-bucket structure (docs/11 Task 2 Part C) — the
+    router-level wiring for add/edit/remove, on top of the already-covered
+    backend/configuration/test_priority_bucket_edits.py unit tests."""
+    resp = seeded_client.get("/config/priority-buckets")
+    assert resp.status_code == 200
+    keys = {b["bucket_key"] for b in resp.json()}
+    assert {"P2", "P3", "P4", "P5"} <= keys
+
+    resp = seeded_client.post(
+        "/config/priority-buckets",
+        json={"bucket_key": "P6", "display_label": "P6", "ceiling_pct": 0.70, "floor_pct": 0.15, "rotation_position": 4},
     )
     assert resp.status_code == 200
-    assert set(resp.json()["changed"]) == {"aging", "trend"}
 
-
-def test_config_model1_weights_invalid_sum_is_400(seeded_client):
-    resp = seeded_client.put(
-        "/config/model1-weights", json={"aging": 0.5, "outstanding": 0.5, "consistency": 0.5, "trend": 0.5}
-    )
-    assert resp.status_code == 400
-    assert "must sum to 1.0" in resp.json()["detail"]
-
-
-def test_config_model3_thresholds_and_bucket_pct(seeded_client):
-    resp = seeded_client.get("/config/model3-thresholds-and-targets")
+    resp = seeded_client.put("/config/priority-buckets/P6", json={"ceiling_pct": 0.65})
     assert resp.status_code == 200
-    assert resp.json()["p2_min_score"] == 70
+    assert resp.json()["changed"] is True
 
-    resp = seeded_client.put("/config/model3-thresholds", json={"p2_threshold": 80, "p3_threshold": 40})
+    resp = seeded_client.delete("/config/priority-buckets/P6")
     assert resp.status_code == 200
 
-    resp = seeded_client.put("/config/model3-bucket-pct/model3.target_pct.p2", json={"value": 60})
+    resp = seeded_client.get("/config/priority-buckets")
+    assert "P6" not in {b["bucket_key"] for b in resp.json()}
+
+
+def test_config_priority_bucket_remove_blocked_when_vendor_tagged(seeded_client):
+    vendors = seeded_client.get("/vendors").json()
+    normal_vendor = next(v for v in vendors if v["category"] == "normal")
+    resp = seeded_client.patch(f"/vendors/{normal_vendor['id']}", json={"field": "priority_tag", "new_value": "P3"})
     assert resp.status_code == 200
-    assert resp.json()["new_fraction"] == pytest.approx(0.6)
 
-
-def test_config_bucket_pct_unknown_key_is_400(seeded_client):
-    resp = seeded_client.put("/config/model3-bucket-pct/not.a.real.key", json={"value": 50})
+    resp = seeded_client.delete("/config/priority-buckets/P3")
     assert resp.status_code == 400
 
 

@@ -8,6 +8,7 @@ class LogPaymentRequest(BaseModel):
 
     vendor_id: int
     amount: float
+    note: str | None = None
 
 
 class LogPaymentResponse(BaseModel):

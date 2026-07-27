@@ -21,6 +21,7 @@ class VendorOut(BaseModel):
     current_aging_bucket: str | None
     reconsider: bool | None
     override_amount: float | None
+    priority_tag: str | None  # New Model 2's Finance-assigned P2/P3/P4 tag (docs/14-new-model-2.md)
 
 
 class VendorAgingOut(BaseModel):
@@ -52,12 +53,22 @@ class VendorAgingOut(BaseModel):
     min_funds_tranches: list[dict[str, Any]]  # oldest -> newest, {month, remaining_amount, is_leftover}
 
 
+class VendorAgingBulkItem(VendorAgingOut):
+    """Same shape as VendorAgingOut, plus vendor_id — GET /vendors/aging
+    (bulk) returns a list of these so the frontend can populate the
+    Planning table's Aging column with one request instead of one
+    GET /vendors/{id}/aging per vendor."""
+
+    vendor_id: int
+
+
 class PaymentOut(BaseModel):
     id: int
     vendor_id: int
     payment_date: date
     amount: float
     week: int | None
+    note: str | None = None
 
 
 class VendorPatchRequest(BaseModel):
@@ -69,11 +80,6 @@ class VendorPatchRequest(BaseModel):
 class VendorPatchResponse(BaseModel):
     old_value: Any
     new_value: Any
-
-
-class RequiredAmountOut(BaseModel):
-    amount: float
-    rule: str
 
 
 class VendorPaymentTrackingOut(BaseModel):
@@ -98,6 +104,21 @@ class VendorPaymentTrackingOut(BaseModel):
     # frozen Finalize snapshot) — this one still always reflects the truth.
     within_week_order: int | None
     balance_outstanding: float  # outstanding - actual_paid_this_month, clamped at 0 — ledger integrity, must never go negative
+    # This vendor's own required_amount() figure, but the PRE-payment
+    # snapshot (paid_so_far_override=0.0) — this cycle's payments already
+    # moved the live version, so this is reconstructed as it stood before
+    # any of them landed (see the router's own docstring). NOT tied to
+    # Budget/override. Frontend's "% Min Funds Paid" = actual_paid_this_month
+    # / this figure.
+    min_funds_required: float
+
+
+class FinalizePlanRequest(BaseModel):
+    # Which model's plan_run family to snapshot into Budget. New Model 2
+    # (model 5) calls finalize_plan() directly from its own router instead
+    # of through this endpoint. Defaults to 1 for any caller sending an
+    # empty body.
+    model: int = 1
 
 
 class FinalizePlanResponse(BaseModel):

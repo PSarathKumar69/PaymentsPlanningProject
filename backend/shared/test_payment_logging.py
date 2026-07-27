@@ -21,7 +21,7 @@ from sqlalchemy import func
 
 from backend.db.models import MonthlyLedger, Payment, PlanAllocation, PlanRun, Vendor
 from backend.db.session import SessionLocal
-from backend.shared.constants import MODEL_1_PLAN_RUN_LABEL
+from backend.shared.constants import NEW_MODEL_2_PLAN_RUN_LABEL
 from backend.shared.enums import PaymentStatus
 from backend.shared.payment_logging import _this_cycle_allocation, finalize_plan, log_payment, week_actual_paid
 from backend.weekly_planning.calendar_utils import week_for_date
@@ -52,14 +52,13 @@ def _unallocated_vendor(session, min_balance=0):
     return vendor
 
 
-def _give_vendor_a_model1_cycle_allocation(session, vendor, amount, override_amount=None, created_at=_FUTURE):
-    """Constructs a Model 1 plan_run/plan_allocation for a vendor, so "this
-    cycle's plan allocation" is a known, controlled number. Model 1 is now
-    the sole driver of payment_status/cycle_allocation (see
-    payment_logging.py) — model_used must be MODEL_1_PLAN_RUN_LABEL for
+def _give_vendor_a_new_model_2_cycle_allocation(session, vendor, amount, override_amount=None, created_at=_FUTURE):
+    """Constructs a plan_run/plan_allocation for a vendor, so "this
+    cycle's plan allocation" is a known, controlled number — model_used
+    must be NEW_MODEL_2_PLAN_RUN_LABEL (the sole model's own family) for
     _this_cycle_allocation to pick it up at all; any other model_used is
     invisible to it by design. created_at defaults far in the future so
-    this is always "the latest" Model 1 plan_run this cycle, regardless of
+    this is always "the latest" plan_run this cycle, regardless of
     what real testing has already generated.
 
     override_amount, when given, sets vendor.override_amount — the sticky,
@@ -70,7 +69,7 @@ def _give_vendor_a_model1_cycle_allocation(session, vendor, amount, override_amo
     if override_amount is not None:
         vendor.override_amount = override_amount
     cycle_month = session.query(func.max(MonthlyLedger.month)).scalar()
-    plan_run = PlanRun(created_at=created_at, month=cycle_month, model_used=MODEL_1_PLAN_RUN_LABEL, funds_figure=amount)
+    plan_run = PlanRun(created_at=created_at, month=cycle_month, model_used=NEW_MODEL_2_PLAN_RUN_LABEL, funds_figure=amount)
     session.add(plan_run)
     session.flush()
     allocation = PlanAllocation(
@@ -98,7 +97,7 @@ def test_large_vendor_reaches_paid_in_full_against_cycle_allocation_not_total_ba
         outstanding = float(vendor.opening_balance)
 
         cycle_allocation = 200_000.0  # constructed: deliberately small vs. the real balance
-        _give_vendor_a_model1_cycle_allocation(session, vendor, cycle_allocation)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, cycle_allocation)
 
         status = log_payment(vendor.id, cycle_allocation, date(2026, 5, 10), session=session)
 
@@ -115,7 +114,7 @@ def test_status_transitions_not_paid_to_partial_to_full_against_cycle_allocation
     try:
         vendor = _unallocated_vendor(session)
         cycle_allocation = 1_000_000.0
-        _give_vendor_a_model1_cycle_allocation(session, vendor, cycle_allocation)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, cycle_allocation)
         assert vendor.payment_status == PaymentStatus.NOT_PAID
 
         status = log_payment(vendor.id, cycle_allocation * 0.3, date(2026, 6, 1), session=session)
@@ -200,7 +199,7 @@ def test_zero_cycle_allocation_vendor_stays_partial_regardless_of_payment_size()
     try:
         vendor = _unallocated_vendor(session, min_balance=2_000_000)
 
-        assert _this_cycle_allocation(session, vendor.id) == 0.0  # no Model 1 plan_run this cycle at all -> 0
+        assert _this_cycle_allocation(session, vendor.id) == 0.0  # no plan_run this cycle at all -> 0
 
         status = log_payment(vendor.id, 5.0, date(2026, 6, 1), session=session)  # smallest payment above MONEY_EPSILON
         assert status == PaymentStatus.PARTIAL
@@ -214,7 +213,7 @@ def test_zero_cycle_allocation_vendor_stays_partial_regardless_of_payment_size()
 
 def test_full_balance_paid_before_any_plan_run_reaches_paid_in_full_not_partial():
     """docs/06 fix, direct regression test: a vendor who clears their entire
-    opening_balance before Model 1 has ever generated a plan_run this cycle
+    opening_balance before a plan_run has ever been generated a plan_run this cycle
     (cycle_allocation == 0) must reach PAID_IN_FULL — not get stuck at
     PARTIAL forever, since no future payment event exists to re-trigger a
     status recheck once nothing's left to pay.
@@ -224,7 +223,7 @@ def test_full_balance_paid_before_any_plan_run_reaches_paid_in_full_not_partial(
         vendor = _unallocated_vendor(session, min_balance=1_000_000)
         owed = float(vendor.opening_balance)
 
-        assert _this_cycle_allocation(session, vendor.id) == 0.0  # no Model 1 plan_run this cycle at all
+        assert _this_cycle_allocation(session, vendor.id) == 0.0  # no plan_run this cycle at all
 
         status = log_payment(vendor.id, owed, date(2026, 6, 1), session=session)
         assert status == PaymentStatus.PAID_IN_FULL
@@ -233,30 +232,24 @@ def test_full_balance_paid_before_any_plan_run_reaches_paid_in_full_not_partial(
         session.close()
 
 
-def test_this_cycle_allocation_scoped_to_current_cycle_month_not_prior_months():
-    """docs/06 fix: _this_cycle_allocation() must only look at Model 1's
-    plan_run(s) whose month is the vendor's CURRENT cycle month (the DB's
-    latest ingested ledger month) — an older month's plan_run must not
-    inflate this cycle's PAID_IN_FULL threshold, now that
-    backend/month_end/rollover.py resets payment_status/
-    paid_so_far_this_month on every genuine new month.
+def test_this_cycle_allocation_ignores_plan_run_month_uses_latest_by_recency_only():
+    """New Model 2's own plan_run.month is Finance's picked planning month
+    (docs/14), not the ledger-ingestion anchor every retired model used —
+    it can legitimately differ from the vendor's real ledger month, so
+    _this_cycle_allocation() must pick the latest plan_run for the model
+    family by recency alone, never filtered/scoped by month. A plan_run
+    dated in an unrelated month must still win if it's the most recent one.
     """
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session, min_balance=500_000)
-
-        current_cycle_month = session.query(func.max(MonthlyLedger.month)).scalar()
-        old_cycle_month = (
-            date(current_cycle_month.year, current_cycle_month.month - 1, 1)
-            if current_cycle_month.month > 1
-            else date(current_cycle_month.year - 1, 12, 1)
-        )
+        unrelated_month = date(2030, 1, 1)
 
         for month, amount, created_at in (
-            (old_cycle_month, 5_000_000.0, _FUTURE),
-            (current_cycle_month, 200_000.0, _FUTURE),
+            (unrelated_month, 5_000_000.0, _FUTURE.replace(hour=1)),
+            (unrelated_month, 200_000.0, _FUTURE.replace(hour=2)),  # created later -> wins, despite the same month
         ):
-            plan_run = PlanRun(created_at=created_at, month=month, model_used=MODEL_1_PLAN_RUN_LABEL, funds_figure=amount)
+            plan_run = PlanRun(created_at=created_at, month=month, model_used=NEW_MODEL_2_PLAN_RUN_LABEL, funds_figure=amount)
             session.add(plan_run)
             session.flush()
             session.add(
@@ -269,23 +262,23 @@ def test_this_cycle_allocation_scoped_to_current_cycle_month_not_prior_months():
         assert _this_cycle_allocation(session, vendor.id) == pytest.approx(200_000.0)  # not 5,200,000
 
         status = log_payment(vendor.id, 200_000.0, date(2026, 5, 10), session=session)
-        assert status == PaymentStatus.PAID_IN_FULL  # matches only the current cycle's 200,000, not 5,200,000
+        assert status == PaymentStatus.PAID_IN_FULL  # matches only the latest plan_run's 200,000, not 5,200,000
     finally:
         session.rollback()
         session.close()
 
 
-def test_this_cycle_allocation_uses_model1s_latest_plan_run_not_a_cumulative_sum():
+def test_this_cycle_allocation_uses_latest_plan_run_not_a_cumulative_sum():
     """Confirmed fix: the real dashboard's Generate Plan/Regenerate button
-    creates a brand-new, independent Model 1 plan_run on every click (never
-    an incremental top-up) — summing every one of them across the whole
-    cycle month made a vendor's "cycle allocation" grow without bound the
-    more times a plan was regenerated, eventually making PAID_IN_FULL
-    permanently unreachable no matter how much they were actually paid
-    (confirmed live against the real dummy DB before this fix: one vendor's
-    cycle allocation had inflated to over 22 crore from dozens of
-    plan_runs). Only Model 1's most recent plan_run should count now — a
-    new click replaces what a vendor was told they'd get, not adds to it.
+    creates a brand-new, independent plan_run on every click (never an
+    incremental top-up) — summing every one of them across the whole cycle
+    made a vendor's "cycle allocation" grow without bound the more times a
+    plan was regenerated, eventually making PAID_IN_FULL permanently
+    unreachable no matter how much they were actually paid (confirmed live
+    against the real dummy DB before this fix: one vendor's cycle allocation
+    had inflated to over 22 crore from dozens of plan_runs). Only the most
+    recent plan_run should count — a new click replaces what a vendor was
+    told they'd get, not adds to it.
     """
     session = SessionLocal()
     try:
@@ -293,15 +286,15 @@ def test_this_cycle_allocation_uses_model1s_latest_plan_run_not_a_cumulative_sum
         cycle_month = session.query(func.max(MonthlyLedger.month)).scalar()
 
         # Three separate "Generate Plan" clicks this cycle, each its own
-        # Model 1 plan_run (same as the real dashboard) — allocation
-        # shrinks each time as the funds figure entered changes. Relative
-        # ordering between these three matters, not their absolute time, so
-        # offset hours off the same future anchor.
+        # plan_run (same as the real dashboard) — allocation shrinks each
+        # time as the funds figure entered changes. Relative ordering
+        # between these three matters, not their absolute time, so offset
+        # hours off the same future anchor.
         for hour, amount in enumerate([1_000_000.0, 700_000.0, 200_000.0]):
             plan_run = PlanRun(
                 created_at=_FUTURE.replace(hour=hour),
                 month=cycle_month,
-                model_used=MODEL_1_PLAN_RUN_LABEL,
+                model_used=NEW_MODEL_2_PLAN_RUN_LABEL,
                 funds_figure=amount,
             )
             session.add(plan_run)
@@ -324,45 +317,43 @@ def test_this_cycle_allocation_uses_model1s_latest_plan_run_not_a_cumulative_sum
         session.close()
 
 
-def test_this_cycle_allocation_ignores_models_2_and_3_entirely():
-    """Confirmed decision: Model 1 (plus a Finance override) is the sole
-    driver of payment_status/cycle_allocation — Models 2/3's plan_runs must
-    never be consulted, even when they exist for the same vendor this cycle
-    with a larger or smaller allocation than Model 1's own.
-    """
+def test_this_cycle_allocation_ignores_an_unrelated_plan_run_label():
+    """Family-matched by a "model{n}%" prefix (plan_history.py's own
+    convention, so a "model5_regeneration"-style label still counts) — but
+    a plan_run under a completely unrelated label must never be consulted,
+    even when it exists for the same vendor with a larger allocation."""
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
         cycle_month = session.query(func.max(MonthlyLedger.month)).scalar()
 
-        _give_vendor_a_model1_cycle_allocation(session, vendor, 300_000.0)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, 300_000.0)
 
-        # Models 2 and 3 both have their own, much larger, live plan_run
-        # this same cycle — must have zero effect on the result.
-        for model_used, amount in [("model2", 5_000_000.0), ("model3", 8_000_000.0)]:
-            plan_run = PlanRun(created_at=_FUTURE, month=cycle_month, model_used=model_used, funds_figure=amount)
-            session.add(plan_run)
-            session.flush()
-            session.add(
-                PlanAllocation(
-                    plan_run_id=plan_run.id, vendor_id=vendor.id, assigned_week=1, within_week_order=1, allocated_amount=amount
-                )
+        # An unrelated, much larger plan_run for the same vendor this same
+        # cycle — must have zero effect on the result.
+        plan_run = PlanRun(created_at=_FUTURE, month=cycle_month, model_used="some_other_label", funds_figure=5_000_000.0)
+        session.add(plan_run)
+        session.flush()
+        session.add(
+            PlanAllocation(
+                plan_run_id=plan_run.id, vendor_id=vendor.id, assigned_week=1, within_week_order=1, allocated_amount=5_000_000.0
             )
-            session.flush()
+        )
+        session.flush()
 
-        assert _this_cycle_allocation(session, vendor.id) == pytest.approx(300_000.0)  # Model 1's figure only
+        assert _this_cycle_allocation(session, vendor.id) == pytest.approx(300_000.0)
     finally:
         session.rollback()
         session.close()
 
 
 def test_this_cycle_allocation_prefers_override_over_allocated_amount():
-    """Finance's override on Model 1's latest plan_run row takes priority
+    """Finance's override on the latest plan_run row takes priority
     over the model's own suggested allocated_amount."""
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
-        _give_vendor_a_model1_cycle_allocation(session, vendor, amount=1_000_000.0, override_amount=650_000.0)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, amount=1_000_000.0, override_amount=650_000.0)
 
         assert _this_cycle_allocation(session, vendor.id) == pytest.approx(650_000.0)  # override, not 1,000,000
 
@@ -373,7 +364,7 @@ def test_this_cycle_allocation_prefers_override_over_allocated_amount():
         session.close()
 
 
-def test_this_cycle_allocation_zero_when_no_model1_plan_run_this_cycle():
+def test_this_cycle_allocation_zero_when_no_plan_run_at_all():
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
@@ -390,7 +381,7 @@ def test_finalize_plan_snapshots_this_cycle_allocation_for_every_vendor():
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
-        _give_vendor_a_model1_cycle_allocation(session, vendor, 400_000.0)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, 400_000.0)
         assert vendor.finalized_budget_amount is None  # never finalized yet
 
         finalize_plan(session)
@@ -406,7 +397,7 @@ def test_finalize_plan_prefers_override_same_as_this_cycle_allocation():
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
-        _give_vendor_a_model1_cycle_allocation(session, vendor, 400_000.0, override_amount=650_000.0)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, 400_000.0, override_amount=650_000.0)
 
         finalize_plan(session)
 
@@ -423,7 +414,7 @@ def test_finalize_plan_does_not_move_again_until_called_a_second_time():
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session)
-        allocation = _give_vendor_a_model1_cycle_allocation(session, vendor, 400_000.0)
+        allocation = _give_vendor_a_new_model_2_cycle_allocation(session, vendor, 400_000.0)
         finalize_plan(session)
         assert float(vendor.finalized_budget_amount) == pytest.approx(400_000.0)
 
@@ -439,18 +430,18 @@ def test_finalize_plan_does_not_move_again_until_called_a_second_time():
         session.close()
 
 
-def test_vendor_fully_paid_against_model1_suggestion_reaches_paid_in_full_end_to_end():
+def test_vendor_fully_paid_against_suggestion_reaches_paid_in_full_end_to_end():
     """Reproduces the original bug end to end: a vendor fully paid against
-    their Model 1 suggested amount now correctly reaches PAID_IN_FULL — the
-    exact V00742/V00093 symptom (Outstanding cleared but status stuck at
-    Partial) traced back to unbounded/cross-model cycle_allocation, now
-    fixed by scoping to Model 1's latest plan_run alone.
+    their suggested amount now correctly reaches PAID_IN_FULL — the exact
+    V00742/V00093 symptom (Outstanding cleared but status stuck at Partial)
+    traced back to unbounded/cross-model cycle_allocation, fixed by always
+    using only the latest plan_run for the model in use.
     """
     session = SessionLocal()
     try:
         vendor = _unallocated_vendor(session, min_balance=1_000_000)
         suggested = float(vendor.opening_balance) * 0.5  # well within their real balance either way
-        _give_vendor_a_model1_cycle_allocation(session, vendor, suggested)
+        _give_vendor_a_new_model_2_cycle_allocation(session, vendor, suggested)
 
         status = log_payment(vendor.id, suggested, date(2026, 5, 12), session=session)
         assert status == PaymentStatus.PAID_IN_FULL
@@ -476,11 +467,11 @@ def test_override_survives_multiple_regenerations_with_changing_funds_and_zero_p
         vendor.override_amount = 500_000.0  # Finance's sticky decision
         session.flush()
 
-        # Three separate "regenerations" this cycle, each its own Model 1
+        # Three separate "regenerations" this cycle, each its own
         # plan_run with a different fresh suggestion/funds figure — no
         # payment ever logged against this vendor in between.
         for hour, amount in enumerate([1_000_000.0, 300_000.0, 800_000.0]):
-            _give_vendor_a_model1_cycle_allocation(session, vendor, amount, created_at=_FUTURE.replace(hour=hour))
+            _give_vendor_a_new_model_2_cycle_allocation(session, vendor, amount, created_at=_FUTURE.replace(hour=hour))
             assert float(vendor.override_amount) == pytest.approx(500_000.0)  # untouched by any of them
             assert _this_cycle_allocation(session, vendor.id) == pytest.approx(500_000.0)  # override, not the suggestion
     finally:
@@ -493,23 +484,23 @@ def test_override_survives_multiple_regenerations_with_changing_funds_and_zero_p
 
 
 def test_status_outcomes_against_suggested_amount_end_to_end():
-    """No override set -> status is measured against Model 1's own
+    """No override set -> status is measured against the model's own
     allocated_amount (docs/06's confirmed rule)."""
     session = SessionLocal()
     try:
         suggested = 1_000_000.0
 
         not_paid = _unallocated_vendor(session, min_balance=2_000_000)
-        _give_vendor_a_model1_cycle_allocation(session, not_paid, suggested)
+        _give_vendor_a_new_model_2_cycle_allocation(session, not_paid, suggested)
         assert not_paid.payment_status == PaymentStatus.NOT_PAID  # nothing paid yet
 
         partial = _unallocated_vendor(session, min_balance=2_000_000)
-        _give_vendor_a_model1_cycle_allocation(session, partial, suggested)
+        _give_vendor_a_new_model_2_cycle_allocation(session, partial, suggested)
         status = log_payment(partial.id, suggested * 0.4, date(2026, 5, 10), session=session)
         assert status == PaymentStatus.PARTIAL
 
         full = _unallocated_vendor(session, min_balance=2_000_000)
-        _give_vendor_a_model1_cycle_allocation(session, full, suggested)
+        _give_vendor_a_new_model_2_cycle_allocation(session, full, suggested)
         status = log_payment(full.id, suggested, date(2026, 5, 10), session=session)
         assert status == PaymentStatus.PAID_IN_FULL
     finally:
@@ -519,19 +510,19 @@ def test_status_outcomes_against_suggested_amount_end_to_end():
 
 def test_status_outcomes_against_overridden_amount_end_to_end():
     """Override set -> status is measured against Finance's override, not
-    Model 1's original suggested amount, in every direction (docs/06)."""
+    the original suggested amount, in every direction (docs/06)."""
     session = SessionLocal()
     try:
         suggested = 1_000_000.0
         override = 650_000.0  # deliberately smaller than suggested
 
         partial = _unallocated_vendor(session, min_balance=2_000_000)
-        _give_vendor_a_model1_cycle_allocation(session, partial, suggested, override_amount=override)
+        _give_vendor_a_new_model_2_cycle_allocation(session, partial, suggested, override_amount=override)
         status = log_payment(partial.id, override * 0.5, date(2026, 5, 10), session=session)
         assert status == PaymentStatus.PARTIAL
 
         full = _unallocated_vendor(session, min_balance=2_000_000)
-        _give_vendor_a_model1_cycle_allocation(session, full, suggested, override_amount=override)
+        _give_vendor_a_new_model_2_cycle_allocation(session, full, suggested, override_amount=override)
         status = log_payment(full.id, override, date(2026, 5, 10), session=session)
         assert status == PaymentStatus.PAID_IN_FULL
         # Proves it's the override driving PAID_IN_FULL, not the (larger)

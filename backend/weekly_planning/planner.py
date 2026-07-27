@@ -1,34 +1,64 @@
 """Weekly view of the initial monthly plan (docs/06-weekly-planning-regeneration.md).
 
-None of Models 1/2/3 know about weeks — they produce one amount per vendor
-for the whole month. This module only groups that already-computed result
-by each vendor's existing `assigned_week` tag for display; it never
-recomputes or re-divides funds per week.
+New Model 2's generate_plan() produces one amount per vendor for the whole
+month — it knows nothing about weeks. This module only groups that
+already-computed result by each vendor's existing `assigned_week` tag for
+display; it never recomputes or re-divides funds per week.
 
 Scoped to the initial monthly plan only — regeneration is a separate,
 later prompt.
+
+Pulled-forward week: a vendor's own `assigned_week` tag (Vendor.assigned_week)
+is Finance-owned and never changed here. But the week a vendor's row
+actually GROUPS/DISPLAYS under this round is `max(assigned_week,
+current_week)` — a vendor whose week has already elapsed shows under the
+current week instead of a past one nobody's tracking anymore. New Model 2
+has no separate regeneration step (every "Generate"/"Regenerate" click goes
+through the same generate-plan-and-weekly-view path — see new_model_2.py),
+so every call through this function needs the same behavior, first
+generation or fifth. A vendor whose week hasn't arrived yet is untouched
+(assigned_week > current_week keeps them at their own future week).
+`current_week` is derived the same way log_payment() already derives a
+real payment's week — today's real date, not the (possibly stale) ledger
+month — so it matches exactly what "today" means everywhere else a week
+gets assigned in this codebase.
+
+Bug fix (this task): the pull-forward above only makes sense when the plan
+being built is actually FOR the real current calendar month. New Model 2's
+planning month is Finance-picked and can genuinely be a future month
+(docs/14, forward planning) — pulling every W1-W3 vendor of an August plan
+forward to "week 4" just because today happens to be July's 4th week is
+meaningless (the two months' weeks don't correspond) and corrupts that
+plan's weekly grouping/summary. `planning_month` (new, optional — None
+preserves every existing caller's exact behavior unchanged) is the actual
+month Finance picked; the pull-forward only applies when it matches
+today's real year/month.
 """
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
 from backend.db.models import PlanAllocation, PlanRun
 from backend.db.session import SessionLocal
-from backend.models.model1_weighted_scoring.scorer import score_vendors
-from backend.models.model2_min_funds_advisory.advisor import _load_vendors_and_ledger, required_amount
+from backend.shared.scoring import score_vendors
+from backend.shared.min_funds import _load_vendors_and_ledger, required_amount
 from backend.shared.payment_logging import week_actual_paid
+from backend.weekly_planning.calendar_utils import week_for_date
 
 
-def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=None, funds_figure=None, persist=True):
-    """vendor_allocations: the `allocations` DataFrame from Model 2's or
-    Model 3's generate_plan() — needs at least `vendor_id`/`allocated_amount`
-    columns. (Model 1 has no generate_plan() of its own — see docs/03's
-    guardrails — so there's nothing to pass in for a Model 1-only plan.)
+def build_weekly_view(
+    vendor_allocations, session=None, as_of=None, model_used=None, funds_figure=None, persist=True, planning_month=None
+):
+    """vendor_allocations: the `allocations` DataFrame from New Model 2's
+    generate_plan() — needs at least `vendor_id`/`allocated_amount` columns.
 
     Returns a dict with:
       - weekly_summary: DataFrame indexed by week (1-5), columns
         minimum_required / actual_planned.
-      - detail: one row per assigned vendor, incl. within_week_order.
+      - detail: one row per assigned vendor, incl. within_week_order. Its
+        own "assigned_week" column is the pulled-forward DISPLAY week for
+        this round (see module docstring) — Vendor.assigned_week itself,
+        read elsewhere (e.g. the Priority column), is never touched.
       - plan_run_id: the persisted plan_runs.id (None if persist=False).
     """
     owns_session = session is None
@@ -38,6 +68,16 @@ def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=N
         vendor_by_id = {v.id: v for v in vendors}
         allocated_by_vendor = dict(zip(vendor_allocations["vendor_id"], vendor_allocations["allocated_amount"]))
         scores = score_vendors(session=session, as_of=as_of).set_index("vendor_id")["score"]
+        today = date.today()
+        # planning_month=None (every pre-existing caller) keeps the exact
+        # prior behavior — always pull forward against today's real week.
+        # A caller that DOES pass planning_month only pulls forward when
+        # it's genuinely today's real month; a future-planned month is
+        # left exactly as Finance assigned it (see module docstring).
+        is_current_real_month = planning_month is None or (
+            (planning_month.year, planning_month.month) == (today.year, today.month)
+        )
+        current_week = week_for_date(today) if is_current_real_month else 0
 
         rows = []
         for vendor in vendors:
@@ -50,7 +90,10 @@ def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=N
                     "vendor_id": vendor.id,
                     "erp_code": vendor.erp_code,
                     "vendor_name": vendor.vendor_name,
-                    "assigned_week": vendor.assigned_week,
+                    # Pulled forward only if their own week already elapsed —
+                    # see module docstring. Untouched (stays at their own
+                    # future week) otherwise.
+                    "assigned_week": max(vendor.assigned_week, current_week),
                     "minimum_required": minimum_required,
                     "rule": rule,
                     "actual_planned": allocated_by_vendor.get(vendor.id, 0.0),
@@ -77,7 +120,8 @@ def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=N
             weekly_summary.index.name = "assigned_week"
         else:
             # DEFAULT — confirm with Sarath: within-week execution order uses
-            # Model 1's score, highest first (ties broken by original row order).
+            # the shared vendor score (backend/shared/scoring.py), highest
+            # first (ties broken by original row order).
             detail["within_week_order"] = (
                 detail.groupby("assigned_week")["score"].rank(method="first", ascending=False).astype(int)
             )
@@ -112,7 +156,14 @@ def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=N
                     # distribution edit yet at all this month (still None)
                     # falls back to the original default: the full suggested
                     # amount under this row's own assigned_week, every other
-                    # week blank.
+                    # week blank. Deliberately NOT written back onto the
+                    # vendor here — see plan_history.py's
+                    # build_plan_run_history_response() for why (this
+                    # per-row default must keep re-deriving fresh every
+                    # regeneration for as long as Finance hasn't actually
+                    # edited a week; freezing it here the first time it's
+                    # computed would stop it from following a later
+                    # assigned_week/amount change).
                     week_distribution_plan = (
                         vendor.week_distribution_plan
                         if vendor.week_distribution_plan is not None
@@ -126,6 +177,10 @@ def build_weekly_view(vendor_allocations, session=None, as_of=None, model_used=N
                         allocated_amount=row.actual_planned,
                         override_amount=override_amount,
                         week_distribution_plan=week_distribution_plan,
+                        # Frozen denominator (this task's fix) — the same
+                        # required_amount() call already made a few lines up
+                        # for this row, not recomputed.
+                        required_amount_snapshot=row.minimum_required,
                     )
                     session.add(allocation)
                     new_allocations.append(allocation)

@@ -38,6 +38,21 @@ class Vendor(Base):
     entity: Mapped[str] = mapped_column(String)
     vendor_name: Mapped[str] = mapped_column(String)
 
+    # Soft-deactivation (data-pipeline-upload Bug #1 fix): a replace-upload
+    # whose sheet no longer lists this erp_code sets is_active=False instead
+    # of deleting the row — PlanAllocation/Payment/AuditLog rows from before
+    # this vendor was removed have a plain FK to vendors.id with no
+    # ON DELETE, and SQLite FK enforcement is off by default here (no PRAGMA
+    # foreign_keys=ON in db/session.py), so a hard delete would silently
+    # orphan that historical data rather than error. Every "list active
+    # vendors" query must filter is_active.isnot(False) (NOT ==True) —
+    # db/session.py's _add_missing_columns ALTER TABLE never carries a
+    # DEFAULT, so this column reads NULL on every vendor row that predates
+    # this migration, and NULL must mean "active" (it always was), not get
+    # silently excluded.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     # Current outstanding balance carried forward (= latest month's closing
     # balance in the Excel) — the starting point for the next cycle.
     opening_balance: Mapped[float] = mapped_column(MONEY)
@@ -99,6 +114,27 @@ class Vendor(Base):
     score: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     current_aging_bucket: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # New Model 2's Finance-assigned priority tag (docs/14-new-model-2.md) —
+    # P2/P3/P4, only meaningful for NORMAL vendors. Deliberately its own
+    # field, not old Model 3's bucket/PriorityBucket concept
+    # (backend/models/model3_priority_bucket/bucketer.py), which is
+    # score-derived and never persisted on Vendor at all — this one is a
+    # direct Finance tag instead.
+    #
+    # Bug fix (this task): was `Enum(VendorPriorityTag)`, hardcapping every
+    # vendor's tag to the fixed P0-P5 Python enum even though
+    # priority_buckets (Configuration's own bucket table, allocator.py's
+    # _seed_and_read_buckets) is meant to be extensible beyond P5 — a
+    # Configuration-added P6+ bucket could never actually be assigned to a
+    # vendor (see priority_bucket_edits.py::add_bucket's own docstring,
+    # which already flagged exactly this). Plain String now — validity is
+    # checked live against VendorPriorityTag's P0/P1 plus whatever's
+    # currently in the priority_buckets table (vendor_edits.py::_validate),
+    # not a fixed Python enum. SQLite's actual column was already a bare
+    # VARCHAR with no CHECK constraint (confirmed via sqlite_master), so
+    # this is a pure application-layer relaxation — no DB migration needed.
+    priority_tag: Mapped[str | None] = mapped_column(String, nullable=True)
+
     monthly_ledger: Mapped[list["MonthlyLedger"]] = relationship(back_populates="vendor")
     payments: Mapped[list["Payment"]] = relationship(back_populates="vendor")
     plan_allocations: Mapped[list["PlanAllocation"]] = relationship(back_populates="vendor")
@@ -136,6 +172,10 @@ class Payment(Base):
     payment_date: Mapped[date] = mapped_column(Date)
     amount: Mapped[float] = mapped_column(MONEY)
     week: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Free-text note Finance can attach when logging a payment (vendor detail
+    # modal's Pay flow) — purely descriptive, never read by any model/
+    # allocation math (CLAUDE.md rule 3).
+    note: Mapped[str | None] = mapped_column(String, nullable=True)
 
     vendor: Mapped["Vendor"] = relationship(back_populates="payments")
 
@@ -193,6 +233,20 @@ class PlanAllocation(Base):
     # a fresh plan seeds the default (planner.py/regeneration.py).
     week_distribution_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # The required_amount/denominator allocated_amount was computed against,
+    # frozen at the moment this row was created (this task's fix). A
+    # vendor's live required_amount can change between generations (a
+    # payment lands, a tranche clears), so recomputing "today's" required
+    # amount for an OLD plan_run would show the wrong historical Suggested
+    # %/Override % — this column is what lets the frontend show the
+    # percentage exactly as it was at generation time, for every plan_run,
+    # not just the still-cached latest one. NULL only for rows
+    # backend/ingestion/load_excel.py seeds straight from the Excel's raw
+    # W1-W5 columns — no model/required_amount concept is involved there at
+    # all, and that plan_run (model_used="ingestion") never surfaces in any
+    # model's Plan-N history view anyway.
+    required_amount_snapshot: Mapped[float | None] = mapped_column(MONEY, nullable=True)
+
     plan_run: Mapped["PlanRun"] = relationship(back_populates="allocations")
     vendor: Mapped["Vendor"] = relationship(back_populates="plan_allocations")
 
@@ -210,6 +264,74 @@ class AuditLog(Base):
     new_value: Mapped[str | None] = mapped_column(String, nullable=True)
     source: Mapped[str] = mapped_column(String)
     changed_by: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class VendorExtraField(Base):
+    """Generic passthrough for an Excel column the mapping layer doesn't
+    recognize (docs/11 upload task) — e.g. a new "Status" column Finance
+    adds to a future upload. Stored, shown, and editable, but per CLAUDE.md
+    rule 3 never read by any model/deterministic calculation — only
+    load_excel.py (populates it) and the master-data grid endpoints (read/
+    edit it) ever touch this table. value is always text; the UI widget
+    (toggle/dropdown/free text) is derived at read time from the current
+    spread of distinct values, never stored (a column's own natural
+    "shape" can shift as Finance edits it, so freezing a widget-type
+    column here would just go stale)."""
+
+    __tablename__ = "vendor_extra_fields"
+    __table_args__ = (UniqueConstraint("vendor_id", "column_name", name="uq_vendor_extra_field_vendor_column"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vendor_id: Mapped[int] = mapped_column(ForeignKey("vendors.id"), index=True)
+    column_name: Mapped[str] = mapped_column(String)  # literal Excel header text
+    value: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class ColumnMappingOverride(Base):
+    """AI-resolved column-header mapping (data-pipeline AI-mapping task) —
+    one row per logical field (erp_code, entity, ..., priority_tag; see
+    column_mapping.ALL_MAPPABLE_FIELDS). Lets a renamed header resolve
+    deterministically on every future upload without re-invoking the AI:
+    once set, build_sheet_map()/load_excel.py consult this before falling
+    back to the field's fixed default header text. A later resolution for
+    the same field replaces the earlier one outright — this is "what header
+    means what right now," not a history (the audit_log is the history)."""
+
+    __tablename__ = "column_mapping_overrides"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    logical_field: Mapped[str] = mapped_column(String, unique=True, index=True)
+    header_text: Mapped[str] = mapped_column(String)
+    set_by: Mapped[str] = mapped_column(String)  # "ai" — only source today
+    set_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PriorityBucket(Base):
+    """New Model 2's priority-bucket definitions (docs/14, Task 2 Part C) —
+    which buckets exist, their ceiling/floor percentages, and rotation
+    (cutting) order. Replaces allocator.py's old hardcoded BUCKET_ORDER
+    list + Config-table-only ceiling values: adding, editing, or removing a
+    bucket is now a row change in this table, not a code change.
+    Seeded with today's P2/P3/P4/P5 on first read — see
+    backend/models/new_model_2/allocator.py::_seed_and_read_buckets().
+
+    ceiling_pct/floor_pct are stored as fractions (0.95, not 95) — this
+    table has no separate Finance-facing-percentage-vs-stored-fraction
+    split the way the generic Config table does, since every reader/writer
+    of this table is this bucket-CRUD feature itself.
+    """
+
+    __tablename__ = "priority_buckets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bucket_key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    display_label: Mapped[str] = mapped_column(String)
+    ceiling_pct: Mapped[float] = mapped_column(Numeric(6, 4))
+    floor_pct: Mapped[float] = mapped_column(Numeric(6, 4))
+    # Cutting/rotation order, lowest-position = highest priority (funded
+    # first, cut last) — e.g. P2=0, P3=1, P4=2, P5=3. Unique so ordering is
+    # always well-defined.
+    rotation_position: Mapped[int] = mapped_column(Integer, unique=True)
 
 
 class Config(Base):

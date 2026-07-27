@@ -94,6 +94,34 @@ def test_category_updates_db_excel_and_audit_log(tmp_path):
         _revert(vendor_id, "category", VendorCategory.NORMAL)
 
 
+def test_category_updates_to_inactive_writes_db_excel_and_audit_log(tmp_path):
+    """docs/14 Inactive design (renamed 2026-07-24 from Exit): Inactive is
+    a 4th valid category value, accepted through the exact same path as
+    Must Pay/Commitment/Normal — same validation, same Excel write-back,
+    same audit-log shape, no special-casing."""
+    excel_copy = _copy_excel(tmp_path)
+    vendor_id = _vendor_id("V00400")
+
+    try:
+        old, new = update_vendor_field(vendor_id, "category", VendorCategory.INACTIVE, excel_path=excel_copy)
+
+        assert old == VendorCategory.NORMAL
+        assert new == VendorCategory.INACTIVE
+        assert _read_cell(excel_copy, "Category", "V00400") == "Inactive"  # published for real
+
+        verify = SessionLocal()
+        try:
+            assert verify.query(Vendor).filter_by(id=vendor_id).one().category == VendorCategory.INACTIVE
+            entry = verify.query(AuditLog).filter_by(vendor_id=vendor_id, field_name="category").one()
+            assert entry.old_value == "Normal"
+            assert entry.new_value == "Inactive"
+            assert entry.source == ChangeSource.UI_EDIT.value
+        finally:
+            verify.close()
+    finally:
+        _revert(vendor_id, "category", VendorCategory.NORMAL)
+
+
 def test_commitment_months_updates_db_and_excel(tmp_path):
     excel_copy = _copy_excel(tmp_path)
     vendor_id = _vendor_id("V01542")
@@ -379,7 +407,7 @@ def test_assigned_week_edit_reflected_in_build_weekly_view(tmp_path):
     caller-supplied session throughout — this only relies on the DB-side
     flush being visible within that same session, which update_vendor_field
     still does regardless of session ownership; nothing here checks Excel."""
-    from backend.models.model2_min_funds_advisory.advisor import generate_plan
+    from backend.models.new_model_2.allocator import generate_plan
     from backend.weekly_planning.planner import build_weekly_view
 
     excel_copy = _copy_excel(tmp_path)

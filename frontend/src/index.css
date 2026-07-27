@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .bg-excel-grid {
+    background-image:
+      linear-gradient(to right, rgba(16, 124, 65, 0.18) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(16, 124, 65, 0.18) 1px, transparent 1px);
+    background-size: 110px 28px;
+  }
+
+  /* Scrollable, but the scrollbar chrome itself stays hidden — content still
+     scrolls (drag, trackpad, wheel, arrow keys), just without a visible bar. */
+  .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+}

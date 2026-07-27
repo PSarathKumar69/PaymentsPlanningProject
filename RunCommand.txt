@@ -5,3 +5,14 @@ python -m uvicorn backend.api.main:app --reload --port 8000
 
 python -m scripts.seed_demo
 PAYMENTS_DB_PATH=backend/db/demo.db python -m uvicorn backend.api.main:app --port 8124 --reload
+
+cd "c:/Users/p.sarathkumar/Desktop/Payments Plan" 
+$env:PAYMENTS_DB_PATH="backend/db/demo.db"; python -m scripts.reset_demo_db
+
+
+PowerShell syntax differs. Use:
+
+
+$env:PAYMENTS_DB_PATH="backend/db/demo.db"
+python -m uvicorn backend.api.main:app --port 8000
+Or one line: $env:PAYMENTS_DB_PATH="backend/db/demo.db"; python -m uvicorn backend.api.main:app --port 8000

@@ -9,45 +9,28 @@ class ConfigRowOut(BaseModel):
     description: str | None
 
 
-class Model1WeightsOut(BaseModel):
-    aging: float
-    outstanding: float
-    consistency: float
-    trend: float
+class PriorityBucketOut(BaseModel):
+    bucket_key: str
+    display_label: str
+    ceiling_pct: float
+    floor_pct: float
+    rotation_position: int
 
 
-class Model1WeightsUpdateRequest(BaseModel):
-    aging: float
-    outstanding: float
-    consistency: float
-    trend: float
+class PriorityBucketCreateRequest(BaseModel):
+    bucket_key: str
+    display_label: str
+    ceiling_pct: float
+    floor_pct: float
+    rotation_position: int
 
 
-class Model1WeightsUpdateResponse(BaseModel):
-    changed: list[str]
+class PriorityBucketUpdateRequest(BaseModel):
+    display_label: str | None = None
+    ceiling_pct: float | None = None
+    floor_pct: float | None = None
+    rotation_position: int | None = None
 
 
-class Model3ThresholdsAndTargetsOut(BaseModel):
-    p2_min_score: float
-    p3_min_score: float
-    p2_target_pct: float
-    p3_target_pct: float
-    p4_target_pct: float
-
-
-class Model3ThresholdsUpdateRequest(BaseModel):
-    p2_threshold: float
-    p3_threshold: float
-
-
-class Model3ThresholdsUpdateResponse(BaseModel):
-    changed: list[str]
-
-
-class BucketPctUpdateRequest(BaseModel):
-    value: float
-
-
-class BucketPctUpdateResponse(BaseModel):
-    old_fraction: float | None
-    new_fraction: float
+class PriorityBucketUpdateResponse(BaseModel):
+    changed: bool
