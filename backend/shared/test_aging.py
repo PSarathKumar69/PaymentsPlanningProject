@@ -202,6 +202,47 @@ def test_already_paid_this_cycle_never_mutates_monthly_ledger_rows():
     assert (rows[0].payable, rows[0].payment, rows[0].opening_balance) == before
 
 
+def test_future_dated_ledger_row_does_not_crash_and_clamps_to_current_bucket():
+    """Real bug: Finance's planning month can resolve to an as_of BEHIND the
+    sheet's own latest ingested ledger month (a fresh upload already
+    containing data for the cycle being planned), leaving a tranche dated
+    after as_of — negative months-back, which used to crash
+    bucket_for_months_back(). docs/14 frames the planning month as "the
+    cycle being funded, not a bucket that ages against itself", so a row at
+    or after as_of is clamped into "0-30" rather than excluded (it's real
+    money, so it must still be counted) or crashing.
+    """
+    rows = [
+        FakeLedgerRow(date(2025, 1, 1), payable=100, payment=0, opening_balance=0),
+        FakeLedgerRow(date(2025, 2, 1), payable=50, payment=0, opening_balance=0),  # dated after as_of below
+    ]
+    aging = compute_vendor_aging(rows, as_of=date(2025, 1, 1))
+    assert aging.total_outstanding == pytest.approx(150)  # both tranches counted, nothing dropped
+    assert aging.bucket_balances["0-30"] == pytest.approx(150)  # Jan (real 0-30) + Feb (clamped) share it
+    assert aging.oldest_tranche_month == date(2025, 1, 1)
+    assert aging.oldest_bucket == "0-30"
+    assert aging.oldest_bucket_months_back == 0
+
+
+def test_future_dated_only_ledger_row_clamps_oldest_to_zero():
+    """Narrower case matching the real production bug directly: EVERY
+    outstanding tranche is dated after as_of (as_of predates the vendor's/
+    sheet's very first recorded month) — oldest_month itself would compute
+    a negative raw months-back if not clamped."""
+    rows = [FakeLedgerRow(date(2025, 6, 1), payable=200, payment=0, opening_balance=0)]
+    aging = compute_vendor_aging(rows, as_of=date(2025, 5, 1))
+    assert aging.total_outstanding == pytest.approx(200)
+    assert aging.oldest_bucket == "0-30"
+    assert aging.oldest_bucket_months_back == 0
+    assert len(aging.monthly_breakdown) == 1
+    entry = aging.monthly_breakdown[0]
+    assert entry["months_back"] == 0
+    assert entry["month"] == date(2025, 5, 1)
+    assert entry["amount"] == pytest.approx(200)
+    assert entry["payable"] == pytest.approx(200)
+    assert entry["payment"] == 0.0
+
+
 def test_advance_payment_becomes_credit_for_next_tranche():
     # Jan: paid 150 against a 100 tranche -> 50 advance credit, no error.
     # Feb: a 80 tranche arrives, the 50 credit offsets it, leaving 30 outstanding.

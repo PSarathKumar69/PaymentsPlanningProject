@@ -1,41 +1,48 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, PiggyBank, Search, SlidersHorizontal, CheckCircle2, RefreshCw, Users, AlertCircle, Handshake, Layers, Trash2 } from 'lucide-react';
-import { listVendors, getVendorAging, getAllVendorsAging, getVendorPaymentTracking, patchVendor } from '../api/vendors';
-import { getPlanRuns, getMinimumFundsRequired, getAllVendorMinFundsRequired, generatePlanAndWeeklyView, finalizeNewModel2 } from '../api/newModel2';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Calendar, PiggyBank, Search, SlidersHorizontal, CheckCircle2, RefreshCw, RotateCcw, Users, AlertCircle, Handshake, Layers, Trash2, Filter, Download } from 'lucide-react';
+import { listVendors, getVendorAging, getAllVendorsAging, getVendorCategories, getVendorPaymentTracking, patchVendor } from '../api/vendors';
+import { getPlanRuns, getMinimumFundsRequired, getAllVendorMinFundsRequired, generatePlanAndWeeklyView, finalizeNewModel2, resetNewModel2Cycle, getCurrentPlanningMonth } from '../api/newModel2';
+import { downloadFinalizedPlanExport, downloadMinFundsVerificationExport } from '../api/planExport';
 import { patchOverride, patchWeekDistribution } from '../api/planAllocations';
 import { deletePlanRun } from '../api/planRuns';
 import { getPriorityBuckets } from '../api/configuration';
 import { getWeeksInMonth } from '../api/calendar';
-import { ApiError } from '../api/client';
+import { ApiError, friendlyErrorMessage } from '../api/client';
 import {
-  FinalizeCheckResponse,
   PlanAllocationRow,
   PlanRunAllocation,
   PlanRunHistory,
   PriorityBucket,
   Vendor,
   VendorAging,
+  VendorCategoryOption,
   VendorPaymentTracking,
 } from '../types';
 import {
   AGING_BUCKET_BADGE_CLASS,
   AGING_BUCKET_OPTIONS,
   AUTO_PRIORITY_TAG,
-  CATEGORY_BADGE_CLASS,
   CATEGORY_LABEL,
   CATEGORY_OPTIONS,
   VENDOR_CATEGORY,
   VendorCategory,
+  categoryBadgeClass,
+  categoryLabel,
 } from '../constants/enums';
 import { formatMoney, formatMonthLong, formatPct } from '../utils/format';
 import { VendorDetailModal } from './VendorDetailModal';
 import { CompanionPanel } from './CompanionPanel';
-import { ShortfallModal } from './ShortfallModal';
 import { ConfirmModal } from './ConfirmModal';
 import { ToastVariant } from './NotificationToast';
 
 interface PlanningViewProps {
   onNotify?: (message: string, variant?: ToastVariant) => void;
+  // Bump this from the parent after a successful upload/rollover to force a
+  // reload — same refreshSignal convention as MasterDataGrid.tsx. Without
+  // this, PlanningView (mounted once at app start, kept alive but hidden via
+  // CSS when switching tabs — see App.tsx) never re-fetches, so a fresh
+  // upload only shows up after a full page reload.
+  refreshSignal?: number;
 }
 
 const currentMonthValue = () => {
@@ -45,6 +52,10 @@ const currentMonthValue = () => {
 
 const moneyDigits = (s: string) => s.replace(/[^0-9]/g, '');
 const moneyText = (n: number) => `₹${Math.round(n).toLocaleString('en-IN')}`;
+// Same "under a rupee is rounding noise, not a real mismatch" convention as
+// backend/shared/constants.py's MONEY_EPSILON (1.0) — kept in sync manually
+// since this is plain client-side arithmetic, not a value read from the API.
+const MONEY_EPSILON = 1;
 
 // Override % and Override Amt are two views of the same one number — typing
 // into either keeps the other in sync live (matches test_ui.html's
@@ -121,52 +132,102 @@ function OverrideCells({ suggestedAmount, denom, currentOverride, tdClass, onSav
   );
 }
 
+// Small per-column text filter (item 2, this task) — funnel icon in a
+// header cell, click opens a single text input, typing filters that
+// column. State-driven click-to-open/click-outside-to-close (not the
+// CSS-only group-hover pattern the main Filters popover used to use before
+// this same task's item 0 fix) — a click inside the popover never races
+// against losing hover mid-click.
+function ColumnFilterIcon({ column, label, active, isOpen, onToggle, value, onChange }: {
+  column: string;
+  label: string;
+  active: boolean;
+  isOpen: boolean;
+  onToggle: () => void;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <span data-column-filter className="relative inline-flex ml-1 normal-case font-normal" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        title={`Filter ${label}`}
+        onClick={onToggle}
+        className={`p-0.5 rounded cursor-pointer ${active ? 'text-[#107c41]' : 'text-gray-400 hover:text-gray-600'}`}
+      >
+        <Filter className="w-3 h-3" fill={active ? 'currentColor' : 'none'} />
+      </button>
+      {isOpen && (
+        <div className="absolute z-50 top-full left-0 mt-1 bg-white border border-gray-200/90 rounded-lg shadow-2xs p-2 w-36">
+          <input
+            autoFocus
+            type="text"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={`Filter ${label}…`}
+            className="w-full text-[11px] text-gray-700 border border-gray-200 rounded px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-[#107c41]/30 focus:border-[#107c41]"
+          />
+        </div>
+      )}
+    </span>
+  );
+}
+
 // Must Pay/Commitment's own auto-derived tags (P0/P1) — never Finance-picked.
 // Single source: constants/enums.ts's AUTO_PRIORITY_TAG, not a fresh literal
 // here (CLAUDE.md rule 7 — status/tag vocabulary lives in one shared module).
 const AUTO_PRIORITY_TAGS = Object.values(AUTO_PRIORITY_TAG);
 
 // Category <-> priority-tag correspondence (Finance's own rule): Must Pay
-// is always P0, Commitment is always P1, Inactive is always P5 — none of
-// these three are manually reassignable independent of category. Normal
-// is the only category with real choice among its own tags (P2/P3/P4, or
-// any custom bucket Configuration adds beyond P5) — defaults to P2.
-// P0/P1 come from the shared AUTO_PRIORITY_TAG constant (constants/enums.ts),
-// not re-typed here. P5-for-Inactive has no equivalent live source to pull
-// from — priority_buckets (Configuration's own bucket table) has no
-// category column linking a bucket_key back to "the Inactive category's
-// bucket," so this exact correspondence is a fixed project convention on
-// the backend side too (backend/shared/enums.py's VendorPriorityTag
-// docstring: "P5, and only P5" — not a DB lookup there either).
+// is always P0, Commitment is always P1 — never manually reassignable
+// independent of category. Every OTHER category (Normal, Inactive, or any
+// custom category Configuration adds) has real choice among its OWN
+// bucket rows (Normal: P2/P3/P4; Inactive: P5 today, just one row; a
+// custom category: whatever row(s) Configuration gave it) — resolved live
+// from `priorityBuckets` (Configuration's own bucket table, now carrying a
+// `category_name` per row — Configuration-tab-rebuild task) rather than a
+// hardcoded P5<->Inactive link, so a brand-new category's own tag resolves
+// correctly with zero code changes here on the next add.
 const FIXED_TAG_FOR_CATEGORY: Partial<Record<string, string>> = {
   [VENDOR_CATEGORY.MUST_PAY]: AUTO_PRIORITY_TAG.must_pay,
   [VENDOR_CATEGORY.COMMITMENT]: AUTO_PRIORITY_TAG.commitment,
-  [VENDOR_CATEGORY.INACTIVE]: 'P5',
 };
-const DEFAULT_NORMAL_TAG = 'P2';
-const NON_NORMAL_TAGS = [AUTO_PRIORITY_TAG.must_pay, AUTO_PRIORITY_TAG.commitment, 'P5'];
-function impliedCategoryForTag(tag: string): string {
+function impliedCategoryForTag(tag: string, priorityBuckets: PriorityBucket[]): string {
   if (tag === AUTO_PRIORITY_TAG.must_pay) return VENDOR_CATEGORY.MUST_PAY;
   if (tag === AUTO_PRIORITY_TAG.commitment) return VENDOR_CATEGORY.COMMITMENT;
-  if (tag === 'P5') return VENDOR_CATEGORY.INACTIVE;
-  return VENDOR_CATEGORY.NORMAL;
+  return priorityBuckets.find((b) => b.bucket_key === tag)?.category_name ?? VENDOR_CATEGORY.NORMAL;
+}
+
+// This category's own bucket rows, in rotation (cut) order — the live
+// option set for its V-Priority dropdown (Normal: P2/P3/P4; Inactive: P5
+// only; a custom category: whatever Configuration gave it).
+function tagsForCategory(category: string, priorityBuckets: PriorityBucket[]): string[] {
+  return [...priorityBuckets]
+    .filter((b) => b.category_name === category)
+    .sort((a, b) => a.rotation_position - b.rotation_position)
+    .map((b) => b.bucket_key);
 }
 
 // Single source for "what tag does this vendor's row actually SHOW" — the
-// V-Priority cell defaults a Normal vendor with no priority_tag yet to
-// DEFAULT_NORMAL_TAG ('P2') for display, so anything comparing against a
-// vendor's tag (the priority-tag filter, in particular) must resolve the
-// same default or it'll silently disagree with what's on screen (bug fix,
-// this task: filtering by "P2" used to hide a vendor whose row visibly
-// read P2, because the filter compared the raw un-defaulted null instead).
-function displayedPriorityTag(vendor: { category: string; priority_tag: string | null }): string {
-  return (
-    FIXED_TAG_FOR_CATEGORY[vendor.category] ??
-    (vendor.priority_tag && !NON_NORMAL_TAGS.includes(vendor.priority_tag) ? vendor.priority_tag : DEFAULT_NORMAL_TAG)
-  );
+// V-Priority cell defaults a vendor with no priority_tag yet (or a stray
+// tag left over from a previous category) to its own category's
+// highest-priority bucket, so anything comparing against a vendor's tag
+// (the priority-tag filter, in particular) must resolve the same default
+// or it'll silently disagree with what's on screen (bug fix, prior task:
+// filtering by "P2" used to hide a vendor whose row visibly read P2,
+// because the filter compared the raw un-defaulted null instead).
+function displayedPriorityTag(
+  vendor: { category: string; priority_tag: string | null },
+  priorityBuckets: PriorityBucket[]
+): string {
+  const fixed = FIXED_TAG_FOR_CATEGORY[vendor.category];
+  if (fixed) return fixed;
+  const ownTags = tagsForCategory(vendor.category, priorityBuckets);
+  if (vendor.priority_tag && ownTags.includes(vendor.priority_tag)) return vendor.priority_tag;
+  return ownTags[0] ?? priorityBuckets[0]?.bucket_key ?? 'P2';
 }
 
-export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
+export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSignal }) => {
   // ---- loaded data --------------------------------------------------------
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [agingByVendorId, setAgingByVendorId] = useState<Record<number, VendorAging>>({});
@@ -174,6 +235,13 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   const [planHistory, setPlanHistory] = useState<PlanRunHistory | null>(null);
   const [nm2MinFundsByVendorId, setNm2MinFundsByVendorId] = useState<Record<number, number>>({});
   const [priorityBuckets, setPriorityBuckets] = useState<PriorityBucket[]>([]);
+  // Category value/label source (P2 demo-polish task, CLAUDE.md rule 7) —
+  // seeded from constants/enums.ts's static list only as a same-session
+  // bootstrap default (no race risk the way weeksInMonth had: this set
+  // isn't month-dependent), overwritten once GET /vendors/categories lands.
+  const [categoryOptions, setCategoryOptions] = useState<VendorCategoryOption[]>(
+    CATEGORY_OPTIONS.map((value) => ({ value, label: CATEGORY_LABEL[value] }))
+  );
   // Rich, freshly-generated cache (this session only) — status/rule fields
   // that don't survive into the coarse plan-run history (test_ui.html's
   // planDataByModel[5]). Drives the AI-script gate and the companion's
@@ -185,11 +253,43 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   // ---- four-card cycle flow ------------------------------------------------
   const [planningMonth, setPlanningMonth] = useState(currentMonthValue());
   // Calendar-derived (CLAUDE.md rule 7) — Feb has only 4, never assume 5.
-  // Falls back to 5 (the safe upper bound) until the real figure loads.
-  const [weeksInMonth, setWeeksInMonth] = useState(5);
+  // null = "not yet known" (docs/17's flagged race fix) — NOT a fallback of
+  // 5 (could briefly offer an invalid W5 on a 4-week month) or 4 (would just
+  // move the race to briefly hiding a real W5). The week `<select>` below
+  // renders only the vendor's own already-assigned week (if any) while this
+  // is null, and the full real range once it resolves.
+  const [weeksInMonth, setWeeksInMonth] = useState<number | null>(null);
   const [fundsRequiredFigure, setFundsRequiredFigure] = useState<number | null>(null);
   const [fundsInputEnabled, setFundsInputEnabled] = useState(false);
   const [availableFunds, setAvailableFunds] = useState('');
+  // Bug fix: this input re-renders every keystroke with commas/₹ inserted
+  // (value={... .toLocaleString('en-IN')}) — a plain controlled input resets
+  // the caret to the end on every value change whose string length shifts
+  // (e.g. a comma appearing), so typing anywhere but at the very end felt
+  // broken. fundsInputRef + pendingCaretDigits restore the caret after each
+  // reformat by digit position (not string index), since formatting only
+  // adds punctuation around the same digits, never reorders them.
+  const fundsInputRef = useRef<HTMLInputElement>(null);
+  const pendingCaretDigits = useRef<number | null>(null);
+  const handleFundsInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const cursorPos = e.target.selectionStart ?? e.target.value.length;
+    pendingCaretDigits.current = moneyDigits(e.target.value.slice(0, cursorPos)).length;
+    setAvailableFunds(moneyDigits(e.target.value));
+  };
+  useLayoutEffect(() => {
+    const el = fundsInputRef.current;
+    const target = pendingCaretDigits.current;
+    if (!el || target == null) return;
+    pendingCaretDigits.current = null;
+    const formatted = el.value;
+    let digitsSeen = 0;
+    let pos = formatted.length;
+    for (let i = 0; i < formatted.length; i++) {
+      if (digitsSeen === target) { pos = i; break; }
+      if (/[0-9]/.test(formatted[i])) digitsSeen++;
+    }
+    el.setSelectionRange(pos, pos);
+  }, [availableFunds]);
   const [fundsLeft, setFundsLeft] = useState<number | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
 
@@ -201,6 +301,20 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   const [categoryFilters, setCategoryFilters] = useState<Set<VendorCategory>>(new Set());
   const [agingBucketFilters, setAgingBucketFilters] = useState<Set<string>>(new Set());
   const [priorityTagFilters, setPriorityTagFilters] = useState<Set<string>>(new Set());
+  // Single on/off toggle, not a multi-select set like the three above —
+  // "false" matches everything (no filter applied).
+  const [overriddenOnly, setOverriddenOnly] = useState(false);
+  // Per-column filters (item 2, this task) — one free-text value per column
+  // id, scoped to the table's static identity/scalar columns (Vendor, ERP
+  // code, Assigned Week, Outstanding). Category/Aging bucket/Priority tag
+  // deliberately do NOT get their own column icon too — they already have
+  // the dedicated Filters popover above; a second filter UI for the same
+  // three fields would just be a confusing duplicate. The dynamic Plan-N
+  // (Suggested/Override) and week-distribution column groups don't get one
+  // either — those are regenerated fresh per plan run, not stable
+  // filterable vendor attributes, and their count varies at runtime.
+  const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
+  const [openColumnFilter, setOpenColumnFilter] = useState<string | null>(null);
   const toggleInSet = <T,>(setter: React.Dispatch<React.SetStateAction<Set<T>>>, value: T) => {
     setter((prev) => {
       const next = new Set(prev);
@@ -208,15 +322,15 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       return next;
     });
   };
-  const activeFilterCount = categoryFilters.size + agingBucketFilters.size + priorityTagFilters.size;
+  const categoryValues = categoryOptions.map((o) => o.value) as VendorCategory[];
+  const categoryLabelByValue: Record<string, string> = Object.fromEntries(categoryOptions.map((o) => [o.value, o.label]));
+  const activeFilterCount = categoryFilters.size + agingBucketFilters.size + priorityTagFilters.size + (overriddenOnly ? 1 : 0);
   const clearAllFilters = () => {
     setCategoryFilters(new Set());
     setAgingBucketFilters(new Set());
     setPriorityTagFilters(new Set());
+    setOverriddenOnly(false);
   };
-
-  // ---- finalize / shortfall -------------------------------------------------
-  const [shortfallData, setShortfallData] = useState<FinalizeCheckResponse | null>(null);
 
   // ---- reconsider (per-cycle UI-only decision, never carried forward) ------
   const [reconsiderYes, setReconsiderYes] = useState<Record<number, boolean>>({});
@@ -249,6 +363,49 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
     latestPlanRun?.allocations.forEach((a) => map.set(a.vendor_id, a));
     return map;
   }, [latestPlanRun]);
+
+  // Signed Available-Funds-vs-committed preview for the Finalize modal (item 1,
+  // this task) — mirrors the backend Finalize check's own leftover
+  // computation (new_model_2.py's post_new_model_2_finalize, same
+  // pinned-vs-cuttable split allocator.py's leftover_remaining uses),
+  // computed client-side from state already on hand rather than calling
+  // POST /models/5/finalize speculatively (that endpoint COMMITS the Budget
+  // snapshot, so calling it just to preview a number would be a real side
+  // effect). Positive = surplus, negative = shortfall — unlike the
+  // backend's own `over_by` (which floors at 0 and throws the surplus case
+  // away), this keeps the sign so the modal can show either a red or a
+  // green card.
+  //
+  // Bug fix (this task): this used to sum EVERY vendor flat against
+  // availableFunds, which double-counts the guaranteed (Must Pay/
+  // Commitment) tier's own inherent shortfall as if Finance could fix it by
+  // cutting Normal/Inactive vendors — inflated the shown "Short by" figure
+  // far past the real cuttable shortfall the Funds Left card already shows
+  // correctly. Pinned-tier membership mirrors allocator.py's own
+  // is_pinned_vendor() check: category matches a pinned bucket's
+  // category_name, or priority_tag matches a pinned bucket_key directly —
+  // `deletable === false` is exactly how the backend already flags a
+  // pinned (Must Pay/Commitment) PriorityBucket row for the frontend
+  // (CLAUDE.md rule 5).
+  const financeSignedDiff = useMemo(() => {
+    const availableFundsNum = Number(moneyDigits(availableFunds)) || 0;
+    const pinnedBuckets = priorityBuckets.filter((b) => !b.deletable);
+    const pinnedBucketKeys = new Set(pinnedBuckets.map((b) => b.bucket_key));
+    const pinnedCategories = new Set(pinnedBuckets.map((b) => b.category_name));
+    const vendorById = new Map(vendors.map((v) => [v.id, v]));
+
+    let pinnedCommitted = 0;
+    let otherCommitted = 0;
+    (latestPlanRun?.allocations || []).forEach((a) => {
+      const amount = a.override_amount ?? a.allocated_amount;
+      const vendor = vendorById.get(a.vendor_id);
+      const isPinned = !!vendor && (pinnedCategories.has(vendor.category) || pinnedBucketKeys.has(vendor.priority_tag ?? ''));
+      if (isPinned) pinnedCommitted += amount; else otherCommitted += amount;
+    });
+
+    const leftover = Math.max(availableFundsNum - pinnedCommitted, 0) - otherCommitted;
+    return leftover;
+  }, [availableFunds, latestPlanRun, priorityBuckets, vendors]);
 
   // Union of week keys actually present across every vendor's stored
   // distribution — never a hardcoded W1-W5 (CLAUDE.md rule 7, week count is
@@ -347,18 +504,20 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
         // every reload even though a plan already exists — nothing ever
         // restored them from the plan_run's own stored figures. The latest
         // plan_run's funds_figure IS what Finance entered last
-        // (PlanRun.funds_figure, set by generate-plan-and-weekly-view);
-        // Funds Left mirrors the router's own effective_funds formula
-        // (backend/api/routers/new_model_2.py: available_funds minus every
-        // vendor's override_amount, floored at 0) since that figure itself
-        // isn't persisted anywhere, only ever returned once from the
-        // generate call.
+        // (PlanRun.funds_figure, set by generate-plan-and-weekly-view).
+        //
+        // Funds Left fix: leftover_remaining is now persisted on the same
+        // row (allocator.py's real post-allocation figure, not an
+        // approximation) — read it back directly instead of recomputing
+        // funds_figure minus overridden vendors, which ignored what the
+        // bucket-ceiling allocation actually spent on every other vendor.
+        // NULL on a PlanRun row that predates this column — shown as "—"
+        // rather than a fabricated number; self-heals on next Generate.
         const latestRun = history.plan_runs[history.plan_runs.length - 1];
         if (latestRun.funds_figure != null) {
           setAvailableFunds(String(Math.round(latestRun.funds_figure)));
-          const totalOverridden = vendorList.reduce((sum, v) => sum + (v.override_amount ?? 0), 0);
-          setFundsLeft(Math.max(latestRun.funds_figure - totalOverridden, 0));
         }
+        setFundsLeft(latestRun.leftover_remaining);
       }
       const minFunds = await getAllVendorMinFundsRequired(generated ? undefined : planningMonth || undefined);
       const byVendor: Record<number, number> = {};
@@ -373,13 +532,39 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
 
   useEffect(() => {
     loadAll();
+    getVendorCategories().then(setCategoryOptions).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refreshSignal]);
+
+  // Planning month is no longer picked here (Main-tab upload-confirm task,
+  // section 4) — Finance confirms it once in the upload confirm modal, and
+  // this tab just reads back whatever _resolve_planning_month() would
+  // currently fall back to (latest plan_run this cycle, else the persisted
+  // config value from that confirm). Refetched on every refreshSignal bump
+  // so a fresh upload's confirmed month shows up here without a reload.
+  // Never overrides a value already restored from an existing plan_run this
+  // cycle (loadAll's own generated-branch already set that first and wins).
+  useEffect(() => {
+    if (hasGeneratedThisCycle) return;
+    getCurrentPlanningMonth()
+      .then((d) => { if (d.planning_month) setPlanningMonth(d.planning_month); })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshSignal]);
 
   useEffect(() => {
     if (!planningMonth) return;
     getWeeksInMonth(planningMonth).then((d) => setWeeksInMonth(d.weeks)).catch(() => {});
   }, [planningMonth]);
+
+  useEffect(() => {
+    if (!openColumnFilter) return;
+    const handler = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest('[data-column-filter]')) setOpenColumnFilter(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [openColumnFilter]);
 
   const planRunIdsKey = (planHistory?.plan_runs || []).map((p) => p.plan_run_id).join(',');
   useEffect(() => {
@@ -397,8 +582,9 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       const data = await getMinimumFundsRequired(planningMonth);
       setFundsRequiredFigure(data.total);
       setFundsInputEnabled(true);
+      if (data.planning_month_warning) onNotify?.(data.planning_month_warning, 'warning');
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -411,14 +597,19 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
     setIsGenerating(true);
     try {
       const data = await generatePlanAndWeeklyView(availableFundsNum, hasGeneratedThisCycle ? undefined : planningMonth);
-      setFundsLeft(data.funds_left_for_regeneration);
+      // Bug fix (this task): funds_left_for_regeneration is a different,
+      // pre-allocation figure (available_funds minus manual overrides only —
+      // always equals Expected Funds when nothing's overridden). The real
+      // "how much is actually left after this plan's allocation" figure is
+      // allocator.py's own leftover_remaining.
+      setFundsLeft(data.plan.leftover_remaining);
       const rich: Record<number, PlanAllocationRow> = {};
       data.plan.allocations.forEach((row) => { rich[row.vendor_id] = row; });
       setRichPlanByVendorId(rich);
       await Promise.all([refreshPlanHistory(), refreshNm2MinFunds()]);
-      onNotify?.(`New Model 2 plan ${hasGeneratedThisCycle ? 'regenerated' : 'generated'} (${data.plan.allocations.length} vendors).`, 'success');
+      onNotify?.(`Plan ${hasGeneratedThisCycle ? 'regenerated' : 'generated'} — ${data.plan.allocations.length} vendors.`, 'success');
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     } finally {
       setIsGenerating(false);
     }
@@ -431,6 +622,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   // the current cycle's latest plan.
   const [pendingDeletePlanRunId, setPendingDeletePlanRunId] = useState<number | null>(null);
   const [showFinalizeConfirm, setShowFinalizeConfirm] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const confirmDeletePlanRun = async (planRunId: number) => {
     setPendingDeletePlanRunId(null);
@@ -457,7 +649,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       if (deletedWasLatest) setRichPlanByVendorId({});
       onNotify?.(`Deleted plan #${planRunId}.`, 'success');
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -477,57 +669,86 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   };
 
   const confirmFinalize = async () => {
-    setShowFinalizeConfirm(false);
+    // Sarath's explicit call (this task): Finalize never blocks on a
+    // shortfall — the backend now always publishes the Budget snapshot
+    // (finalize_plan()) regardless of `ok`, so the confirm card always
+    // closes here too. `ok`/`over_by` are still surfaced, just as a
+    // warning toast instead of a modal that stays open and refuses to
+    // proceed (CLAUDE.md rule 2: suggestion, never enforce).
     try {
       const data = await finalizeNewModel2();
+      setShowFinalizeConfirm(false);
+      await refreshPaymentTracking();
       if (data.ok) {
-        await refreshPaymentTracking();
         onNotify?.(
-          `New Model 2 plan finalized — within available funds (${formatMoney(data.total_committed)} of ${formatMoney(data.available_funds)}). ` +
+          `Plan finalized — ${formatMoney(data.total_committed)} of ${formatMoney(data.available_funds)} available funds committed. ` +
             `Budget updated for ${data.vendor_count} vendor(s).`,
           'success'
         );
       } else {
-        setShortfallData(data);
+        onNotify?.(
+          `Plan finalized despite a shortfall of ${formatMoney(data.over_by)} — Budget updated for ${data.vendor_count} vendor(s). ` +
+            'This is a suggestion, not a block.',
+          'warning'
+        );
       }
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
-  const handleReduceToSuggested = async () => {
-    if (!shortfallData) return;
+  // Opens the confirm popup; the actual reset call only fires from
+  // confirmReset() below once Finance clicks through it.
+  const handleReset = () => setShowResetConfirm(true);
+
+  const confirmReset = async () => {
+    setShowResetConfirm(false);
     try {
-      for (const v of shortfallData.responsible_vendors) {
-        const allocation = latestAllocationByVendorId.get(v.vendor_id);
-        if (!allocation) continue;
-        await patchOverride(allocation.plan_allocation_id, null);
-      }
-      // Bug fix (this task): clearing an override also clears
-      // vendor.override_amount server-side (plan_allocations.py), which
-      // reconsiderEnabled() reads — without refreshing vendors too, the
-      // Reconsider toggle stayed wrongly frozen until an unrelated action
-      // happened to refresh it. Every other override call site already
-      // refreshes both.
-      await Promise.all([refreshPlanHistory(), refreshVendors()]);
-      setShortfallData(null);
-      onNotify?.('Override(s) reset to suggested. Click Generate plan to redistribute the freed funds among other vendors, then Finalize again.', 'success');
+      await resetNewModel2Cycle();
+      // Back to the exact state loadAll() produces before any plan exists
+      // this cycle: no Min Funds figure, funds input disabled, nothing
+      // generated. These four aren't restored by loadAll() alone (it only
+      // ever sets them inside its own "a plan already exists" branch), so
+      // clear them explicitly here.
+      setFundsRequiredFigure(null);
+      setFundsInputEnabled(false);
+      setAvailableFunds('');
+      setFundsLeft(null);
+      setRichPlanByVendorId({});
+      setReconsiderYes({});
+      await loadAll();
+      onNotify?.('Planning cycle reset — start over from Calculate Minimum Funds Required.', 'success');
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
-  const handlePickAnotherVendor = () => {
-    setShortfallData(null);
-    onNotify?.("Edit another vendor's Override cell in the table below to free up the difference, then click Finalize again.", 'warning');
+  const handleDownloadExport = async () => {
+    try {
+      const { blob, filename } = await downloadFinalizedPlanExport();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename ?? 'Vendor Payment Plan.xlsx';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      onNotify?.(friendlyErrorMessage(e), 'error');
+    }
   };
 
-  const handleIncreaseFunds = () => {
-    if (!shortfallData) return;
-    const current = Number(moneyDigits(availableFunds)) || shortfallData.available_funds;
-    setAvailableFunds(String(Math.round(current + shortfallData.over_by)));
-    setShortfallData(null);
-    onNotify?.('Available funds increased to cover the gap — click Generate plan, then Finalize again.', 'success');
+  const handleDownloadMinFundsVerification = async () => {
+    try {
+      const { blob, filename } = await downloadMinFundsVerificationExport();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename ?? 'Min Funds Verification.xlsx';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      onNotify?.(friendlyErrorMessage(e), 'error');
+    }
   };
 
   const handleOverrideChange = async (vendor: Vendor, overrideAmount: number | null) => {
@@ -544,7 +765,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
         onNotify?.(`Committed amounts (${formatMoney(w.total_committed)}) exceed available funds (${formatMoney(w.available_funds)}) by ${formatMoney(w.over_by)}. This is a suggestion, not a block.`, 'warning');
       }
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -557,7 +778,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       await patchWeekDistribution(allocation.plan_allocation_id, { [String(week)]: amount });
       await refreshPlanHistory();
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -569,7 +790,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       // after an unrelated full reload.
       await Promise.all([refreshVendors(), refreshPaymentTracking()]);
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -577,7 +798,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   // concept — changing either one keeps the other in lockstep (Must
   // Pay=P0, Commitment=P1, Inactive=P5, Normal=P2/P3/P4 default P2).
   const handleCategoryChange = async (vendor: Vendor, newCategory: string) => {
-    const impliedTag = displayedPriorityTag({ category: newCategory, priority_tag: vendor.priority_tag });
+    const impliedTag = displayedPriorityTag({ category: newCategory, priority_tag: vendor.priority_tag }, priorityBuckets);
     try {
       await patchVendor(vendor.id, 'category', newCategory);
       if (impliedTag !== vendor.priority_tag) {
@@ -585,12 +806,12 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       }
       await Promise.all([refreshVendors(), refreshPaymentTracking()]);
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
   const handlePriorityTagChange = async (vendor: Vendor, newTag: string) => {
-    const impliedCategory = impliedCategoryForTag(newTag);
+    const impliedCategory = impliedCategoryForTag(newTag, priorityBuckets);
     try {
       await patchVendor(vendor.id, 'priority_tag', newTag);
       if (impliedCategory !== vendor.category) {
@@ -598,7 +819,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       }
       await Promise.all([refreshVendors(), refreshPaymentTracking()]);
     } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
+      onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
@@ -614,6 +835,19 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       return copy;
     });
   };
+
+  // Untagged rank: one past every real tag (mirrors backend/weekly_planning/
+  // planner.py's own within-week-order convention — tag_rank = {P0:0, P1:1,
+  // ...bucket_order}, untagged_rank = len(tag_rank) — reused here rather
+  // than a second, independently-invented fallback constant).
+  const untaggedPriorityRank = Object.keys(priorityTagOrder).length;
+
+  const columnFilterValues = {
+    vendor_name: (v: Vendor) => v.vendor_name,
+    erp_code: (v: Vendor) => v.erp_code,
+    assigned_week: (v: Vendor) => (v.assigned_week ? `W${v.assigned_week}` : ''),
+    outstanding: (v: Vendor) => String(v.live_outstanding_balance ?? ''),
+  } satisfies Record<string, (v: Vendor) => string>;
 
   const filteredPlanningVendors = vendors
     .filter((v) => {
@@ -631,10 +865,16 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       const vendorAging = agingByVendorId[v.id];
       const matchesAging =
         agingBucketFilters.size === 0 || !vendorAging || agingBucketFilters.has(vendorAging.oldest_bucket || '');
-      const matchesPriority = priorityTagFilters.size === 0 || priorityTagFilters.has(displayedPriorityTag(v));
-      return matchesSearch && matchesCategory && matchesAging && matchesPriority;
+      const matchesPriority = priorityTagFilters.size === 0 || priorityTagFilters.has(displayedPriorityTag(v, priorityBuckets));
+      const matchesOverridden = !overriddenOnly || (latestAllocationByVendorId.get(v.id)?.override_amount != null);
+      const matchesColumnFilters = Object.entries(columnFilters).every(([col, needle]) => {
+        if (!needle.trim()) return true;
+        const getter = columnFilterValues[col as keyof typeof columnFilterValues];
+        return getter ? getter(v).toLowerCase().includes(needle.trim().toLowerCase()) : true;
+      });
+      return matchesSearch && matchesCategory && matchesAging && matchesPriority && matchesOverridden && matchesColumnFilters;
     })
-    .sort((a, b) => (priorityTagOrder[a.priority_tag || ''] ?? 99) - (priorityTagOrder[b.priority_tag || ''] ?? 99));
+    .sort((a, b) => (priorityTagOrder[a.priority_tag || ''] ?? untaggedPriorityRank) - (priorityTagOrder[b.priority_tag || ''] ?? untaggedPriorityRank));
 
   const paymentRowsByVendorId = useMemo(() => {
     const map = new Map<number, VendorPaymentTracking>();
@@ -644,7 +884,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
 
 
   const paymentRowsSorted = [...paymentTracking].sort(
-    (a, b) => CATEGORY_OPTIONS.indexOf(a.category as VendorCategory) - CATEGORY_OPTIONS.indexOf(b.category as VendorCategory)
+    (a, b) => categoryValues.indexOf(a.category as VendorCategory) - categoryValues.indexOf(b.category as VendorCategory)
   );
 
   const selectedVendor = selectedVendorId != null ? vendors.find((v) => v.id === selectedVendorId) || null : null;
@@ -732,7 +972,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
   const totalTableCols = 11 + planGroupColCount + weekColumns.length;
 
   return (
-    <div className="flex flex-col gap-5 w-full max-w-6xl mx-auto py-2 overflow-y-auto no-scrollbar max-h-[calc(100vh-2rem)] pr-1">
+    <div className="flex flex-col gap-5 w-full py-2">
       {loadError && <p className="text-xs text-red-600">ERROR loading planning data: {loadError}</p>}
 
       {/* Vendors overview — logo + label sit on one line, the number is its
@@ -814,12 +1054,13 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           </div>
           <div className="flex-7 flex items-center">
             <input
+              ref={fundsInputRef}
               type="text"
               inputMode="numeric"
               disabled={!fundsInputEnabled}
               value={availableFunds ? `₹${Number(availableFunds).toLocaleString('en-IN')}` : ''}
               placeholder={fundsInputEnabled ? '₹0' : 'calc funds first'}
-              onChange={(e) => setAvailableFunds(moneyDigits(e.target.value))}
+              onChange={handleFundsInput}
               className="w-full text-xl font-bold text-gray-900 bg-gray-50 rounded-lg px-2 py-1.5 focus:outline-none disabled:text-gray-400 truncate"
             />
           </div>
@@ -830,43 +1071,33 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
             <div className="w-8 h-8 rounded-full bg-emerald-50 text-emerald-700 flex items-center justify-center border border-emerald-100 shrink-0">
               <PiggyBank className="w-4 h-4 text-emerald-600" />
             </div>
-            <span className="text-xs text-gray-500 font-medium">Funds Left</span>
+            <span className="text-xs text-gray-500 font-medium" title="Funds left over after this plan's actual allocation, not funds available for the next regeneration.">Funds Left</span>
           </div>
           <span className="text-xl font-bold text-gray-900 tracking-tight">{formatMoney(fundsLeft)}</span>
         </div>
 
-        {!hasGeneratedThisCycle ? (
-          <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#107c41] flex items-center justify-center border border-emerald-200 shrink-0">
-                <Calendar className="w-4 h-4 text-[#107c41]" />
-              </div>
-              <span className="text-xs text-gray-500 font-medium">Planning Month</span>
+        {/* Read-only (Main-tab upload-confirm task, section 4) — Finance
+            confirms Planning Month once, in the upload confirm modal;
+            this card just shows the resolved value, never asks again. */}
+        <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#107c41] flex items-center justify-center border border-emerald-200 shrink-0">
+              <Calendar className="w-4 h-4 text-[#107c41]" />
             </div>
-            <input
-              type="month"
-              value={planningMonth}
-              onChange={(e) => setPlanningMonth(e.target.value)}
-              className="text-xl font-bold text-gray-900 border border-gray-200 rounded-lg px-2 py-1"
-            />
+            <span className="text-xs text-gray-500 font-medium">
+              Planning Month{hasGeneratedThisCycle ? ' (locked this cycle)' : ''}
+            </span>
           </div>
-        ) : (
-          <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#107c41] flex items-center justify-center border border-emerald-200 shrink-0">
-                <Calendar className="w-4 h-4 text-[#107c41]" />
-              </div>
-              <span className="text-xs text-gray-500 font-medium">Planning Month (locked this cycle)</span>
-            </div>
-            <span className="text-xl font-bold text-gray-900 tracking-tight truncate">{formatMonthLong(planningMonth)}</span>
-          </div>
-        )}
+          <span className="text-xl font-bold text-gray-900 tracking-tight truncate">
+            {planningMonth ? formatMonthLong(planningMonth) : '—'}
+          </span>
+        </div>
       </div>
 
       {/* Control bar: search/filter (left) + Generate/Regenerate + Finalize (right) */}
       <div className="bg-white border border-gray-200/90 rounded-xl p-3 shadow-2xs flex flex-col sm:flex-row items-center justify-between gap-3">
         <div className="flex items-center gap-2 w-full sm:w-auto">
-          <div className="relative flex-1 sm:w-80">
+          <div className="relative flex-1 sm:w-56">
             <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
@@ -900,7 +1131,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                 the same conventions used elsewhere in this table
                 (CATEGORY_BADGE_CLASS / AGING_BUCKET_BADGE_CLASS / the tag's
                 implied category color). */}
-            <div className="hidden group-hover:block absolute z-30 top-full left-0 mt-1.5 bg-white border border-gray-200 rounded-xl shadow-lg w-[34rem] max-w-[90vw] overflow-hidden">
+            <div className="hidden group-hover:block absolute z-50 top-full left-0 mt-1.5 bg-white border border-gray-200/90 rounded-xl shadow-2xs w-[34rem] max-w-[90vw] overflow-hidden">
               <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100">
                 <span className="text-xs font-bold text-gray-700">Filters</span>
                 {activeFilterCount > 0 && (
@@ -913,14 +1144,14 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                 <div className="flex flex-col gap-2.5 p-4 min-w-0">
                   <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wide">Category</span>
                   <div className="flex flex-wrap gap-1.5">
-                    {CATEGORY_OPTIONS.map((c) => (
+                    {categoryValues.map((c) => (
                       <button
                         key={c}
                         type="button"
                         onClick={() => toggleInSet(setCategoryFilters, c)}
-                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer border ${categoryFilters.has(c) ? 'border-current' : 'border-transparent opacity-50'} ${CATEGORY_BADGE_CLASS[c]}`}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer border ${categoryFilters.has(c) ? 'border-current' : 'border-transparent opacity-50'} ${categoryBadgeClass(c)}`}
                       >
-                        {CATEGORY_LABEL[c]}
+                        {categoryLabelByValue[c]}
                       </button>
                     ))}
                   </div>
@@ -948,11 +1179,21 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                         key={tag}
                         type="button"
                         onClick={() => toggleInSet(setPriorityTagFilters, tag)}
-                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer border ${priorityTagFilters.has(tag) ? 'border-current' : 'border-transparent opacity-50'} ${CATEGORY_BADGE_CLASS[impliedCategoryForTag(tag) as VendorCategory]}`}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer border ${priorityTagFilters.has(tag) ? 'border-current' : 'border-transparent opacity-50'} ${categoryBadgeClass(impliedCategoryForTag(tag, priorityBuckets))}`}
                       >
                         {tag}
                       </button>
                     ))}
+                  </div>
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wide mt-1">Override</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setOverriddenOnly((prev) => !prev)}
+                      className={`px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer border ${overriddenOnly ? 'border-current bg-gray-100 text-gray-700' : 'border-transparent opacity-50 bg-gray-100 text-gray-700'}`}
+                    >
+                      Overridden only
+                    </button>
                   </div>
                 </div>
               </div>
@@ -960,23 +1201,50 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           </div>
         </div>
 
-        <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end flex-wrap">
+        <div className="flex items-center gap-1.5 w-full sm:w-auto justify-end flex-nowrap">
           <button
             onClick={handleGeneratePlan}
             disabled={isGenerating || !fundsInputEnabled}
-            className="px-4 py-2 bg-[#107c41] hover:bg-[#0d6535] disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center gap-2 cursor-pointer"
+            className="px-3 py-1.5 bg-[#107c41] hover:bg-[#0d6535] disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             {hasGeneratedThisCycle ? 'Regenerate Plan' : 'Generate Plan'}
           </button>
           <button
+            onClick={handleDownloadMinFundsVerification}
+            disabled={Object.keys(nm2MinFundsByVendorId).length === 0}
+            title={Object.keys(nm2MinFundsByVendorId).length === 0 ? 'Calculate Minimum Funds Required first' : undefined}
+            className="px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Verify Min Funds
+          </button>
+          <button
             onClick={handleFinalize}
             disabled={!hasGeneratedThisCycle}
             title={!hasGeneratedThisCycle ? 'Generate a plan first' : undefined}
-            className="px-4 py-2 bg-white border border-[#107c41] hover:bg-emerald-50/60 disabled:opacity-50 disabled:cursor-not-allowed text-[#107c41] rounded-lg text-xs font-bold flex items-center gap-2 cursor-pointer"
+            className="px-3 py-1.5 bg-white border border-[#107c41] hover:bg-emerald-50/60 disabled:opacity-50 disabled:cursor-not-allowed text-[#107c41] rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
             <CheckCircle2 className="w-3.5 h-3.5" />
             Finalize Plan
+          </button>
+          <button
+            onClick={handleDownloadExport}
+            disabled={!paymentRowsSorted.some((row) => row.budget > 0)}
+            title={!paymentRowsSorted.some((row) => row.budget > 0) ? 'Finalize a plan first' : undefined}
+            className="px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Download Excel
+          </button>
+          <button
+            onClick={handleReset}
+            disabled={!hasGeneratedThisCycle}
+            title={!hasGeneratedThisCycle ? 'Nothing generated yet this cycle' : undefined}
+            className="px-3 py-1.5 bg-white border border-gray-300 hover:bg-red-50 hover:border-red-300 hover:text-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            Reset
           </button>
         </div>
       </div>
@@ -987,16 +1255,36 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           <h3 className="text-sm font-bold text-gray-900">Planning</h3>
           <span className="text-xs font-medium text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{filteredPlanningVendors.length} entries</span>
         </div>
-        <div className="overflow-x-auto no-scrollbar">
+        <div className="table-scroll overscroll-contain max-h-155">
           <table className="w-full text-left text-xs border-separate border-spacing-0">
-            <thead className="bg-emerald-50 text-[#107c41] font-semibold">
+            <thead className="bg-emerald-50 text-[#107c41] font-semibold sticky top-0 z-30">
               <tr className="border-b border-emerald-100">
-                <th rowSpan={2} className={`${th} sticky left-0 z-20 bg-emerald-50`}>Vendor</th>
-                <th rowSpan={2} className={th}>ERP code</th>
+                <th rowSpan={2} className={`${th} sticky left-0 z-40 bg-emerald-50`}>
+                  Vendor
+                  <ColumnFilterIcon column="vendor_name" label="Vendor" active={!!columnFilters.vendor_name}
+                    isOpen={openColumnFilter === 'vendor_name'} onToggle={() => setOpenColumnFilter((c) => (c === 'vendor_name' ? null : 'vendor_name'))}
+                    value={columnFilters.vendor_name || ''} onChange={(v) => setColumnFilters((prev) => ({ ...prev, vendor_name: v }))} />
+                </th>
+                <th rowSpan={2} className={th}>
+                  ERP code
+                  <ColumnFilterIcon column="erp_code" label="ERP code" active={!!columnFilters.erp_code}
+                    isOpen={openColumnFilter === 'erp_code'} onToggle={() => setOpenColumnFilter((c) => (c === 'erp_code' ? null : 'erp_code'))}
+                    value={columnFilters.erp_code || ''} onChange={(v) => setColumnFilters((prev) => ({ ...prev, erp_code: v }))} />
+                </th>
                 <th rowSpan={2} className={`${th} min-w-32.5`}>Category</th>
                 <th rowSpan={2} className={`${th} border-l border-emerald-100 min-w-17.5`}>V-Priority</th>
-                <th rowSpan={2} className={`${th} border-l border-emerald-100`}>Assigned Wk</th>
-                <th rowSpan={2} className={`${th} border-l border-emerald-100 text-right`}>Outstanding</th>
+                <th rowSpan={2} className={`${th} border-l border-emerald-100`}>
+                  Assigned Wk
+                  <ColumnFilterIcon column="assigned_week" label="Assigned Wk" active={!!columnFilters.assigned_week}
+                    isOpen={openColumnFilter === 'assigned_week'} onToggle={() => setOpenColumnFilter((c) => (c === 'assigned_week' ? null : 'assigned_week'))}
+                    value={columnFilters.assigned_week || ''} onChange={(v) => setColumnFilters((prev) => ({ ...prev, assigned_week: v }))} />
+                </th>
+                <th rowSpan={2} className={`${th} border-l border-emerald-100 text-right`}>
+                  Outstanding
+                  <ColumnFilterIcon column="outstanding" label="Outstanding" active={!!columnFilters.outstanding}
+                    isOpen={openColumnFilter === 'outstanding'} onToggle={() => setOpenColumnFilter((c) => (c === 'outstanding' ? null : 'outstanding'))}
+                    value={columnFilters.outstanding || ''} onChange={(v) => setColumnFilters((prev) => ({ ...prev, outstanding: v }))} />
+                </th>
                 <th colSpan={3} className={`${th} border-l border-emerald-100 text-center`}>Aging</th>
                 {planGroupHeader.row1}
                 {weekColumns.length > 0 && (
@@ -1046,34 +1334,66 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                   const allocation = latestAllocationByVendorId.get(vendor.id);
                   const denom = allocation?.required_amount_snapshot ?? null;
                   const distribution = planHistory?.vendor_week_distribution_plans[String(vendor.id)] || {};
+                  // Item 2 (this task): Vendor.week_distribution_plan is
+                  // deliberately sticky across regenerations once Finance has
+                  // ever hand-edited a week (planner.py's own comment: "must
+                  // keep re-deriving fresh ... for as long as Finance hasn't
+                  // actually edited a week" — a stored, non-null distribution
+                  // is never auto-rescaled). docs/06 only specifies grouping
+                  // a vendor's single allocated amount by Assigned Week for
+                  // display — it's silent on this further per-vendor,
+                  // multi-week manual split, so the fix here is a visible
+                  // staleness flag rather than a backend auto-rescale (which
+                  // would silently overwrite a manual split Finance made on
+                  // purpose). Flag whenever the stored split's total no
+                  // longer sums to the vendor's current effective amount
+                  // (override, if set, else the freshly-generated suggestion).
+                  const distributionValues = Object.values(distribution).filter((v): v is number => typeof v === 'number');
+                  const distributionTotal = distributionValues.reduce((sum, v) => sum + v, 0);
+                  const currentEffectiveAmount = allocation ? (allocation.override_amount ?? allocation.allocated_amount) : null;
+                  const distributionStale =
+                    currentEffectiveAmount != null &&
+                    distributionValues.length > 0 &&
+                    Math.abs(distributionTotal - currentEffectiveAmount) > MONEY_EPSILON;
                   const canReconsider = reconsiderEnabled(vendor);
                   const isYes = !!reconsiderYes[vendor.id];
                   return (
                     <tr key={vendor.id} className="hover:bg-gray-50/70 cursor-pointer" onClick={() => { setSelectedVendorId(vendor.id); setShowPaymentInModal(false); }}>
-                      <td className={`${td} sticky left-0 z-10 bg-white font-medium text-gray-900`}>{vendor.vendor_name}</td>
+                      <td className={`${td} sticky left-0 z-10 bg-white font-medium text-gray-900`}>
+                        {vendor.vendor_name}
+                        {distributionStale && (
+                          <span
+                            className="inline-block align-text-bottom ml-1"
+                            title={`Weekly split (${formatMoney(distributionTotal)}) no longer matches this vendor's current allocation (${formatMoney(currentEffectiveAmount)}) — rebalance the week amounts below.`}
+                          >
+                            <AlertCircle className="inline w-3 h-3 text-amber-500" />
+                          </span>
+                        )}
+                      </td>
                       <td className={`${td} font-mono text-[11px] text-gray-500`}>{vendor.erp_code}</td>
                       <td className={td} onClick={(e) => e.stopPropagation()}>
                         <select
                           value={vendor.category}
                           onChange={(e) => handleCategoryChange(vendor, e.target.value)}
-                          className={`${tagFieldCls} min-w-30 font-semibold ${CATEGORY_BADGE_CLASS[vendor.category as VendorCategory] || ''}`}
+                          className={`${tagFieldCls} min-w-30 font-semibold ${categoryBadgeClass(vendor.category)}`}
                         >
-                          {CATEGORY_OPTIONS.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
+                          {categoryValues.map((c) => <option key={c} value={c}>{categoryLabelByValue[c]}</option>)}
                         </select>
                       </td>
                       <td className={`${td} border-l border-gray-100`} onClick={(e) => e.stopPropagation()}>
                         {FIXED_TAG_FOR_CATEGORY[vendor.category] ? (
-                          // Must Pay/Commitment/Inactive: fixed, not manually reassignable.
+                          // Must Pay/Commitment: fixed, not manually reassignable.
                           <span className="px-1.5 py-1 text-gray-500">{FIXED_TAG_FOR_CATEGORY[vendor.category]}</span>
                         ) : (
-                          // Normal: real choice among its own tags (P2/P3/P4, or any
-                          // custom bucket Configuration adds beyond P5) — defaults P2.
+                          // Every other category: real choice among its own live bucket
+                          // rows (Normal: P2/P3/P4; Inactive: P5 only; a custom category:
+                          // whatever Configuration gave it) — defaults to the first.
                           <select
-                            value={displayedPriorityTag(vendor)}
+                            value={displayedPriorityTag(vendor, priorityBuckets)}
                             onChange={(e) => handlePriorityTagChange(vendor, e.target.value)}
                             className={tagFieldCls}
                           >
-                            {allPriorityTagOptions.filter((t) => !NON_NORMAL_TAGS.includes(t)).map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+                            {tagsForCategory(vendor.category, priorityBuckets).map((tag) => <option key={tag} value={tag}>{tag}</option>)}
                           </select>
                         )}
                       </td>
@@ -1084,7 +1404,15 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                           className={tagFieldCls}
                         >
                           <option value="">—</option>
-                          {Array.from({ length: weeksInMonth }, (_, i) => i + 1).map((w) => <option key={w} value={w}>W{w}</option>)}
+                          {(
+                            weeksInMonth != null
+                              ? Array.from({ length: weeksInMonth }, (_, i) => i + 1)
+                              // Not yet known (docs/17 race fix): offer only the vendor's own
+                              // already-assigned week, if any — never a guessed full range.
+                              : vendor.assigned_week
+                              ? [vendor.assigned_week]
+                              : []
+                          ).map((w) => <option key={w} value={w}>W{w}</option>)}
                         </select>
                       </td>
                       <td className={`${td} border-l border-gray-100 text-right font-semibold text-gray-900`}>{formatMoney(vendor.live_outstanding_balance)}</td>
@@ -1204,11 +1532,11 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           <h3 className="text-sm font-bold text-gray-900">Payments</h3>
           <span className="text-xs font-medium text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{paymentRowsSorted.length} vendors</span>
         </div>
-        <div className="overflow-x-auto no-scrollbar">
+        <div className="table-scroll overscroll-contain max-h-155">
           <table className="w-full text-left text-xs border-separate border-spacing-0">
-            <thead className="bg-emerald-50 text-[#107c41] font-semibold">
+            <thead className="bg-emerald-50 text-[#107c41] font-semibold sticky top-0 z-30">
               <tr className="border-b border-emerald-100">
-                <th rowSpan={2} className={`${th} sticky left-0 z-20 bg-emerald-50`}>Vendor</th>
+                <th rowSpan={2} className={`${th} sticky left-0 z-40 bg-emerald-50`}>Vendor</th>
                 <th rowSpan={2} className={th}>ERP code</th>
                 <th rowSpan={2} className={`${th} min-w-30`}>Category</th>
                 <th rowSpan={2} className={`${th} border-l border-emerald-100 text-right`}>Outstanding</th>
@@ -1216,7 +1544,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                 <th colSpan={3} className={`${th} border-l border-emerald-100 text-center`}>Actual paid this month</th>
                 <th rowSpan={2} className={`${th} border-l border-emerald-100 text-right`}>Balance this month</th>
                 <th rowSpan={2} className={`${th} border-l border-emerald-100 text-right`}>Balance outstanding</th>
-                <th rowSpan={2} className={`${th} border-l border-emerald-100 sticky right-0 z-20 bg-emerald-50`}>Pay</th>
+                <th rowSpan={2} className={`${th} border-l border-emerald-100 sticky right-0 z-40 bg-emerald-50`}>Pay</th>
               </tr>
               <tr className="border-b border-emerald-100">
                 <th className={`${th} border-l border-emerald-100 text-right`}>Amt</th>
@@ -1233,8 +1561,8 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                   <td className={`${td} sticky left-0 z-10 bg-white font-medium text-gray-900`}>{row.vendor_name}</td>
                   <td className={`${td} font-mono text-[11px] text-gray-500`}>{row.erp_code}</td>
                   <td className={td}>
-                    <span className={`inline-block px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${CATEGORY_BADGE_CLASS[row.category as VendorCategory] || ''}`}>
-                      {CATEGORY_LABEL[row.category as VendorCategory] || row.category}
+                    <span className={`inline-block px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${categoryBadgeClass(row.category)}`}>
+                      {categoryLabelByValue[row.category] || row.category}
                     </span>
                   </td>
                   <td className={`${td} border-l border-gray-100 text-right font-semibold text-gray-900`}>{formatMoney(row.outstanding)}</td>
@@ -1248,7 +1576,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
                     <button
                       type="button"
                       onClick={() => { setSelectedVendorId(row.vendor_id); setShowPaymentInModal(true); }}
-                      className="px-2.5 py-1 bg-[#107c41] hover:bg-[#0d6535] text-white rounded-md text-[11px] font-semibold cursor-pointer"
+                      className="px-2.5 py-1 bg-[#107c41] hover:bg-[#0d6535] text-white rounded-lg text-[11px] font-semibold cursor-pointer"
                     >
                       Pay
                     </button>
@@ -1266,7 +1594,6 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           showPayment={showPaymentInModal}
           planningMonth={planningMonth}
           hasGeneratedThisCycle={hasGeneratedThisCycle}
-          latestAllocation={richPlanByVendorId[selectedVendor.id] || null}
           effectiveAmount={(() => {
             const a = latestAllocationByVendorId.get(selectedVendor.id);
             return a ? (a.override_amount ?? a.allocated_amount) : null;
@@ -1275,16 +1602,6 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
           onPaymentLogged={async () => { await Promise.all([refreshVendors(), refreshPaymentTracking(), refreshVendorAging(selectedVendor.id)]); }}
           onCommitmentMonthsChange={(value) => handleVendorFieldChange(selectedVendor, 'commitment_months', value)}
           onNotify={onNotify}
-        />
-      )}
-
-      {shortfallData && (
-        <ShortfallModal
-          data={shortfallData}
-          onClose={() => setShortfallData(null)}
-          onReduceToSuggested={handleReduceToSuggested}
-          onPickAnotherVendor={handlePickAnotherVendor}
-          onIncreaseFunds={handleIncreaseFunds}
         />
       )}
 
@@ -1302,10 +1619,38 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify }) => {
       {showFinalizeConfirm && (
         <ConfirmModal
           title="Finalize this plan?"
-          message="This publishes a stable Budget figure to the Payments table for every vendor in the current plan. You can finalize again later if you regenerate or change overrides."
+          message="Publishes the Budget for every vendor in this plan to Payments."
           confirmLabel="Finalize"
           onConfirm={confirmFinalize}
           onCancel={() => setShowFinalizeConfirm(false)}
+          extra={
+            // Proactive preview shown the moment the modal opens, using the
+            // signed financeSignedDiff computed above: red if short, green
+            // if there's room to spare, nothing if it's an exact match.
+            // Finalize itself never blocks on this (CLAUDE.md rule 2 /
+            // Sarath's explicit call, this task) — it's informational only.
+            financeSignedDiff < -MONEY_EPSILON ? (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5 leading-relaxed">
+                <p className="font-semibold">Short by {formatMoney(Math.abs(financeSignedDiff))}.</p>
+                <p>Try reducing allocations for Normal/Inactive vendors, or increasing available funds, then Finalize again.</p>
+              </div>
+            ) : financeSignedDiff > MONEY_EPSILON ? (
+              <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5 leading-relaxed">
+                <p className="font-semibold">You&apos;ll have {formatMoney(financeSignedDiff)} left after this plan.</p>
+              </div>
+            ) : null
+          }
+        />
+      )}
+
+      {showResetConfirm && (
+        <ConfirmModal
+          title="Reset this cycle's plan?"
+          message="Deletes this cycle's plan, every override, and the Min Funds figure. You'll start over from Calculate Minimum Funds Required. Past finalized months and vendor master data are not affected."
+          confirmLabel="Reset Plan"
+          variant="danger"
+          onConfirm={confirmReset}
+          onCancel={() => setShowResetConfirm(false)}
         />
       )}
 

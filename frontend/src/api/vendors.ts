@@ -1,5 +1,5 @@
 import { api } from './client';
-import { Vendor, VendorAging, VendorPaymentTracking } from '../types';
+import { Payment, Vendor, VendorAging, VendorCategoryOption, VendorPaymentTracking } from '../types';
 
 export const listVendors = () => api.get<Vendor[]>('/vendors');
 export const getVendor = (id: number) => api.get<Vendor>(`/vendors/${id}`);
@@ -13,8 +13,11 @@ export const getVendorPaymentTracking = () => api.get<VendorPaymentTracking[]>('
 export const patchVendor = (id: number, field: string, new_value: unknown) =>
   api.patch<{ old_value: unknown; new_value: unknown }>(`/vendors/${id}`, { field, new_value });
 
-// model: 1 (default) — New Model 2's own tab uses finalizeNewModel2() instead
-// (POST /models/5/finalize), which calls this same underlying snapshot with
-// model=5 server-side; this wrapper is only for the generic route's own default.
-export const finalizePlan = (model = 1) =>
-  api.post<{ vendor_count: number }>('/vendors/finalize-plan', { model });
+export const getVendorPayments = (id: number) => api.get<Payment[]>(`/vendors/${id}/payments`);
+
+// Read-only source of truth for the category dropdown(s) (P2 demo-polish
+// task, CLAUDE.md rule 7) — the category SET itself is a fixed backend enum,
+// not Finance-editable data, but the label/value pairs still come from here
+// rather than a hardcoded second copy (constants/enums.ts's CATEGORY_OPTIONS/
+// CATEGORY_LABEL are kept only as a same-session bootstrap default now).
+export const getVendorCategories = () => api.get<VendorCategoryOption[]>('/vendors/categories');

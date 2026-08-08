@@ -13,6 +13,21 @@ class ChangeSource(str, enum.Enum):
     EXCEL_UPLOAD = "excel_upload"
     INGESTION = "ingestion"  # one-time initial load, not a Finance-initiated override
     AI_COLUMN_MAPPING = "ai_column_mapping"  # AI-mapping task: a header the AI layer resolved/auto-persisted
+    # Category<->Priority Tag auto-update task: the SIBLING field's own
+    # audit_log entry when editing one derives a change to the other (e.g.
+    # editing category to Commitment auto-sets priority_tag to P1) — never
+    # UI_EDIT, so the audit trail can always tell a system-derived side
+    # effect apart from a direct Finance action on that field.
+    UI_EDIT_DERIVED = "ui_edit_derived"
+    # Audit log revamp task — action types that previously had no dedicated
+    # source at all (Generate Plan, Export, Funds Input, Min Funds Calc), or
+    # were logged under the generic UI_EDIT (Reset Cycle), each split out so
+    # the Configuration tab's audit-log filter can distinguish them.
+    GENERATE_PLAN = "generate_plan"
+    RESET_CYCLE = "reset_cycle"
+    EXPORT = "export"
+    FUNDS_INPUT = "funds_input"
+    MIN_FUNDS_CALC = "min_funds_calc"
 
 
 class VendorCategory(str, enum.Enum):

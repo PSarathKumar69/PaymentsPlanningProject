@@ -17,8 +17,11 @@ from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+from backend.ingestion.ai_column_mapper import AIMappingUnavailableError
+
 from .routers import (
     ai_layer,
+    analytics,
     audit_log,
     calendar,
     configuration,
@@ -28,7 +31,6 @@ from .routers import (
     payments,
     plan_allocations,
     plan_runs,
-    rollover,
     vendors,
     weekly_planning,
 )
@@ -43,6 +45,11 @@ def value_error_handler(request: Request, exc: ValueError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
+@app.exception_handler(AIMappingUnavailableError)
+def ai_mapping_unavailable_handler(request: Request, exc: AIMappingUnavailableError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 app.include_router(vendors.router)
 app.include_router(calendar.router)
 app.include_router(new_model_2.router)
@@ -53,9 +60,9 @@ app.include_router(plan_runs.router)
 app.include_router(configuration.router)
 app.include_router(ingestion.router)
 app.include_router(master_data.router)
-app.include_router(rollover.router)
 app.include_router(audit_log.router)
 app.include_router(ai_layer.router)
+app.include_router(analytics.router)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

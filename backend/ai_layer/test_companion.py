@@ -194,6 +194,96 @@ def test_zero_only_build_prompt_is_unchanged():
     assert "**Talking points (step by step)**" in prompt
 
 
+def test_build_prompt_instructs_indian_rupees_not_dollars():
+    """Real bug: Gemini defaulted to '$' since nothing told it this is an
+    Indian Rupee amount. The static instruction text itself must demand
+    '₹' and explicitly ban '$'/USD/dollars — never just a passing mention."""
+    prompt = prompt_template.build_prompt({"vendor_name": "Alpha", "status": "zero"})
+    assert "₹" in prompt
+    assert "Indian Rupees" in prompt
+    assert "Indian-style digit grouping" in prompt
+    assert "$" not in prompt
+
+
+def test_talking_points_prompt_instructs_indian_rupees_not_dollars():
+    prompt = prompt_template.build_talking_points_prompt({"vendor_name": "Alpha", "status": "full"})
+    assert "₹" in prompt
+    assert "Indian Rupees" in prompt
+    assert "Indian-style digit grouping" in prompt
+    assert "$" not in prompt
+
+
+# ---- Banned internal-process phrasing (Sarath's flagged real example) -----
+
+_BANNED_PHRASES = [
+    "our current operational plan",
+    "prioritizes invoices",
+    "aging period",
+    "as per the plan",
+]
+
+
+def test_talking_points_guardrails_ban_internal_process_phrasing():
+    """Real flagged example: 'This allocation is based on our current
+    operational plan, which prioritizes invoices within the most recent
+    aging period.' None of these literally name a bucket/model term (rule 2
+    already bans that), but they're exactly as internal-sounding and
+    unwelcome — the new rule must call them out by name, not just gesture
+    at the general idea."""
+    prompt = prompt_template.build_talking_points_prompt({"vendor_name": "Alpha", "status": "full"})
+    for phrase in _BANNED_PHRASES:
+        assert phrase in prompt  # named as a banned example, not present as live output
+
+
+def test_email_guardrails_ban_internal_process_phrasing():
+    prompt = prompt_template.build_vendor_email_prompt({"vendor_name": "Alpha", "status": "full"})
+    for phrase in _BANNED_PHRASES:
+        assert phrase in prompt
+
+
+# ---- build_vendor_email_prompt / format toggle -----------------------------
+
+
+def test_build_vendor_email_prompt_has_email_shape():
+    prompt = prompt_template.build_vendor_email_prompt({"vendor_name": "Alpha Freight", "status": "full"})
+    assert "Dear [Vendor Name] team" in prompt
+    assert "AuthBridge Finance Team" in prompt
+    assert "no bullet points" in prompt.lower()
+    assert "WHAT THE EMAIL ITSELF MUST SOUND LIKE" in prompt
+    # Shares the same non-negotiable guardrails as the talking-points prompt.
+    assert "Never state or imply a legal or binding commitment" in prompt
+    assert "Never expose internal mechanics" in prompt
+
+
+def test_build_vendor_email_prompt_instructs_indian_rupees_not_dollars():
+    prompt = prompt_template.build_vendor_email_prompt({"vendor_name": "Alpha", "status": "full"})
+    assert "₹" in prompt
+    assert "Indian Rupees" in prompt
+    assert "$" not in prompt
+
+
+def test_generate_vendor_talking_points_defaults_to_talking_format(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gemini_client, "generate_text", lambda prompt: calls.append(prompt) or "SCRIPT")
+    companion.generate_vendor_talking_points(
+        vendor_id=1, erp_code="V001", vendor_name="Alpha", category="normal", priority_tag="P2",
+        aging={}, min_funds_breakdown={}, allocated_amount=100.0, required_amount=100.0, status="full",
+    )
+    assert "WHAT THE SCRIPT ITSELF MUST SOUND LIKE" in calls[0]
+
+
+def test_generate_vendor_talking_points_email_format_uses_email_prompt(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gemini_client, "generate_text", lambda prompt: calls.append(prompt) or "EMAIL")
+    companion.generate_vendor_talking_points(
+        format="email",
+        vendor_id=1, erp_code="V001", vendor_name="Alpha", category="normal", priority_tag="P2",
+        aging={}, min_funds_breakdown={}, allocated_amount=100.0, required_amount=100.0, status="full",
+    )
+    assert "WHAT THE EMAIL ITSELF MUST SOUND LIKE" in calls[0]
+    assert "Dear [Vendor Name] team" in calls[0]
+
+
 def test_qa_mode_fully_removed():
     """Sarath's scope correction: the broader Q&A path is gone, not just
     unused — confirms the deleted names really don't exist anymore."""

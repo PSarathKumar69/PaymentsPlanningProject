@@ -27,6 +27,31 @@ class NewModel2MinimumFundsRequiredResponse(BaseModel):
     breakdown: list[dict[str, Any]]
     planning_month: str  # "YYYY-MM", echoed back from the request
     as_of: date  # planning_month minus one calendar month — the aging reference point actually used
+    # Non-blocking (this task): set when `planning_month` isn't exactly the
+    # sheet's last recorded ledger month + 1 — never blocks Card 1/2, just
+    # flags it plainly. None when it matches (the common case) or when
+    # there's no ledger data yet to compare against.
+    planning_month_warning: str | None = None
+
+
+class SuggestedPlanningMonthResponse(BaseModel):
+    """GET /models/5/suggested-planning-month (this task) — the sheet's real
+    last recorded ledger month, and the suggested planning month (that + 1),
+    for the frontend to pre-fill Card 1's picker instead of leaving it
+    blank/defaulting to today's real calendar month. Both None when the DB
+    has no ledger data loaded at all yet."""
+
+    last_recorded_month: str | None = None
+    suggested_planning_month: str | None = None
+
+
+class CurrentPlanningMonthResponse(BaseModel):
+    """GET /models/5/current-planning-month (Main-tab upload-confirm task) —
+    whatever _resolve_planning_month() would fall back to right now: the
+    latest plan_run's month if one exists this cycle, else the persisted
+    planning.current_planning_month config value, else None."""
+
+    planning_month: str | None = None
 
 
 class AllVendorMinFundsRequiredV2Response(BaseModel):
@@ -82,6 +107,21 @@ class NewModel2GeneratePlanResponse(BaseModel):
     bucket_ceiling: dict[str, float]  # {"P2": 0.95, "P3": 0.90, "P4": 0.85} — config-sourced, docs/14
     bucket_pct: dict[str, float]  # the pct actually used per bucket, after any cutting
     exceptional_shortfall: bool
+    # Bug fix (this task): allocator.py's generate_plan() has always
+    # returned this (the real, post-allocation "money left over" figure),
+    # but this schema never declared it, so FastAPI's response_model
+    # silently stripped it before it ever reached the frontend — same
+    # failure mode as the earlier ai_column_mapping_messages gap. The
+    # "Funds Left" UI card needs this one, not funds_left_for_regeneration
+    # (a different, pre-allocation figure — see PlanningView.tsx).
+    leftover_remaining: float
+    # Bug fix (New Model 2 e2e validation task, 2026-08-03): same silent-strip
+    # failure mode as leftover_remaining/ai_column_mapping_messages above —
+    # allocator.py's generate_plan() has always returned this (how much of
+    # leftover_remaining's pre-top-up figure the top-up sweep actually spent),
+    # but this schema never declared it either, so it never reached the API
+    # response despite being computed correctly the whole time.
+    leftover_topup_total: float
     allocations: list[dict[str, Any]]
 
 
@@ -98,6 +138,19 @@ class ResponsibleVendor(BaseModel):
     vendor_name: str
     suggested_amount: float
     override_amount: float
+
+
+class ResetCycleResponse(BaseModel):
+    """POST /models/5/reset-cycle — confirmed-with-Sarath scope (CLAUDE.md):
+    wipes only the current planning cycle's own Generate Plan output plus
+    every vendor's whole-month cycle state. Never touches vendor master
+    data/Excel, Configuration, past months' plan history, or the confirmed
+    planning month itself."""
+
+    planning_month: str
+    deleted_plan_runs: int
+    deleted_allocations: int
+    vendors_reset: int
 
 
 class FinalizeCheckResponse(BaseModel):

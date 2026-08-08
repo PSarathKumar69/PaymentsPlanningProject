@@ -106,7 +106,9 @@ def week_actual_paid(session, vendor_id):
     DEFAULT — confirm with Sarath: "this cycle" is scoped to
     payment_date >= _current_cycle_month(session) — the same ledger-month
     anchor _this_cycle_allocation() uses. There's nothing more precise to
-    filter on: rollover_month() never purges/archives old Payment rows, and
+    filter on: the month-end cycle reset (commit_upload()'s own new-month
+    check, backend/month_end/rollover.py::_reset_vendor_cycle_state()) never
+    purges/archives old Payment rows, and
     Payment carries no explicit cycle/plan_run link of its own. In a live
     system payment_date (the server's real current date, see log_payment)
     and the ledger's newly-ingested cycle month are the same real month, so

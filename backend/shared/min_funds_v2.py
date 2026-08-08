@@ -26,6 +26,7 @@ excluded — its own untouched opening-balance/commitment_months formula is
 delegated to min_funds.required_amount() directly below, so the number can
 never drift between the old and new code paths.
 """
+
 import pandas as pd
 
 from backend.db.session import SessionLocal
@@ -54,7 +55,7 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
         return {
             "total": amount,
             "rule": rule,
-            "category": vendor.category.value,
+            "category": vendor.category,
             "opening_balance": float(vendor.opening_balance),
             "live_balance": max(float(vendor.opening_balance) - paid_so_far, 0.0),
             "commitment_months": vendor.commitment_months or 1,
@@ -70,8 +71,26 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
     tranches = build_vendor_tranches(ledger_rows, already_paid_this_cycle=paid_so_far)
     outstanding = [t for t in tranches if t.remaining > MONEY_EPSILON]
 
+    # Defensive cap (this task, same principle as allocator.py's own rule-1
+    # ledger-integrity clamp): build_vendor_tranches() only ever creates a
+    # tranche for a POSITIVE payable row, and separately drops any leftover
+    # payment below MONEY_EPSILON as noise rather than carrying it forward —
+    # so a real negative-payable credit/correction (confirmed real case:
+    # V00393, a -8,088.69 correction) or an accumulated sub-rupee rounding
+    # drift (confirmed real case: V00986, ~-3.20 over several months) never
+    # nets against the tranche list, even though it's already correctly
+    # reflected in the vendor's real running ledger balance
+    # (vendor.opening_balance). Without this cap, required_amount_v2() can
+    # hand back a figure the vendor could never actually owe — never
+    # silently trusted past what they really do.
+    live_outstanding = max(float(vendor.opening_balance) - paid_so_far, 0.0)
+
+    def _capped(result):
+        result["total"] = min(result["total"], live_outstanding)
+        return result
+
     base = {
-        "category": vendor.category.value,
+        "category": vendor.category,
         "opening_balance": None,
         "live_balance": None,
         "commitment_months": None,
@@ -83,8 +102,8 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
 
     if not outstanding:
         # Rule 6: nothing owed at all.
-        return {**base, **no_second, "total": 0.0, "rule": "v2_no_outstanding", "current_month": None,
-                "current_amount": None, "oldest_month": None, "oldest_amount": None}
+        return _capped({**base, **no_second, "total": 0.0, "rule": "v2_no_outstanding", "current_month": None,
+                "current_amount": None, "oldest_month": None, "oldest_amount": None})
 
     current = next((t for t in outstanding if t.month == as_of), None)
     current_amount = current.remaining if current else 0.0
@@ -93,9 +112,30 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
     older = [t for t in outstanding if t.month < as_of]
 
     if not older:
+        if current is None:
+            # Rule 1b (this task, flagged default — docs/14 doesn't cover
+            # this): no tranche in the current (0-30) reference bucket AND
+            # no older leftover either — every real outstanding tranche is
+            # STRICTLY AFTER as_of. `outstanding` is non-empty here (the
+            # "nothing owed at all" case already returned above), so this
+            # can only happen when as_of (planning month minus one) predates
+            # the vendor's/sheet's very first recorded month — e.g. Finance
+            # planning for the sheet's own first month, right after a fresh
+            # upload. There is no "current month's own bill" to point to,
+            # but nothing was genuinely leftover from before either — a flat
+            # 0 here would be wrong (real money is owed) and doesn't match
+            # rule 1's spirit ("no older leftover, only the [nearest] bill
+            # is outstanding"). Decision: treat the EARLIEST outstanding
+            # tranche (the nearest real bill, oldest -> newest per
+            # build_vendor_tranches()'s own contract) as the reference
+            # figure directly, same as if it were the current month's bill.
+            earliest = outstanding[0]
+            return _capped({**base, **no_second, "total": earliest.remaining, "rule": "v2_no_history_before_as_of",
+                    "current_month": earliest.month, "current_amount": earliest.remaining, "oldest_month": None,
+                    "oldest_amount": None})
         # Rule 1: no older leftover at all, only the current month's own bill.
-        return {**base, **no_second, "total": current_amount, "rule": "v2_only_current", "current_month": as_of,
-                "current_amount": current_amount, "oldest_month": None, "oldest_amount": None}
+        return _capped({**base, **no_second, "total": current_amount, "rule": "v2_only_current", "current_month": as_of,
+                "current_amount": current_amount, "oldest_month": None, "oldest_amount": None})
 
     # Rule 5: the single oldest month's own remaining balance — `older` is
     # already oldest -> newest (build_vendor_tranches()'s own contract), so
@@ -105,9 +145,9 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
 
     if current_amount <= MONEY_EPSILON:
         # Rule 2: current bucket is zero, but an older month is outstanding.
-        return {**base, **no_second, "total": oldest.remaining, "rule": "v2_current_zero_oldest_only",
+        return _capped({**base, **no_second, "total": oldest.remaining, "rule": "v2_current_zero_oldest_only",
                 "current_month": as_of, "current_amount": 0.0, "oldest_month": oldest.month,
-                "oldest_amount": oldest.remaining}
+                "oldest_amount": oldest.remaining})
 
     if oldest.remaining <= 0.5 * current_amount + MONEY_EPSILON:  # inclusive: exactly 50% qualifies (docs/14),
         # checked ONCE against the oldest month only — never re-checked
@@ -126,7 +166,7 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
         after_oldest = sorted((t for t in outstanding if t.month > oldest.month), key=lambda t: t.month)
         second = after_oldest[0]
         is_current = second.month == as_of
-        return {
+        return _capped({
             **base,
             "total": oldest.remaining + second.remaining,
             "rule": "v2_oldest_and_current" if is_current else "v2_oldest_and_second",
@@ -136,11 +176,11 @@ def _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override):
             "oldest_amount": oldest.remaining,
             "second_month": second.month,
             "second_amount": second.remaining,
-        }
+        })
 
     # Rule 4: oldest > 50% of current -> oldest only, current not added.
-    return {**base, **no_second, "total": oldest.remaining, "rule": "v2_oldest_only", "current_month": as_of,
-            "current_amount": current_amount, "oldest_month": oldest.month, "oldest_amount": oldest.remaining}
+    return _capped({**base, **no_second, "total": oldest.remaining, "rule": "v2_oldest_only", "current_month": as_of,
+            "current_amount": current_amount, "oldest_month": oldest.month, "oldest_amount": oldest.remaining})
 
 
 def required_amount_v2(vendor, ledger_rows, as_of=None, paid_so_far_override=None):
@@ -162,13 +202,95 @@ def min_funds_breakdown_v2(vendor, ledger_rows, as_of=None):
     return _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override=None)
 
 
+def min_funds_tranche_breakdown_v2(vendor, ledger_rows, as_of=None):
+    """v2 equivalent of min_funds.min_funds_tranche_breakdown() — same
+    (total, tranches) return shape (tranches oldest -> newest,
+    {month, remaining_amount, is_leftover}), for GET /vendors/aging and
+    /vendors/{id}/aging (backend/api/routers/vendors.py) and
+    build_weekly_view() (backend/weekly_planning/planner.py), all of which
+    used to call the old function and so disagreed with the Planning
+    table's own required_amount_v2()-based figure for any vendor whose old
+    vs new rule actually differs (confirmed real cases: V00193, V00204,
+    V00194, V00393, V00226).
+
+    Built from this module's own _compute_v2() detail dict rather than a
+    second calculation — `total` always equals the sum of the tranche
+    amounts returned here, by construction (each branch below adds exactly
+    the month(s) _compute_v2() actually summed into `total`).
+
+    Must Pay/Commitment: no tranche concept, tranches always [] (same
+    convention the old function uses) — total is still their real required
+    amount, Must Pay's own last-month's-payable rule or Commitment's
+    outstanding-balance rule via required_amount().
+
+    "is_leftover" mirrors the old function's own meaning — True for a
+    month that isn't this cycle's own fresh bill (the oldest month, or a
+    "second" month that isn't `as_of` itself); False for the current (0-30)
+    month's own bill, including the v2_no_history_before_as_of fallback's
+    nearest-bill figure, which stands in for a current bill that doesn't
+    exist yet at this as_of.
+    """
+    detail = _compute_v2(vendor, ledger_rows, as_of, paid_so_far_override=None)
+    if vendor.category == VendorCategory.COMMITMENT:
+        return detail["total"], []
+
+    tranches = []
+    if detail["oldest_month"] is not None:
+        tranches.append(
+            {"month": detail["oldest_month"], "remaining_amount": detail["oldest_amount"], "is_leftover": True}
+        )
+    if detail["second_month"] is not None:
+        is_current = detail["second_month"] == detail["current_month"]
+        tranches.append(
+            {
+                "month": detail["second_month"],
+                "remaining_amount": detail["second_amount"],
+                "is_leftover": not is_current,
+            }
+        )
+    elif detail["rule"] in ("v2_only_current", "v2_no_history_before_as_of") and detail["current_month"] is not None:
+        tranches.append(
+            {
+                "month": detail["current_month"],
+                "remaining_amount": detail["current_amount"],
+                "is_leftover": detail["rule"] == "v2_no_history_before_as_of",
+            }
+        )
+
+    # _compute_v2()'s defensive cap (real confirmed case: V00393) only ever
+    # clamps `total` itself — oldest_amount/second_amount/current_amount are
+    # the raw, pre-cap tranche figures, so a capped vendor's tranches would
+    # otherwise sum to MORE than `total`. Absorb the excess from the oldest
+    # tranche forward (same "older/leftover money is the less certain
+    # figure" reasoning _capped()'s own docstring uses) so the invariant
+    # "tranches always sum to total" holds even for a capped vendor.
+    excess = sum(t["remaining_amount"] for t in tranches) - detail["total"]
+    if excess > MONEY_EPSILON:
+        for t in tranches:
+            reduction = min(t["remaining_amount"], excess)
+            t["remaining_amount"] -= reduction
+            excess -= reduction
+            if excess <= MONEY_EPSILON:
+                break
+
+    return detail["total"], tranches
+
+
 def calculate_minimum_funds_required_v2(session=None, as_of=None):
     """New Model 2's own Minimum Funds Required total (docs/14) — Card 2 of
     the four-card UI flow (GET /models/5/minimum-funds-required). Uses
     required_amount_v2 for every vendor with an outstanding balance, Must
     Pay/Normal/Inactive/Commitment alike — reuses min_funds.py's own
     vendor+ledger loader (the has_outstanding_balance exclusion is identical
-    for New Model 2, docs/14) rather than a second copy of that query."""
+    for New Model 2, docs/14) rather than a second copy of that query.
+
+    Duplicate-vendor handling: the ONE duplicate check in this codebase is
+    ERP-code-based, at ingestion (backend/ingestion/load_excel.py) — a
+    vendor_id here is by definition unique per ERP code, so there is
+    nothing left to de-duplicate at this layer. (A same-name-different-
+    signature check used to also live here; removed — Sarath's call, one
+    check only, keyed on ERP code.)
+    """
     owns_session = session is None
     session = session or SessionLocal()
     try:
@@ -181,13 +303,14 @@ def calculate_minimum_funds_required_v2(session=None, as_of=None):
                     "vendor_id": vendor.id,
                     "erp_code": vendor.erp_code,
                     "vendor_name": vendor.vendor_name,
-                    "category": vendor.category.value,
+                    "category": vendor.category,
                     "required_amount": amount,
                     "rule": rule,
                 }
             )
         breakdown = pd.DataFrame(
-            rows, columns=["vendor_id", "erp_code", "vendor_name", "category", "required_amount", "rule"]
+            rows,
+            columns=["vendor_id", "erp_code", "vendor_name", "category", "required_amount", "rule"],
         )
         total = float(breakdown["required_amount"].sum()) if not breakdown.empty else 0.0
         return {"total": total, "breakdown": breakdown}

@@ -9,6 +9,11 @@ interface ConfirmModalProps {
   variant?: 'danger' | 'default';
   onConfirm: () => void;
   onCancel: () => void;
+  // Optional extra content rendered between the message and the button row
+  // (e.g. Finalize's own inline shortfall warning) — kept generic here so
+  // this component stays reusable by every other caller (Delete Plan, etc.)
+  // that never passes it.
+  extra?: React.ReactNode;
 }
 
 // One shared clean confirm surface for every "are you sure" moment app-wide
@@ -23,6 +28,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   variant = 'default',
   onConfirm,
   onCancel,
+  extra,
 }) => {
   const isDanger = variant === 'danger';
   return (
@@ -40,6 +46,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
         </div>
         <h2 className="text-sm font-bold text-gray-900 mb-1.5">{title}</h2>
         <p className="text-xs text-gray-600 mb-5 leading-relaxed">{message}</p>
+        {extra && <div className="mb-5 -mt-3">{extra}</div>}
         <div className="flex items-center justify-end gap-2.5">
           <button
             type="button"

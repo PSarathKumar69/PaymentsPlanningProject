@@ -62,6 +62,18 @@ class VendorAgingBulkItem(VendorAgingOut):
     vendor_id: int
 
 
+class VendorCategoryOut(BaseModel):
+    """Read-only source of truth for the frontend's category dropdown(s)
+    (P2 demo-polish task, CLAUDE.md rule 7) — the SET of categories itself
+    is a fixed Python enum (backend/shared/enums.py::VendorCategory), not
+    Finance-editable data the way priority buckets are (see the router's
+    own docstring), but the frontend must still read the value/label pairs
+    from here rather than hardcoding a second copy."""
+
+    value: str
+    label: str
+
+
 class PaymentOut(BaseModel):
     id: int
     vendor_id: int
@@ -80,6 +92,18 @@ class VendorPatchRequest(BaseModel):
 class VendorPatchResponse(BaseModel):
     old_value: Any
     new_value: Any
+    # Category<->Priority Tag auto-update (this task): populated only when
+    # editing `field` derived a change to its sibling too (None when the
+    # sibling already agreed — nothing changed there). Lets the UI show
+    # Finance both the direct edit and the side effect, not just the field
+    # they touched.
+    sibling_field: str | None = None
+    sibling_old_value: Any = None
+    sibling_new_value: Any = None
+    # Non-blocking (this task's documented decision — see
+    # vendor_edits.py::_commitment_months_warning): set when this edit moved
+    # a vendor into Commitment while commitment_months is still unconfirmed.
+    commitment_months_warning: str | None = None
 
 
 class VendorPaymentTrackingOut(BaseModel):

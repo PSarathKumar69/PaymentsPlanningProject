@@ -32,9 +32,20 @@ class Vendor(Base):
     """Current-state master data — one row per vendor, Excel-backed."""
 
     __tablename__ = "vendors"
+    # Real uniqueness key is (entity, erp_code), not erp_code alone
+    # (entity-code-collision fix): the real master sheet has 28 confirmed
+    # cases of two different legal entities (ARS/FP) sharing one bare
+    # numeric erp_code, disambiguated by the sheet's own "Unique" column
+    # (e.g. "ARSV00149" vs "FPV00149"). A bare-erp_code unique constraint
+    # made the second entity's vendor impossible to store at all —
+    # load_excel.py's first-row-wins duplicate handling was silently
+    # dropping its entire ledger history, permanently, on every ingestion.
+    # See load_excel.py's upsert lookup and find_duplicate_erp_codes()
+    # (column_mapping.py), both rekeyed to match.
+    __table_args__ = (UniqueConstraint("entity", "erp_code", name="uq_vendor_entity_erp_code"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    erp_code: Mapped[str] = mapped_column(String, unique=True, index=True)
+    erp_code: Mapped[str] = mapped_column(String, index=True)
     entity: Mapped[str] = mapped_column(String)
     vendor_name: Mapped[str] = mapped_column(String)
 
@@ -59,9 +70,19 @@ class Vendor(Base):
 
     # Persistent, Finance-set tags — Excel-backed, follow the write-back rule.
     assigned_week: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    category: Mapped[VendorCategory] = mapped_column(
-        Enum(VendorCategory), default=VendorCategory.NORMAL, server_default=VendorCategory.NORMAL.name
-    )
+    # Category-configuration task: was `Enum(VendorCategory)`, hardcapping
+    # every vendor to the fixed must_pay/commitment/normal/inactive Python
+    # enum — a Configuration-added category (e.g. "Contractor") could never
+    # actually be stored. Plain String now, same fix already applied to
+    # priority_tag below — validity is checked live against the two fixed
+    # categories plus whatever's currently in the priority_buckets table
+    # (vendor_edits.py::_validate), not a fixed Python enum. NOTE: existing
+    # SQLite rows physically stored the enum MEMBER NAME ("NORMAL",
+    # "MUST_PAY", ...), not its .value ("normal", "must_pay", ...) — every
+    # other reader (API schemas, frontend, ingestion) already expects the
+    # lowercase .value form, so db/session.py normalizes old rows once at
+    # startup (LOWER()) rather than every reader guessing at both forms.
+    category: Mapped[str] = mapped_column(String, default=VendorCategory.NORMAL.value, server_default="normal")
     # Only meaningful for COMMITMENT vendors (docs/04-model2-min-funds-advisory.md).
     # Defaults to 1 (full outstanding due this cycle) until Finance sets it via the UI.
     commitment_months: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1, server_default="1")
@@ -91,9 +112,10 @@ class Vendor(Base):
     # PlanAllocation.override_amount already has to this field's sibling.
     week_distribution_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    # "Budget" for the Vendor Payment Table — a stable snapshot of Model 1's
-    # then-current effective amount (override if set, else Model 1's latest
-    # plan_run allocation), taken only when Finance clicks "Finalize Plan"
+    # "Budget" for the Vendor Payment Table — a stable snapshot of the
+    # then-current effective amount (override if set, else the latest
+    # plan_run allocation — New Model 2's today, the sole remaining model),
+    # taken only when Finance clicks "Finalize Plan"
     # (backend/shared/payment_logging.py::finalize_plan()). Deliberately NOT
     # a live-following figure: further overrides/regenerations after a
     # Finalize click do not change this until Finance finalizes again — so
@@ -110,7 +132,9 @@ class Vendor(Base):
     )
     paid_so_far_this_month: Mapped[float] = mapped_column(MONEY, default=0, server_default="0")
 
-    # Computed by Model 1 / Model 3 — not populated by ingestion.
+    # Computed by backend/shared/scoring.py (relocated from the old Model 1
+    # weighted-scoring package, still live infra for New Model 2) — not
+    # populated by ingestion.
     score: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     current_aging_bucket: Mapped[str | None] = mapped_column(String, nullable=True)
 
@@ -190,6 +214,21 @@ class PlanRun(Base):
     month: Mapped[date] = mapped_column(Date)
     model_used: Mapped[str] = mapped_column(String)
     funds_figure: Mapped[float | None] = mapped_column(MONEY, nullable=True)
+    # Analytics funds-trend task: New Model 2's own Minimum Funds Required
+    # total (backend/shared/min_funds_v2.py), captured at the same moment as
+    # funds_figure (new_model_2.py's Generate Plan endpoint) so the two live
+    # on the same row for the trend chart. NULL on every PlanRun that
+    # predates this column, including old rows — never backfilled, per
+    # CLAUDE.md rule "no invented/guessed history" (backend/analytics/
+    # calculations.py's funds trend only reads rows where both this and
+    # funds_figure are populated).
+    min_funds_required: Mapped[float | None] = mapped_column(MONEY, nullable=True)
+    # Funds Left card fix: allocator.py's own leftover_remaining, persisted
+    # the same way as min_funds_required above so a Planning-tab remount can
+    # restore the real post-allocation figure instead of approximating it
+    # from funds_figure minus overrides. NULL on every row that predates
+    # this column — not backfilled, same precedent as min_funds_required.
+    leftover_remaining: Mapped[float | None] = mapped_column(MONEY, nullable=True)
 
     allocations: Mapped[list["PlanAllocation"]] = relationship(back_populates="plan_run")
 
@@ -207,10 +246,9 @@ class PlanAllocation(Base):
     allocated_amount: Mapped[float] = mapped_column(MONEY)
 
     # Per-row snapshot of vendor.override_amount at the moment this row was
-    # created (docs: Model 1 is now the sole driver of payment_status/
-    # cycle_allocation — see payment_logging.py — so this is only
-    # meaningfully used on Model 1's rows in practice, even though the
-    # column exists on every model's). NULL means "no override was set on
+    # created (docs: New Model 2, the sole remaining model, plus this
+    # override now drive payment_status/cycle_allocation — see
+    # payment_logging.py). NULL means "no override was set on
     # the vendor at that moment, use allocated_amount as-is". No longer the
     # live source of truth and no longer "never carried forward" — that was
     # the bug (docs/06 fix): Vendor.override_amount is now the sticky,
@@ -326,12 +364,32 @@ class PriorityBucket(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     bucket_key: Mapped[str] = mapped_column(String, unique=True, index=True)
     display_label: Mapped[str] = mapped_column(String)
+    # Category-configuration task: the Finance-facing category name this
+    # row belongs to (e.g. "Normal", "Inactive", or a custom name Finance
+    # typed) — several rows can share one category_name (P2/P3/P4 all say
+    # "Normal" today, each its own ceiling/floor tier per docs/14), so this
+    # is NOT unique. Nullable only so `_add_missing_columns()`'s bare
+    # ALTER TABLE ADD COLUMN can apply to a pre-existing table; every row
+    # is immediately backfilled by `_seed_and_read_buckets()`.
+    category_name: Mapped[str | None] = mapped_column(String, nullable=True)
     ceiling_pct: Mapped[float] = mapped_column(Numeric(6, 4))
     floor_pct: Mapped[float] = mapped_column(Numeric(6, 4))
     # Cutting/rotation order, lowest-position = highest priority (funded
     # first, cut last) — e.g. P2=0, P3=1, P4=2, P5=3. Unique so ordering is
     # always well-defined.
     rotation_position: Mapped[int] = mapped_column(Integer, unique=True)
+    # Guaranteed-funding tier identity (pinned-role task, 2026-08-07) —
+    # "must_pay"/"commitment" (VendorCategory's own .value strings — a
+    # guaranteed row's pinned_role IS its category value, no separate
+    # vocabulary needed) or NULL for an ordinary, fully reorderable/
+    # removable bucket. Decouples allocator.py's guaranteed-tier detection
+    # from this row's bucket_key/display text, which Finance can now freely
+    # rename — see allocator.py's _seed_and_read_buckets()/
+    # priority_bucket_edits.py's remove_bucket(). Nullable so
+    # `_add_missing_columns()`'s bare ALTER TABLE ADD COLUMN applies to a
+    # pre-existing table; backfilled once by
+    # `db/session.py::_backfill_pinned_roles()`.
+    pinned_role: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Config(Base):

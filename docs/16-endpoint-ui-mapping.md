@@ -13,15 +13,14 @@ accounted for below.
 | Method | Path | Router file | React API wrapper | Called from (component) | Note |
 |---|---|---|---|---|---|
 | POST | `/ingestion/load` | `ingestion.py` | — none — | — | Test-only. `POST /master-data/commit-upload` is the real UI upload path and drives the same `backend/ingestion/load_excel.py` machinery under the hood — confirmed by reading `master_data.py`'s commit-upload handler. Intentional, not a gap. |
-| POST | `/master-data/commit-upload` | `master_data.py` | `masterData.ts::commitUpload` (via `api.upload()`, not `api.post()`) | `MainTab.tsx` | Single-button upload, no preview step. |
+| POST | `/master-data/commit-upload` | `master_data.py` | `masterData.ts::commitUpload` (via `api.upload()`, not `api.post()`) | `MainTab.tsx` | Single-button upload, no preview step. Now also accepts an optional `sheet_start_month` form field (P1 demo-readiness task) — `MainTab.tsx`'s small "Sheet start month (optional)" input next to the upload control, blank by default. |
 | POST | `/master-data/revert` | `master_data.py` | `masterData.ts::revertUpload` | `MainTab.tsx` | Restores the one backup slot. |
 | GET | `/master-data/grid` | `master_data.py` | `masterData.ts::getMasterGrid` | `MasterDataGrid.tsx` (rendered inside `MainTab.tsx`) | **Closed since this doc was first written**: was a real gap (no React caller at all); `MasterDataGrid.tsx` now wires it, reloading on mount and after every upload/revert. |
 | GET | `/master-data/extra-fields` | `master_data.py` | `masterData.ts::getExtraFields` | **— none —** | Still unused — `MasterDataGrid.tsx` reads extra-field values/widgets off `GET /master-data/grid`'s own `extra_field_widgets` + per-vendor `values`, not this separate endpoint. Not a gap: nothing needs the standalone list this returns. |
 | PATCH | `/master-data/extra-fields/{vendor_id}` | `master_data.py` | `masterData.ts::patchExtraField` | `MasterDataGrid.tsx` | Closed alongside the grid endpoint above — every `"extra"`-kind cell edit calls this. |
-| POST | `/rollover` | `rollover.py` | **— none —** | — | **No wrapper file, no caller.** Month-end rollover has zero UI entry point in the React app. Flagged prominently below — real, consequential gap. |
 | DELETE | `/config/priority-buckets/{bucket_key}` | `configuration.py` | `configuration.ts::removePriorityBucket` | `ConfigurationTab.tsx` | |
 | DELETE | `/plan-runs/{plan_run_id}` | `plan_runs.py` | `planRuns.ts::deletePlanRun` | `PlanningView.tsx` | |
-| GET | `/audit-log` | `audit_log.py` | **— none —** | — | **No wrapper file, no caller.** No viewer anywhere for the audit trail CLAUDE.md rule 6 requires. Flagged prominently below. |
+| GET | `/audit-log` | `audit_log.py` | `auditLog.ts::getAuditLog` | `ConfigurationTab.tsx` | Closed — Audit Log viewer at the bottom of the Configuration tab (Finance-friendly rework: vendor name/ERP code, plain-language field/source labels, search/source/date filters, pagination, CSV export). |
 | GET | `/calendar/weeks-in-month` | `calendar.py` | `calendar.ts::getWeeksInMonth` | `PlanningView.tsx` | |
 | GET | `/config` | `configuration.py` | **— none —** | — | Generic system-config key/value table (e.g. `backend/shared/scoring.py`'s weights) has no Configuration-tab UI; only `/config/priority-buckets` does. Flag as a gap, may be legitimately deferred until those weights need to be Finance-editable. |
 | GET | `/config/priority-buckets` | `configuration.py` | `configuration.ts::getPriorityBuckets` | `ConfigurationTab.tsx`, `PlanningView.tsx` | |
@@ -48,16 +47,18 @@ accounted for below.
 | POST | `/weekly-view` | `weekly_planning.py` | **— none —** | — | Router's own docstring: a standalone, flexibility/testing wrapper around `build_weekly_view()`, independent of the per-model convenience endpoints, with direct pytest coverage (`backend/api/test_api.py`) but no UI caller by design. Intentionally UI-unmapped — do not delete, do not wire up. |
 | PUT | `/config/priority-buckets/{bucket_key}` | `configuration.py` | `configuration.ts::updatePriorityBucket` | `ConfigurationTab.tsx` | |
 
-34/34 endpoints from the live-router re-grep accounted for above — matches the
-prior scoping pass's count.
+34/34 endpoints accounted for above. `POST /rollover` removed (merge-
+rollover-into-upload task) — the standalone Month-end rollover
+action/router/button is retired; `POST /master-data/commit-upload` now
+does the same new-month check and payment-cycle reset itself, on every
+upload, in the same transaction as the ingestion (see
+`backend/ingestion/upload.py::commit_upload()`).
 
 ## Endpoints with no React caller — summary
 
 | Endpoint | Verdict | Why |
 |---|---|---|
 | `POST /ingestion/load` | Intentional | Test-only; `commit-upload` is the real path. |
-| **`POST /rollover`** | **Real gap — significant** | Recurring month-end operational workflow, zero UI entry point anywhere. |
-| **`GET /audit-log`** | **Real gap — significant** | CLAUDE.md rule 6 requires every override logged; nothing in the UI lets Finance view that log. |
 | `GET /config` | Real gap, likely deferrable | No Configuration-tab UI for the generic system-config table (e.g. scoring weights); only bucket config is wired. |
 | `GET /vendors/{vendor_id}/payments` | Real gap | Vendor detail modal can log a payment but never shows past ones. |
 | `GET /master-data/grid`, `PATCH /master-data/extra-fields/{vendor_id}` | **Closed** | Built into the React app via `MasterDataGrid.tsx` inside `MainTab.tsx` — see the mapping table above. |

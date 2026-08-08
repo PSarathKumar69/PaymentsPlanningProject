@@ -5,7 +5,13 @@ once New Model 2 became the sole model — their config values had no
 remaining caller."""
 from fastapi import APIRouter
 
-from backend.configuration.priority_bucket_edits import add_bucket, list_buckets, remove_bucket, update_bucket
+from backend.configuration.priority_bucket_edits import (
+    add_bucket,
+    list_buckets,
+    remove_bucket,
+    reorder_buckets,
+    update_bucket,
+)
 from backend.db.models import Config
 from backend.db.session import SessionLocal
 from backend.shared.enums import ChangeSource
@@ -14,6 +20,8 @@ from ..schemas.configuration import (
     ConfigRowOut,
     PriorityBucketCreateRequest,
     PriorityBucketOut,
+    PriorityBucketReorderRequest,
+    PriorityBucketReorderResponse,
     PriorityBucketUpdateRequest,
     PriorityBucketUpdateResponse,
 )
@@ -51,15 +59,24 @@ def post_priority_bucket(body: PriorityBucketCreateRequest):
         body.ceiling_pct,
         body.floor_pct,
         body.rotation_position,
+        body.category_name,
         source=ChangeSource.UI_EDIT,
     )
     return {
         "bucket_key": body.bucket_key,
         "display_label": body.display_label,
+        "category_name": body.category_name,
         "ceiling_pct": body.ceiling_pct,
         "floor_pct": body.floor_pct,
         "rotation_position": body.rotation_position,
+        "deletable": True,  # add_bucket() never sets pinned_role — a new row is always removable
     }
+
+
+@router.put("/config/priority-buckets/reorder", response_model=PriorityBucketReorderResponse)
+def put_priority_bucket_order(body: PriorityBucketReorderRequest):
+    changed = reorder_buckets(body.ordered_bucket_keys, source=ChangeSource.UI_EDIT)
+    return {"changed": changed}
 
 
 @router.put("/config/priority-buckets/{bucket_key}", response_model=PriorityBucketUpdateResponse)
@@ -70,6 +87,8 @@ def put_priority_bucket(bucket_key: str, body: PriorityBucketUpdateRequest):
         ceiling_pct=body.ceiling_pct,
         floor_pct=body.floor_pct,
         rotation_position=body.rotation_position,
+        category_name=body.category_name,
+        new_bucket_key=body.new_bucket_key,
         source=ChangeSource.UI_EDIT,
     )
     return {"changed": changed}

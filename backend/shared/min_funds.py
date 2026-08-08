@@ -211,7 +211,7 @@ def _vendor_required_rows(vendors, ledger_by_vendor, as_of=None):
             "vendor_id": vendor.id,
             "erp_code": vendor.erp_code,
             "vendor_name": vendor.vendor_name,
-            "category": vendor.category.value,
+            "category": vendor.category,
             "commitment_months": vendor.commitment_months if vendor.category == VendorCategory.COMMITMENT else None,
             # Live figure everywhere (decision 4) — no static/live split.
             "outstanding_balance": max(float(vendor.opening_balance) - paid_so_far, 0.0),

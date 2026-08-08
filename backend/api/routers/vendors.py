@@ -1,13 +1,15 @@
 """Vendors router — read endpoints plus the single Finance-facing edit route."""
 from fastapi import APIRouter
 
+from backend.configuration.priority_bucket_edits import list_buckets
 from backend.configuration.vendor_edits import update_vendor_field
 from backend.db.models import MonthlyLedger, Payment, Vendor
 from backend.db.session import SessionLocal
+from backend.ingestion.column_mapping import CATEGORY_EXCEL_LABEL
 from backend.shared.aging import compute_vendor_aging
 from backend.shared.constants import MONEY_EPSILON
-from backend.shared.enums import ChangeSource
-from backend.shared.min_funds import min_funds_tranche_breakdown, required_amount
+from backend.shared.enums import ChangeSource, VendorCategory
+from backend.shared.min_funds_v2 import min_funds_tranche_breakdown_v2, required_amount_v2
 from backend.shared.payment_logging import finalize_plan, week_actual_paid
 from backend.shared.plan_history import latest_budget_for_vendor, latest_priority_for_vendor
 
@@ -17,6 +19,7 @@ from ..schemas.vendors import (
     PaymentOut,
     VendorAgingBulkItem,
     VendorAgingOut,
+    VendorCategoryOut,
     VendorOut,
     VendorPatchRequest,
     VendorPatchResponse,
@@ -44,7 +47,7 @@ def _vendor_out(vendor: Vendor) -> dict:
         "vendor_name": vendor.vendor_name,
         "opening_balance": float(vendor.opening_balance),
         "live_outstanding_balance": max(float(vendor.opening_balance) - float(vendor.paid_so_far_this_month), 0.0),
-        "category": vendor.category.value,
+        "category": vendor.category,
         "commitment_months": vendor.commitment_months,
         "assigned_week": vendor.assigned_week,
         "payment_status": vendor.payment_status.value,
@@ -127,18 +130,20 @@ def get_vendor_payment_tracking():
     onto vendorsById via applyPaymentTracking(), the same fetch this table
     already does, rather than adding a second endpoint for one integer.
 
-    min_funds_required is this vendor's own required_amount() figure, but
-    the PRE-payment snapshot (paid_so_far_override=0.0) — not the same live
-    call the Aging card/badge use. Fix (this task): required_amount() is
-    live-payment-aware, so the plain live call shrinks the moment a payment
-    lands (the oldest tranche it's still measuring moves forward), while
-    actual_paid_this_month only ever grows — comparing a growing number
-    against a shrinking one mechanically produces >100% once a vendor is
-    paid past its current oldest tranche. Reconstructing the pre-payment
-    figure on demand (same convention already used for the Aging card's own
-    opening-vs-live split, compute_vendor_aging's already_paid_this_cycle)
-    keeps the percentage meaningful without storing a second copy of the
-    number anywhere.
+    min_funds_required is this vendor's own required_amount_v2() figure
+    (New Model 2's rule, backend/shared/min_funds_v2.py — the same one the
+    Planning table/weekly view already use, not the old
+    min_funds.required_amount() the retired old models used), but the
+    PRE-payment snapshot (paid_so_far_override=0.0) — not the same live
+    call the Aging card/badge use. required_amount_v2() is live-payment-aware,
+    so the plain live call shrinks the moment a payment lands (the oldest
+    tranche it's still measuring moves forward), while actual_paid_this_month
+    only ever grows — comparing a growing number against a shrinking one
+    mechanically produces >100% once a vendor is paid past its current
+    oldest tranche. Reconstructing the pre-payment figure on demand (same
+    convention already used for the Aging card's own opening-vs-live split,
+    compute_vendor_aging's already_paid_this_cycle) keeps the percentage
+    meaningful without storing a second copy of the number anywhere.
     """
     session = SessionLocal()
     try:
@@ -154,13 +159,13 @@ def get_vendor_payment_tracking():
             ledger_rows = (
                 session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
             )
-            min_funds_required, _ = required_amount(vendor, ledger_rows, as_of=None, paid_so_far_override=0.0)
+            min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=None, paid_so_far_override=0.0)
             rows.append(
                 {
                     "vendor_id": vendor.id,
                     "erp_code": vendor.erp_code,
                     "vendor_name": vendor.vendor_name,
-                    "category": vendor.category.value,
+                    "category": vendor.category,
                     "outstanding": outstanding,
                     "budget": budget,
                     "actual_paid_this_month": actual_paid,
@@ -206,7 +211,7 @@ def get_all_vendors_aging():
                 ledger_rows, as_of=None, already_paid_this_cycle=float(vendor.paid_so_far_this_month)
             )
             opening_aging = compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0)
-            min_funds_total, min_funds_tranches = min_funds_tranche_breakdown(vendor, ledger_rows)
+            min_funds_total, min_funds_tranches = min_funds_tranche_breakdown_v2(vendor, ledger_rows)
             results.append(
                 {
                     "vendor_id": vendor.id,
@@ -226,6 +231,39 @@ def get_all_vendors_aging():
         return results
     finally:
         session.close()
+
+
+@router.get("/vendors/categories", response_model=list[VendorCategoryOut])
+def list_vendor_categories():
+    """Read-only category value/label source (CLAUDE.md rule 7) — the
+    category SET is Must Pay/Commitment (fixed, never a Configuration row)
+    plus every live category_name currently in the priority_buckets table
+    (Configuration-tab-rebuild task: this used to be a fixed 4-member
+    Python enum; now Finance can add a category through Configuration and
+    it appears here immediately, no code change). P2/P3/P4 all share the
+    "Normal" category_name today — deduped to one entry.
+
+    Registered ABOVE /vendors/{vendor_id} deliberately — same
+    static-before-dynamic-route reason documented on
+    GET /vendors/payment-tracking above.
+    """
+    fixed = [
+        {"value": VendorCategory.MUST_PAY.value, "label": CATEGORY_EXCEL_LABEL[VendorCategory.MUST_PAY]},
+        {"value": VendorCategory.COMMITMENT.value, "label": CATEGORY_EXCEL_LABEL[VendorCategory.COMMITMENT]},
+    ]
+    seen = {c["value"] for c in fixed}
+    # CATEGORY_EXCEL_LABEL is keyed by VendorCategory members, whose .value
+    # equals Normal/Inactive's own category_name here — a custom category
+    # has no such translation, so its own name IS the label (same fallback
+    # vendor_edits.py's _excel_cell_value() already uses).
+    value_to_label = {c.value: CATEGORY_EXCEL_LABEL[c] for c in VendorCategory}
+    live = []
+    for bucket in list_buckets():
+        name = bucket["category_name"]
+        if name not in seen:
+            seen.add(name)
+            live.append({"value": name, "label": value_to_label.get(name, name)})
+    return fixed + live
 
 
 @router.get("/vendors/{vendor_id}", response_model=VendorOut)
@@ -260,9 +298,10 @@ def get_vendor_aging(vendor_id: int):
         # docs/04 carry-forward fix: the vendor detail card's own "Min Funds
         # calculation" table (frontend only shows this before a plan exists
         # this cycle, per docs/04's two-step flow) — recomputed fresh from
-        # the real ledger/payments every call, nothing stored. 0.0/[] for
-        # Must Pay/Commitment (this fix is Normal-vendor-only).
-        min_funds_total, min_funds_tranches = min_funds_tranche_breakdown(vendor, ledger_rows)
+        # the real ledger/payments every call, nothing stored. Real total is
+        # still returned for Must Pay/Commitment (their own required_amount()
+        # rule); tranches stays [] for them (no tranche concept).
+        min_funds_total, min_funds_tranches = min_funds_tranche_breakdown_v2(vendor, ledger_rows)
         return {
             "oldest_tranche_month": aging.oldest_tranche_month,
             "oldest_bucket": aging.oldest_bucket,
@@ -297,8 +336,18 @@ def get_vendor_payments(vendor_id: int):
 
 @router.patch("/vendors/{vendor_id}", response_model=VendorPatchResponse)
 def patch_vendor(vendor_id: int, body: VendorPatchRequest):
-    old_value, new_value = update_vendor_field(
+    result = update_vendor_field(
         vendor_id, body.field, body.new_value, source=ChangeSource.UI_EDIT, session=None, excel_path=body.excel_path
     )
     to_plain = lambda v: v.value if hasattr(v, "value") else v
-    return {"old_value": to_plain(old_value), "new_value": to_plain(new_value)}
+    response = {"old_value": to_plain(result[0]), "new_value": to_plain(result[1])}
+    if result.sibling_update is not None:
+        sibling_field, sibling_old, sibling_new = result.sibling_update
+        response.update(
+            sibling_field=sibling_field,
+            sibling_old_value=to_plain(sibling_old),
+            sibling_new_value=to_plain(sibling_new),
+        )
+    if result.commitment_months_warning is not None:
+        response["commitment_months_warning"] = result.commitment_months_warning
+    return response

@@ -8,8 +8,45 @@
     background-size: 110px 28px;
   }
 
+  /* Thin, low-profile scrollbar for every scrollable panel/table — visible
+     (unlike the old fully-hidden bar) but small and muted so it doesn't
+     compete with content. */
+  .thin-scrollbar { scrollbar-width: thin; scrollbar-color: rgba(16, 124, 65, 0.35) transparent; }
+  .thin-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+  .thin-scrollbar::-webkit-scrollbar-track { background: transparent; }
+  .thin-scrollbar::-webkit-scrollbar-thumb {
+    background-color: rgba(16, 124, 65, 0.35);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  .thin-scrollbar::-webkit-scrollbar-thumb:hover { background-color: rgba(16, 124, 65, 0.55); }
+  .thin-scrollbar::-webkit-scrollbar-corner { background: transparent; }
+
   /* Scrollable, but the scrollbar chrome itself stays hidden — content still
      scrolls (drag, trackpad, wheel, arrow keys), just without a visible bar. */
   .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
   .no-scrollbar::-webkit-scrollbar { display: none; }
+
+  /* One scroll container per table (both axes on the SAME element —
+     splitting x/y across nested divs breaks position:sticky, see below),
+     vertical bar visible/thin, horizontal bar hidden but still functional
+     (drag/wheel/trackpad). Needs one element, not nested overflow-x-auto +
+     overflow-y-auto divs: per the CSS overflow spec, setting only
+     overflow-x to non-visible forces the browser to compute overflow-y as
+     auto too, so a nested "overflow-x-auto" div silently becomes its own
+     (empty, never-scrolling) y-scroll container — sticky thead/column then
+     locks onto THAT box instead of the real one and never actually freezes. */
+  .table-scroll { overflow: auto; scrollbar-width: thin; scrollbar-color: rgba(16, 124, 65, 0.35) transparent; }
+  .table-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+  .table-scroll::-webkit-scrollbar:horizontal { height: 0; }
+  .table-scroll::-webkit-scrollbar-track { background: transparent; }
+  .table-scroll::-webkit-scrollbar-thumb {
+    background-color: rgba(16, 124, 65, 0.35);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  .table-scroll::-webkit-scrollbar-thumb:hover { background-color: rgba(16, 124, 65, 0.55); }
+  .table-scroll::-webkit-scrollbar-corner { background: transparent; }
 }

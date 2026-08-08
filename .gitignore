@@ -7,6 +7,7 @@ __pycache__/
 *.db
 *.db.backup_*
 *.db.bak
+*.bak-erpfix-*
 demo.db*
 
 # Excel backups the app writes on config edits (docs/11 write-back rule)
@@ -19,3 +20,14 @@ data/*.xlsx
 .DS_Store
 .vscode/
 .idea/
+
+# Frontend / Vercel
+node_modules/
+frontend/dist/
+frontend/.vercel/
+.vercel/
+
+# Local-only tooling / dangerous scripts — never pushed
+reset_realdb.py
+_claude_verify_snapshot.tar.gz
+.claude/

@@ -76,6 +76,52 @@ def test_vendor_talking_points_endpoint_end_to_end(seeded_client, monkeypatch):
     assert data["script_text"].startswith("MOCKED SCRIPT")
 
 
+def test_vendor_talking_points_default_format_uses_talking_prompt(seeded_client, monkeypatch):
+    import backend.ai_layer.gemini_client as gemini_client
+
+    captured = {}
+
+    def fake_generate(prompt):
+        captured["prompt"] = prompt
+        return "MOCKED"
+
+    monkeypatch.setattr(gemini_client, "generate_text", fake_generate)
+
+    generate = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 1_000_000_000, "planning_month": "2026-08"},
+    )
+    vendor_id = generate.json()["plan"]["allocations"][0]["vendor_id"]
+
+    resp = seeded_client.post("/ai/vendor-talking-points", json={"vendor_id": vendor_id})
+    assert resp.status_code == 200
+    assert "WHAT THE SCRIPT ITSELF MUST SOUND LIKE" in captured["prompt"]
+
+
+def test_vendor_talking_points_email_format_passes_through_to_email_prompt(seeded_client, monkeypatch):
+    import backend.ai_layer.gemini_client as gemini_client
+
+    captured = {}
+
+    def fake_generate(prompt):
+        captured["prompt"] = prompt
+        return "MOCKED EMAIL"
+
+    monkeypatch.setattr(gemini_client, "generate_text", fake_generate)
+
+    generate = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 1_000_000_000, "planning_month": "2026-08"},
+    )
+    vendor_id = generate.json()["plan"]["allocations"][0]["vendor_id"]
+
+    resp = seeded_client.post("/ai/vendor-talking-points", json={"vendor_id": vendor_id, "format": "email"})
+    assert resp.status_code == 200
+    assert resp.json()["script_text"] == "MOCKED EMAIL"
+    assert "WHAT THE EMAIL ITSELF MUST SOUND LIKE" in captured["prompt"]
+    assert "Dear [Vendor Name] team" in captured["prompt"]
+
+
 def test_vendor_talking_points_with_no_plan_yet_is_400(seeded_client, monkeypatch):
     _mock_gemini(monkeypatch)
     vendor_id = seeded_client.get("/vendors").json()[0]["id"]

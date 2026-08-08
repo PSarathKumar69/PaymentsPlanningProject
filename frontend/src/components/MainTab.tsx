@@ -1,9 +1,10 @@
 import React, { useRef, useState } from 'react';
 import { UploadCloud, RotateCcw } from 'lucide-react';
 import { commitUpload, revertUpload } from '../api/masterData';
-import { MasterDataCommitResult } from '../types';
+import { getCurrentPlanningMonth, getSuggestedPlanningMonth } from '../api/newModel2';
 import { ApiError } from '../api/client';
 import { ToastVariant } from './NotificationToast';
+import { UploadConfirmModal } from './UploadConfirmModal';
 import { MasterDataGrid } from './MasterDataGrid';
 
 interface MainTabProps {
@@ -11,43 +12,83 @@ interface MainTabProps {
   onUploaded?: () => void;
 }
 
-interface UploadHistoryEntry {
-  filename: string;
-  result: MasterDataCommitResult;
-}
+const currentMonthValue = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
 
-// Upload + revert — one file pick, one action, takes effect immediately
-// (no preview/confirm step, backend/ingestion/upload.py's own design).
+// Upload flow (revised): picking/dropping a file no longer commits
+// immediately — it opens UploadConfirmModal first, pre-filled with the
+// current cycle's planning month (or the sheet's suggested next month if
+// none is set yet). Only Confirm & Upload actually calls commitUpload();
+// Cancel discards the picked file with no request made. Kept deliberately
+// minimal (Sarath's call): no Sheet start month field in the modal — that
+// override still exists server-side (commitUpload()'s optional param),
+// just no longer surfaced here; the backend uses whatever's configured.
 //
-// Scope note (flagged, not silently solved): the backend keeps exactly ONE
-// backup slot (commit_upload()/revert_upload()), overwritten every commit,
-// and stores no filename/timestamp for past uploads server-side — the
-// audit log's own "excel_upload" entries are per-vendor field-change
-// summaries, not a reconstructable per-upload event list. `uploadHistory`
-// below is THIS SESSION's list only (the filename comes from the browser's
-// own File object at upload time, never persisted) — a real cross-session
-// history needs a backend change (store filename/timestamp per commit),
-// not something this tab can reconstruct on its own.
+// Upload history card removed (Sarath's call — this session's own list was
+// never more than a same-session filename feed anyway, see the old
+// Scope note this replaced: the backend keeps exactly ONE backup slot
+// (commit_upload()/revert_upload()), overwritten every commit, and stores
+// no filename/timestamp for past uploads server-side, so there was never a
+// real cross-session history to show here). The upload card now spans the
+// full width; "Revert to previous upload" moved into its header, and the
+// most recent upload's AI-column-mapping warning (if any) renders as its
+// own banner right below the card instead of inside a per-upload history
+// list — CLAUDE.md's "loud but non-blocking" banner still needs somewhere
+// to live even without a history feed.
 export const MainTab: React.FC<MainTabProps> = ({ onNotify, onUploaded }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isHovering, setIsHovering] = useState(false);
-  const [uploadHistory, setUploadHistory] = useState<UploadHistoryEntry[]>([]);
+  const [lastUploadWarnings, setLastUploadWarnings] = useState<string[]>([]);
   const [isReverting, setIsReverting] = useState(false);
+  // Bumped on every successful upload/revert — MasterDataGrid.tsx's own
+  // refetch signal, scoped to this tab (separate from App.tsx's
+  // refreshSignal, which drives PlanningView instead).
   const [gridRefreshSignal, setGridRefreshSignal] = useState(0);
 
-  const handleUpload = async (file: File) => {
+  // ---- upload confirm modal ------------------------------------------------
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [planningMonthInput, setPlanningMonthInput] = useState(currentMonthValue());
+
+  const openConfirmModal = async (file: File) => {
+    setPendingFile(file);
+    // Pre-fill Planning Month: current cycle's already-set value if one
+    // exists, else the sheet's suggested next month — never left blank.
+    try {
+      const current = await getCurrentPlanningMonth();
+      if (current.planning_month) {
+        setPlanningMonthInput(current.planning_month);
+      } else {
+        const suggested = await getSuggestedPlanningMonth();
+        if (suggested.suggested_planning_month) setPlanningMonthInput(suggested.suggested_planning_month);
+      }
+    } catch {
+      // Leave the calendar-default pre-fill in place — Finance can still edit it.
+    }
+  };
+
+  const handleConfirmUpload = async () => {
+    if (!pendingFile) return;
     setIsUploading(true);
     try {
-      const result = await commitUpload(file);
-      setUploadHistory((prev) => [{ filename: file.name, result }, ...prev]);
-      onNotify?.(
-        `Upload committed — ${result.vendors_changed} vendor(s) changed ` +
-          `(${result.new_vendor_count} new, ${result.vendors_with_changed_ledger_count} with a changed ledger figure).`,
-        'success'
-      );
+      const result = await commitUpload(pendingFile, planningMonthInput);
+      setLastUploadWarnings(result.ai_column_mapping_messages);
       setGridRefreshSignal((n) => n + 1);
+      // Month-end cycle reset (merge-rollover-into-upload task): only
+      // mentioned when it actually happened — the ordinary same-month
+      // correction case stays exactly as quiet as it was before this task,
+      // no "nothing reset" clutter.
+      let message =
+        `Upload committed — ${result.vendors_changed} vendor(s) changed ` +
+        `(${result.new_vendor_count} new, ${result.vendors_with_changed_ledger_count} with a changed ledger figure).`;
+      if (result.cycle_reset) {
+        message += ` New payment cycle started — ${result.vendors_reset} vendor(s) reset for the new month.`;
+      }
+      onNotify?.(message, 'success');
+      setPendingFile(null);
       onUploaded?.();
     } catch (e) {
       onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
@@ -60,8 +101,8 @@ export const MainTab: React.FC<MainTabProps> = ({ onNotify, onUploaded }) => {
     setIsReverting(true);
     try {
       const result = await revertUpload();
-      onNotify?.(`Reverted. ${result.warning}`, 'success');
       setGridRefreshSignal((n) => n + 1);
+      onNotify?.(`Reverted. ${result.warning}`, 'success');
     } catch (e) {
       onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
     } finally {
@@ -88,7 +129,7 @@ export const MainTab: React.FC<MainTabProps> = ({ onNotify, onUploaded }) => {
   };
 
   return (
-    <div className="flex flex-col min-h-full w-full gap-6 max-w-5xl mx-auto">
+    <div className="flex flex-col min-h-full w-full gap-6">
       <div className="flex-1 flex flex-col justify-center items-center text-center pt-6">
         <h1 className="text-4xl sm:text-[44px] md:text-[48px] font-extrabold text-[#107c41] tracking-tight leading-tight select-none">
           Vendor Payment Planning
@@ -99,100 +140,92 @@ export const MainTab: React.FC<MainTabProps> = ({ onNotify, onUploaded }) => {
         </p>
       </div>
 
-      <div className="flex-1 flex items-center justify-center">
-        <div
-          onClick={() => !isUploading && fileInputRef.current?.click()}
-          onMouseEnter={() => setIsHovering(true)}
-          onMouseLeave={() => setIsHovering(false)}
-          onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
-          onDragLeave={() => setIsDragOver(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setIsDragOver(false);
-            const file = e.dataTransfer.files?.[0];
-            if (file) handleUpload(file);
-          }}
-          style={dashedBorderStyle}
-          className={`w-[84%] min-w-[384px] max-w-3xl h-full ${isDragOver ? 'bg-emerald-50/20' : 'bg-white'} hover:bg-emerald-50/20 rounded-2xl p-6 flex flex-col items-center justify-center gap-3 transition-colors cursor-pointer group shadow-sm select-none relative overflow-hidden`}
+      {pendingFile && (
+        <UploadConfirmModal
+          fileName={pendingFile.name}
+          planningMonth={planningMonthInput}
+          onPlanningMonthChange={setPlanningMonthInput}
+          isUploading={isUploading}
+          onConfirm={handleConfirmUpload}
+          onCancel={() => !isUploading && setPendingFile(null)}
+        />
+      )}
+
+      {/* Full width: upload card — drag-drop area + Upload Excel button, with
+          Revert tucked into its top-left corner (Upload history card removed
+          — Sarath's call, see the comment above the component). */}
+      <div
+        onClick={() => !isUploading && fileInputRef.current?.click()}
+        onMouseEnter={() => setIsHovering(true)}
+        onMouseLeave={() => setIsHovering(false)}
+        onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragOver(false);
+          const file = e.dataTransfer.files?.[0];
+          if (file) openConfirmModal(file);
+        }}
+        style={dashedBorderStyle}
+        className={`min-h-56 ${isDragOver ? 'bg-emerald-50/20' : 'bg-white'} hover:bg-emerald-50/20 rounded-2xl p-6 flex flex-col items-center justify-center gap-3 transition-colors cursor-pointer group shadow-sm select-none relative overflow-hidden`}
+      >
+        <div className="absolute top-3 right-4 text-[10px] font-mono text-emerald-700/40 tracking-widest pointer-events-none select-none hidden sm:block font-semibold">
+          XLSX • EXCEL ENGINE
+        </div>
+
+        <button
+          type="button"
+          disabled={isReverting}
+          onClick={(e) => { e.stopPropagation(); handleRevert(); }}
+          title="Restores the one backup slot the backend keeps"
+          className="absolute top-3 left-4 text-xs text-gray-400 hover:text-[#107c41] font-medium flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
         >
-          <div className="absolute top-3 right-4 text-[10px] font-mono text-emerald-700/40 tracking-widest pointer-events-none select-none hidden sm:block font-semibold">
-            XLSX • EXCEL ENGINE
-          </div>
+          <RotateCcw className="w-3.5 h-3.5" />
+          Revert to previous upload
+        </button>
 
-          <div className="w-12 h-12 rounded-xl bg-emerald-50 group-hover:bg-[#107c41] text-[#107c41] group-hover:text-white flex items-center justify-center transition-colors shadow-2xs border border-emerald-200">
-            <UploadCloud className="w-6 h-6 transition-transform group-hover:scale-110" />
-          </div>
-
-          <div className="flex flex-col items-center text-center gap-1">
-            <span className="text-base font-bold text-gray-900 group-hover:text-[#107c41] transition-colors">
-              {isUploading ? 'Uploading…' : 'Upload Vendor Excel Master Sheet'}
-            </span>
-            <span className="text-xs text-gray-500 max-w-sm">
-              Drag & drop your Excel sheet here or click to browse files — takes effect immediately
-            </span>
-          </div>
-
-          <button
-            type="button"
-            disabled={isUploading}
-            onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
-            className="mt-1 bg-[#107c41] hover:bg-[#0d6535] active:scale-[0.98] disabled:opacity-50 text-white font-bold py-2.5 px-6 rounded-xl text-xs shadow-xs transition-all flex items-center gap-2 group-hover:shadow-md cursor-pointer"
-          >
-            <UploadCloud className="w-4 h-4 text-white shrink-0" />
-            <span>Upload Excel</span>
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".xlsx"
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f); e.target.value = ''; }}
-            className="hidden"
-          />
+        <div className="w-12 h-12 rounded-xl bg-emerald-50 group-hover:bg-[#107c41] text-[#107c41] group-hover:text-white flex items-center justify-center transition-colors shadow-2xs border border-emerald-200">
+          <UploadCloud className="w-6 h-6 transition-transform group-hover:scale-110" />
         </div>
-      </div>
 
-      <div className="flex items-center justify-center mb-4">
-        <div className="bg-white border border-gray-200/90 rounded-xl p-5 shadow-xs flex flex-col gap-3 w-[84%] min-w-[384px] max-w-3xl">
-          <div className="flex items-center justify-between pb-2 border-b border-gray-100">
-            <h3 className="text-sm font-bold text-gray-900">Upload history</h3>
-            <button
-              type="button"
-              disabled={isReverting}
-              onClick={handleRevert}
-              title="Restores the one backup slot the backend keeps"
-              className="text-xs text-gray-500 hover:text-[#107c41] font-medium flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Revert to previous upload
-            </button>
-          </div>
-          {uploadHistory.length === 0 ? (
-            <p className="text-xs text-gray-400">No upload yet this session — uploaded file names appear here as you go.</p>
-          ) : (
-            <ul className="flex flex-col gap-2.5">
-              {uploadHistory.map((entry, i) => (
-                <li key={i} className={i > 0 ? 'pt-2.5 border-t border-gray-100' : ''}>
-                  <p className="text-xs text-gray-700">
-                    <span className="font-semibold text-gray-900">{entry.filename}</span>
-                    {' — '}
-                    {entry.result.vendors_changed} vendor(s) changed ({entry.result.new_vendor_count} new,{' '}
-                    {entry.result.vendors_with_changed_ledger_count} with a changed ledger figure).
-                  </p>
-                  {entry.result.ai_column_mapping_messages.length > 0 && (
-                    <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/60 rounded-lg p-2.5 mt-1.5">
-                      {entry.result.ai_column_mapping_messages.join(' ')}
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
+        <div className="flex flex-col items-center text-center gap-1">
+          <span className="text-base font-bold text-gray-900 group-hover:text-[#107c41] transition-colors">
+            Upload Vendor Excel Master Sheet
+          </span>
+          <span className="text-xs text-gray-500 max-w-sm">
+            Drag & drop your Excel sheet here or click to browse files
+          </span>
         </div>
+
+        <button
+          type="button"
+          disabled={isUploading}
+          onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+          className="mt-1 bg-[#107c41] hover:bg-[#0d6535] active:scale-[0.98] disabled:opacity-50 text-white font-bold py-2.5 px-6 rounded-xl text-xs shadow-xs transition-all flex items-center gap-2 group-hover:shadow-md cursor-pointer"
+        >
+          <UploadCloud className="w-4 h-4 text-white shrink-0" />
+          <span>Upload Excel</span>
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx"
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) openConfirmModal(f); e.target.value = ''; }}
+          className="hidden"
+        />
       </div>
 
-      <div className="w-full pb-4">
-        <MasterDataGrid onNotify={onNotify} refreshSignal={gridRefreshSignal} />
-      </div>
+      {/* Most recent upload's AI-column-mapping warning, if any — loud but
+          non-blocking (CLAUDE.md), previously shown per-entry inside the
+          now-removed Upload history list. */}
+      {lastUploadWarnings.length > 0 && (
+        <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/60 rounded-lg p-2.5">
+          {lastUploadWarnings.join(' ')}
+        </div>
+      )}
+
+      {/* Full width below: the real Master Grid (docs/18 — no longer dead code). */}
+      <MasterDataGrid onNotify={onNotify} refreshSignal={gridRefreshSignal} />
     </div>
   );
 };

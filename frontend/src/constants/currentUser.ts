@@ -4,7 +4,7 @@
 // isolated here instead of scattered literal strings in each component, so
 // it's unmistakably a placeholder and a one-line swap once real auth lands.
 export const PLACEHOLDER_CURRENT_USER = {
-  initials: 'SK',
-  name: 'Sarath Kumar',
+  initials: 'P',
+  name: 'Pankaj',
   role: 'Finance Admin',
 };

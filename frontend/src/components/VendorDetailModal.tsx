@@ -1,16 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import { getVendorAging } from '../api/vendors';
+import { getVendorAging, getVendorPayments } from '../api/vendors';
 import { getVendorMinFundsRequired } from '../api/newModel2';
 import { postPayment } from '../api/payments';
-import { postTalkingScripts } from '../api/aiCompanion';
 import { ApiError } from '../api/client';
-import { PlanAllocationRow, Vendor, VendorAging, VendorMinFundsRequired } from '../types';
-import { ALLOCATION_STATUS_ZERO, STATUS_LABEL } from '../constants/enums';
+import { Payment, Vendor, VendorAging, VendorMinFundsRequired } from '../types';
+import { STATUS_LABEL } from '../constants/enums';
 import { ToastVariant } from './NotificationToast';
 import { ConfirmModal } from './ConfirmModal';
 import { SuccessCheck } from './SuccessCheck';
-import { formatMoney, formatMonthShortYear } from '../utils/format';
+import { AiCompanionCard } from './AiCompanionCard';
+import { formatDateShort, formatMoney, formatMonthShortYear } from '../utils/format';
 
 // Deterministic template sentence (docs/14) — NOT an LLM call (CLAUDE.md
 // rule 3). Mirrors test_ui.html's nm2MinFundsSentence() exactly.
@@ -48,7 +48,6 @@ interface VendorDetailModalProps {
   showPayment: boolean;
   planningMonth: string; // whatever's currently picked on Card 1 — used only before this cycle's first Generate
   hasGeneratedThisCycle: boolean;
-  latestAllocation: PlanAllocationRow | null; // this vendor's row in New Model 2's latest plan_run, if any
   effectiveAmount: number | null; // override-if-set else suggested — prefills the payment amount
   onClose: () => void;
   onPaymentLogged: (paymentStatus: string) => void;
@@ -61,7 +60,6 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
   showPayment,
   planningMonth,
   hasGeneratedThisCycle,
-  latestAllocation,
   effectiveAmount,
   onClose,
   onPaymentLogged,
@@ -71,33 +69,36 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
   const [aging, setAging] = useState<VendorAging | null>(null);
   const [minFunds, setMinFunds] = useState<VendorMinFundsRequired | null>(null);
   const [minFundsError, setMinFundsError] = useState('');
+  const [payments, setPayments] = useState<Payment[] | null>(null);
+  const [paymentsError, setPaymentsError] = useState('');
   const [amount, setAmount] = useState('');
   const [comment, setComment] = useState('');
-  const [scriptText, setScriptText] = useState('');
-  const [scriptLoading, setScriptLoading] = useState(false);
+  const [showAiCard, setShowAiCard] = useState(false);
   const [showPayConfirm, setShowPayConfirm] = useState(false);
   const [paySuccessStatus, setPaySuccessStatus] = useState<string | null>(null);
 
   useEffect(() => {
     getVendorAging(vendor.id).then(setAging);
     if (!showPayment) {
-      // Min Funds Required / AI talking script are "view details" concerns
-      // only — the Pay flow (showPayment) deliberately shows just Aging +
-      // Amount + Comment (Sarath's explicit call), so skip fetching what
-      // won't render anyway.
+      // Min Funds Required / AI talking script / Payment history are "view
+      // details" concerns only — the Pay flow (showPayment) deliberately
+      // shows just Aging + Amount + Comment (Sarath's explicit call), so
+      // skip fetching what won't render anyway.
       if (!hasGeneratedThisCycle && !planningMonth) {
-        setMinFundsError('Pick a planning month on the New Model 2 card above first.');
+        setMinFundsError('Pick a planning month first.');
       } else {
         getVendorMinFundsRequired(vendor.id, hasGeneratedThisCycle ? undefined : planningMonth)
           .then(setMinFunds)
           .catch((e) => setMinFundsError(e instanceof ApiError ? e.message : String(e)));
       }
+      getVendorPayments(vendor.id)
+        .then(setPayments)
+        .catch((e) => setPaymentsError(e instanceof ApiError ? e.message : String(e)));
     }
     if (effectiveAmount != null) setAmount(String(Math.round(effectiveAmount)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendor.id]);
 
-  const status = latestAllocation?.status;
   const parsedAmount = Number(amount.replace(/[^0-9]/g, ''));
 
   const submitPayment = async () => {
@@ -110,21 +111,8 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
     }
   };
 
-  const handleGenerateScript = async () => {
-    if (!latestAllocation) return;
-    setScriptLoading(true);
-    try {
-      const resp = await postTalkingScripts([latestAllocation]);
-      setScriptText(resp.scripts[0]?.script_text || '');
-    } catch (e) {
-      onNotify?.(e instanceof ApiError ? e.message : String(e), 'error');
-    } finally {
-      setScriptLoading(false);
-    }
-  };
-
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-8 overflow-auto no-scrollbar" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-8 overflow-auto thin-scrollbar" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="bg-white rounded-2xl border border-gray-200 shadow-xl w-full max-w-3xl p-6 relative">
         <button onClick={onClose} className="absolute top-3 right-4 text-gray-400 hover:text-gray-700 cursor-pointer" aria-label="Close">
           <X className="w-5 h-5" />
@@ -155,7 +143,7 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
             ) : aging.monthly_breakdown.length === 0 ? (
               <p className="text-xs text-gray-400">No outstanding balance.</p>
             ) : (
-              <div className="overflow-x-auto no-scrollbar">
+              <div className="overflow-x-auto thin-scrollbar">
                 <table className="text-xs">
                   <tbody>
                     <tr>{aging.monthly_breakdown.map((m, i) => <th key={`${m.month}-${i}`} className="px-2.5 py-1 text-[#0c447c] font-semibold text-right">{formatMonthShortYear(m.month)}</th>)}</tr>
@@ -180,19 +168,48 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
             </div>
           )}
 
-          {!showPayment && status === ALLOCATION_STATUS_ZERO && (
+          {!showPayment && (
             <div className="bg-blue-50/60 rounded-lg p-3.5">
-              <h3 className="text-xs font-bold text-[#0c447c] mb-2">AI talking script</h3>
-              <button
-                type="button"
-                disabled={scriptLoading}
-                onClick={handleGenerateScript}
-                className="px-3 py-1.5 bg-[#107c41] hover:bg-[#0d6535] disabled:opacity-50 text-white rounded-lg text-xs font-bold cursor-pointer"
-              >
-                {scriptLoading ? 'Generating…' : scriptText ? 'Regenerate' : 'Generate talking script'}
-              </button>
-              {scriptText && <pre className="text-xs whitespace-pre-wrap bg-white rounded p-2.5 mt-2">{scriptText}</pre>}
+              <h3 className="text-xs font-bold text-[#0c447c] mb-2">Payment history</h3>
+              {paymentsError ? (
+                <p className="text-xs text-gray-400">{paymentsError}</p>
+              ) : !payments ? (
+                <p className="text-xs text-gray-400">Loading…</p>
+              ) : payments.length === 0 ? (
+                <p className="text-xs text-gray-400">No payments logged yet.</p>
+              ) : (
+                <div className="overflow-x-auto thin-scrollbar">
+                  <table className="text-xs w-full">
+                    <thead>
+                      <tr className="text-left text-[#0c447c]">
+                        <th className="px-2.5 py-1 font-semibold">Date</th>
+                        <th className="px-2.5 py-1 font-semibold text-right">Amount</th>
+                        <th className="px-2.5 py-1 font-semibold">Note</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...payments].reverse().map((p) => (
+                        <tr key={p.id}>
+                          <td className="px-2.5 py-1 whitespace-nowrap">{formatDateShort(p.payment_date)}</td>
+                          <td className="px-2.5 py-1 text-right font-semibold text-gray-900">{formatMoney(p.amount)}</td>
+                          <td className="px-2.5 py-1 text-gray-600">{p.note || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
+          )}
+
+          {!showPayment && (
+            <button
+              type="button"
+              onClick={() => setShowAiCard(true)}
+              className="self-start text-xs text-[#107c41] font-semibold hover:underline cursor-pointer"
+            >
+              Ask AI about this vendor
+            </button>
           )}
         </div>
 
@@ -258,6 +275,10 @@ export const VendorDetailModal: React.FC<VendorDetailModalProps> = ({
           </div>
         )}
       </div>
+
+      {showAiCard && (
+        <AiCompanionCard planVendors={[]} preselectedVendor={vendor} onClose={() => setShowAiCard(false)} />
+      )}
     </div>
   );
 };

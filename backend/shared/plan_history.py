@@ -144,6 +144,23 @@ def latest_priority_for_vendor(session, vendor_id):
     return allocation.within_week_order if allocation is not None else None
 
 
+def latest_week_distribution_for_vendor(session, vendor_id):
+    """week_distribution_plan from the same "latest plan_run, any model" row
+    latest_budget_for_vendor()/latest_priority_for_vendor() read.
+
+    Confirmed real bug fix: Vendor.week_distribution_plan itself is only
+    ever written by two manual Finance-edit actions (plan_allocations.py's
+    override-rescale and its own dedicated week-distribution edit) — a
+    vendor nobody has individually edited keeps it None forever, even
+    though planner.py computes a correct per-cycle default (sticky vendor
+    value if one exists, else {assigned_week: effective_amount}) onto
+    every PlanAllocation row, every single generate. This reads THAT
+    already-computed value instead of the near-always-empty Vendor field.
+    None if this vendor has no allocation in any plan_run this cycle."""
+    allocation = _latest_allocation_any_model(session, vendor_id)
+    return allocation.week_distribution_plan if allocation is not None else None
+
+
 def build_plan_run_history_response(session, model_number: int, cycle_month=None) -> dict:
     """Shape returned by GET /models/{n}/plan-runs (model1.py/model2.py/
     model3.py) — see those routers' docstrings for the endpoint contract.
@@ -222,6 +239,12 @@ def build_plan_run_history_response(session, model_number: int, cycle_month=None
                 "month": plan_run.month,
                 "model_used": plan_run.model_used,
                 "funds_figure": float(plan_run.funds_figure) if plan_run.funds_figure is not None else None,
+                "min_funds_required": (
+                    float(plan_run.min_funds_required) if plan_run.min_funds_required is not None else None
+                ),
+                "leftover_remaining": (
+                    float(plan_run.leftover_remaining) if plan_run.leftover_remaining is not None else None
+                ),
                 "allocations": allocation_dicts,
             }
         )

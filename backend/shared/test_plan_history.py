@@ -19,6 +19,7 @@ from backend.db.session import SessionLocal
 from backend.shared.plan_history import (
     build_plan_run_history_response,
     is_latest_plan_run,
+    latest_week_distribution_for_vendor,
     model_family_prefix,
     plan_runs_for_model,
 )
@@ -175,6 +176,76 @@ def test_build_plan_run_history_response_numbers_oldest_as_plan_1_and_exposes_ve
         # The one place distribution IS surfaced: vendor-scoped, live/current,
         # regardless of which plan_run's allocations happen to be in view.
         assert response["vendor_week_distribution_plans"][str(vendor.id)] == {"1": 12345.0}
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_latest_week_distribution_for_vendor_reads_the_allocation_snapshot__dataset_1():
+    """Bug fix, test data set 1: a vendor whose OWN week_distribution_plan
+    was never touched (the real, near-universal production case — nobody
+    ever went through plan_allocations.py's manual edit endpoints) must
+    still get the correct value back from their latest allocation row."""
+    session = SessionLocal()
+    try:
+        month = _cycle_month(session)
+        vendor = _unallocated_vendor(session)
+        plan_run = _plan_run(session, "model2", _FUTURE.replace(hour=9), month)
+        session.add(
+            PlanAllocation(
+                plan_run_id=plan_run.id,
+                vendor_id=vendor.id,
+                assigned_week=3,
+                allocated_amount=4200.0,
+                week_distribution_plan={"3": 4200.0},
+            )
+        )
+        session.flush()
+
+        assert vendor.week_distribution_plan is None
+        assert latest_week_distribution_for_vendor(session, vendor.id) == {"3": 4200.0}
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_latest_week_distribution_for_vendor_reads_the_allocation_snapshot__dataset_2():
+    """Bug fix, test data set 2: a DIFFERENT vendor, a DIFFERENT multi-week
+    split, and TWO plan_runs (an initial generate plus a later
+    regeneration) — must read the LATEST one's snapshot, not the first."""
+    session = SessionLocal()
+    try:
+        month = _cycle_month(session)
+        vendor = _unallocated_vendor(session)
+        older_run = _plan_run(session, "model2", _FUTURE.replace(hour=10), month)
+        newer_run = _plan_run(session, "model2_regeneration", _FUTURE.replace(hour=11), month)
+        session.add(
+            PlanAllocation(
+                plan_run_id=older_run.id, vendor_id=vendor.id, assigned_week=1,
+                allocated_amount=1000.0, week_distribution_plan={"1": 1000.0},
+            )
+        )
+        session.add(
+            PlanAllocation(
+                plan_run_id=newer_run.id, vendor_id=vendor.id, assigned_week=2,
+                allocated_amount=6500.75, week_distribution_plan={"2": 3000.0, "5": 3500.75},
+            )
+        )
+        session.flush()
+
+        assert vendor.week_distribution_plan is None
+        assert latest_week_distribution_for_vendor(session, vendor.id) == {"2": 3000.0, "5": 3500.75}
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_latest_week_distribution_for_vendor_returns_none_when_vendor_has_no_allocation_at_all():
+    session = SessionLocal()
+    try:
+        vendor = _unallocated_vendor(session)
+        session.flush()
+        assert latest_week_distribution_for_vendor(session, vendor.id) is None
     finally:
         session.rollback()
         session.close()

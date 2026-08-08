@@ -12,12 +12,17 @@ import tailwindcss from '@tailwindcss/vite'
 const API_BASE = process.env.VITE_API_BASE || 'http://localhost:8000'
 const API_PATH_PREFIXES = [
   '/vendors', '/models', '/plan-allocations', '/plan-runs', '/payments',
-  '/master-data', '/config', '/audit-log', '/ai', '/ingestion', '/rollover', '/calendar',
+  '/master-data', '/config', '/audit-log', '/ai', '/ingestion', '/rollover', '/calendar', '/analytics',
 ]
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: Object.fromEntries(API_PATH_PREFIXES.map((p) => [p, { target: API_BASE, changeOrigin: true }])),
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    globals: true,
   },
 })

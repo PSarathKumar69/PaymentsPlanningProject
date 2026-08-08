@@ -13,6 +13,58 @@
 
 export class ApiError extends Error {}
 
+// Bug fix: a filename with spaces (every real download name here has them,
+// e.g. "Vendor Payment Plan - Aug-2026 - ....xlsx") makes Starlette's
+// FileResponse emit the RFC 5987 extended form (`filename*=utf-8''...`,
+// percent-encoded) instead of a plain `filename="..."` — confirmed by
+// reading starlette/responses.py's FileResponse.__init__, which switches
+// forms whenever `urllib.parse.quote(filename) != filename` (true for any
+// space). The old `/filename="?([^"]+)"?/` regex only ever matched the
+// plain form, so it silently returned null on every one of these
+// downloads, forever, and every caller fell back to its hardcoded literal
+// name — which is why the browser kept appending "(1)", "(2)"... to the
+// same literal filename on every repeat download.
+export function parseContentDispositionFilename(disposition: string | null): string | null {
+  if (!disposition) return null;
+  const extended = disposition.match(/filename\*=(?:UTF-8|utf-8)''([^;]+)/);
+  if (extended) {
+    try {
+      return decodeURIComponent(extended[1]);
+    } catch {
+      return extended[1];
+    }
+  }
+  const plain = disposition.match(/filename="?([^";]+)"?/);
+  return plain ? plain[1] : null;
+}
+
+// Standard browser fetch reason phrases — exactly what `res.statusText`
+// returns when the backend crashed with no real JSON `detail` body (an
+// unhandled exception, not a raised HTTPException/ValueError with an
+// actual human-authored message). A genuine backend-authored message would
+// essentially never be byte-identical to one of these, so this is a safe,
+// precise way to tell "real Finance-facing message" apart from "the
+// backend just fell over" without touching how errors are caught/thrown.
+const GENERIC_HTTP_REASON_PHRASES = new Set([
+  'Bad Request', 'Unauthorized', 'Forbidden', 'Not Found', 'Method Not Allowed',
+  'Conflict', 'Unprocessable Entity', 'Internal Server Error', 'Bad Gateway',
+  'Service Unavailable', 'Gateway Timeout',
+]);
+
+// Finance-facing error text: a real ApiError with a real backend message
+// (something a human wrote for this exact situation, e.g. "Can't remove a
+// category still assigned to a vendor") is shown as-is. Anything else — a
+// network failure, an unhandled backend crash, a raw JS exception string —
+// is replaced with a short, plain fallback; the real error still goes to
+// the console for debugging.
+export function friendlyErrorMessage(e: unknown, fallback = 'Something went wrong — please try again.'): string {
+  if (e instanceof ApiError && e.message && !GENERIC_HTTP_REASON_PHRASES.has(e.message)) {
+    return e.message;
+  }
+  console.error(e);
+  return fallback;
+}
+
 // FastAPI's own validation-error envelope puts `detail` as an ARRAY of
 // {loc, msg, type} objects, not a string — passing that straight to
 // `new Error(...)` stringifies it to the literally useless "[object
@@ -42,9 +94,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T;
 }
 
-async function upload<T>(path: string, file: File): Promise<T> {
+async function upload<T>(path: string, file: File, extraFields?: Record<string, string>): Promise<T> {
   const formData = new FormData();
   formData.append('file', file);
+  if (extraFields) {
+    for (const [key, value] of Object.entries(extraFields)) {
+      formData.append(key, value);
+    }
+  }
   const res = await fetch(path, { method: 'POST', body: formData });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -59,5 +116,5 @@ export const api = {
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   delete: <T>(path: string) => request<T>('DELETE', path),
-  upload: <T>(path: string, file: File) => upload<T>(path, file),
+  upload: <T>(path: string, file: File, extraFields?: Record<string, string>) => upload<T>(path, file, extraFields),
 };

@@ -1,10 +1,20 @@
 import { api } from './client';
 import { ExtraField, MasterDataCommitResult, MasterDataRevertResult, MasterGrid } from '../types';
 
-// Single button, one file, one POST — takes effect immediately, no
-// preview/confirm step (backend/ingestion/upload.py's own explicit design).
-export const commitUpload = (file: File) =>
-  api.upload<MasterDataCommitResult>('/master-data/commit-upload', file);
+// One POST, now gated behind the upload confirm modal (Main-tab
+// upload-confirm task) rather than firing immediately on file pick/drop.
+// planningMonth ("YYYY-MM"): Finance's confirmed planning month for this
+// cycle, from that modal — optional so any caller that omits it leaves the
+// persisted value untouched. sheetStartMonth ("YYYY-MM"): still a real,
+// optional server-side override (P1 demo-readiness task) — the confirm
+// modal no longer surfaces it (Sarath's call, kept the card minimal), so
+// every current caller omits it and the backend just uses whatever's
+// currently configured.
+export const commitUpload = (file: File, planningMonth?: string, sheetStartMonth?: string) =>
+  api.upload<MasterDataCommitResult>('/master-data/commit-upload', file, {
+    ...(planningMonth ? { planning_month: planningMonth } : {}),
+    ...(sheetStartMonth ? { sheet_start_month: sheetStartMonth } : {}),
+  });
 
 // Restores the ONE backup slot the backend keeps (commit_upload() overwrites
 // it every time, never versioned/timestamped) — there is no endpoint for an

@@ -5,6 +5,7 @@ import sys
 import tempfile
 from datetime import date
 
+import openpyxl
 import pytest
 
 from backend.ingestion.column_mapping import parse_assigned_week_order, to_number
@@ -34,6 +35,143 @@ def test_to_number():
     assert to_number(" ") == 0.0
     assert to_number(5000) == 5000.0
     assert to_number("5000") == 5000.0
+
+
+def test_load_duplicate_erp_code_same_entity_first_row_wins_and_warns_loudly(tmp_path):
+    """Confirmed real bug (2026-07-31 investigation), narrowed by the
+    entity-code-collision fix: a SAME-ENTITY ERP code collision (e.g. the
+    real sheet's ARS "INC" pair — two different vendors typo'd onto one
+    code) is a genuine data-entry error, not two entities legitimately
+    sharing a bare code (see the different-entity test below for that
+    case). The per-(entity, erp_code) upsert must still not let the later
+    row silently overwrite the earlier one. First-row-wins (Sarath's later
+    call, superseding the original last-row-wins fix): the later row is
+    skipped entirely, never even read — loud either way, via a note naming
+    the code, entity, every row, and the winner.
+    """
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "dup.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    sheet_map = build_sheet_map(ws)
+    # Fixture's two real rows: VT0001/"Alpha Freight Services" (row 2),
+    # VT0002/"Bravo Industrial Supplies" (row 3), both entity "ARS" — give
+    # row 3 row 2's own erp_code (same entity on both), matching the real
+    # sheet's ARS "INC" collision shape exactly.
+    ws.cell(row=3, column=sheet_map.erp_code_col, value="VT0001")
+    wb.save(path)
+
+    os.environ["PAYMENTS_DB_PATH"] = os.path.join(tempfile.mkdtemp(), "test.db")
+    for mod in ("backend.db.session", "backend.ingestion.load_excel"):
+        sys.modules.pop(mod, None)
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import load
+
+    report = load(excel_path=path)
+
+    assert len(report["duplicate_erp_code_notes"]) == 1
+    note = report["duplicate_erp_code_notes"][0]
+    assert "VT0001" in note and "ARS" in note and "Alpha Freight Services" in note  # names code, entity, winner
+    assert "distinct ERP code" in note  # explicit, not left looking resolved
+    assert note in report["data_quality_notes"]  # also surfaced through the existing notes channel
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).count() == 1  # collapsed to one row, upload still succeeds
+        vendor = session.query(Vendor).filter_by(erp_code="VT0001").one()
+        assert vendor.vendor_name == "Alpha Freight Services"  # first row (row 2) won
+    finally:
+        session.close()
+
+
+def test_load_duplicate_erp_code_different_entities_both_kept(tmp_path):
+    """Entity-code-collision fix, the actual bug: 28 real pairs in the
+    master sheet are two DIFFERENT legal entities (ARS/FP) sharing one bare
+    numeric code, disambiguated by the sheet's own "Unique" column — this
+    is not a duplicate at all, and both vendors must be ingested as
+    separate, live rows (Vendor's real uniqueness key is (entity,
+    erp_code), models.py), not silently collapsed to one."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "dup_entities.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    sheet_map = build_sheet_map(ws)
+    # Same bare erp_code as row 2, but a DIFFERENT entity — this is the
+    # ARS/FP "V00149" shape, not a real duplicate.
+    ws.cell(row=3, column=sheet_map.erp_code_col, value="VT0001")
+    ws.cell(row=3, column=sheet_map.entity_col, value="FP")
+    wb.save(path)
+
+    os.environ["PAYMENTS_DB_PATH"] = os.path.join(tempfile.mkdtemp(), "test.db")
+    for mod in ("backend.db.session", "backend.ingestion.load_excel"):
+        sys.modules.pop(mod, None)
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import load
+
+    report = load(excel_path=path)
+
+    assert report["duplicate_erp_code_notes"] == []  # not flagged — different entities, not a real duplicate
+
+    session = SessionLocal()
+    try:
+        vendors = session.query(Vendor).filter_by(erp_code="VT0001").order_by(Vendor.entity).all()
+        assert len(vendors) == 2  # both entities' vendors kept, not collapsed
+        assert {v.entity for v in vendors} == {"ARS", "FP"}
+        assert {v.vendor_name for v in vendors} == {"Alpha Freight Services", "Bravo Industrial Supplies"}
+    finally:
+        session.close()
+
+
+def test_load_negative_payment_cell_treated_as_overpayment(tmp_path):
+    """Confirmed with Finance: a negative Payment cell means an over-payment
+    (more than what was billed) recorded with the wrong sign — it must be
+    applied as a real payment of that magnitude (balance goes DOWN), not
+    added back on as extra debt (the old, backwards behavior)."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "negpay.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    sheet_map = build_sheet_map(ws)
+    first_month, payment_col = sheet_map.payment_cols[0]
+    ws.cell(row=2, column=payment_col, value=-332000)
+    wb.save(path)
+
+    os.environ["PAYMENTS_DB_PATH"] = os.path.join(tempfile.mkdtemp(), "test.db")
+    for mod in ("backend.db.session", "backend.ingestion.load_excel"):
+        sys.modules.pop(mod, None)
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import load
+
+    report = load(excel_path=path)
+    assert any("negative payment cell" in note for note in report["data_quality_notes"])
+
+    session = SessionLocal()
+    try:
+        vendor = session.query(Vendor).filter_by(erp_code=ws.cell(row=2, column=sheet_map.erp_code_col).value).one()
+        row = (
+            session.query(MonthlyLedger)
+            .filter_by(vendor_id=vendor.id, month=first_month)
+            .one()
+        )
+        assert row.payment == 332000  # stored corrected/positive, never the raw negative
+        assert row.closing_balance == row.opening_balance + row.payable - 332000  # balance went DOWN
+    finally:
+        session.close()
 
 
 def test_load_real_sheet_reconciles():

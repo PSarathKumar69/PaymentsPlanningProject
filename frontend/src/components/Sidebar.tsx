@@ -51,7 +51,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside
-      className={`relative bg-white border-r border-gray-200 flex flex-col justify-between transition-all duration-300 ease-in-out shrink-0 select-none h-full z-20 ${
+      className={`relative bg-white border border-gray-200 rounded-2xl shadow-2xs overflow-hidden flex flex-col justify-between transition-all duration-300 ease-in-out shrink-0 select-none h-full z-20 ${
         isCollapsed ? 'w-[68px]' : 'w-[200px]'
       }`}
       aria-label="Sidebar navigation"
@@ -68,7 +68,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
           <button
             onClick={() => setIsCollapsed((prev) => !prev)}
-            className={`p-1.5 text-gray-400 hover:text-[#107c41] hover:bg-emerald-50/60 rounded-md transition-colors ${
+            className={`p-1.5 text-gray-400 hover:text-[#107c41] hover:bg-emerald-50/60 rounded-lg transition-colors ${
               isCollapsed ? 'mx-auto' : ''
             }`}
             title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
@@ -135,7 +135,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {!isCollapsed && (
             <button
               onClick={onLogoutClick}
-              className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-md transition-colors shrink-0"
+              className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
               title="Sign out"
               aria-label="Sign out"
             >

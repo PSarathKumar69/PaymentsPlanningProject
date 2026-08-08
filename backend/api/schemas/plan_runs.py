@@ -29,6 +29,11 @@ class PlanRunOut(BaseModel):
     month: date
     model_used: str
     funds_figure: float | None
+    # Funds Left card fix: both were silently dropped by response_model
+    # before this — same undeclared-key bug class as ai_column_mapping_messages
+    # and leftover_topup_total. NULL on rows that predate these columns.
+    min_funds_required: float | None
+    leftover_remaining: float | None
     allocations: list[PlanRunAllocationOut]
 
 

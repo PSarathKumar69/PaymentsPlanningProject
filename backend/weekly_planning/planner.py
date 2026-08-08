@@ -40,8 +40,10 @@ import pandas as pd
 
 from backend.db.models import PlanAllocation, PlanRun
 from backend.db.session import SessionLocal
+from backend.models.new_model_2.allocator import _seed_and_read_buckets
 from backend.shared.scoring import score_vendors
-from backend.shared.min_funds import _load_vendors_and_ledger, required_amount
+from backend.shared.min_funds import _load_vendors_and_ledger
+from backend.shared.min_funds_v2 import required_amount_v2
 from backend.shared.payment_logging import week_actual_paid
 from backend.weekly_planning.calendar_utils import week_for_date
 
@@ -68,6 +70,23 @@ def build_weekly_view(
         vendor_by_id = {v.id: v for v in vendors}
         allocated_by_vendor = dict(zip(vendor_allocations["vendor_id"], vendor_allocations["allocated_amount"]))
         scores = score_vendors(session=session, as_of=as_of).set_index("vendor_id")["score"]
+        # Within-week execution order rank (docs/06, confirmed with Sarath):
+        # Must Pay/Commitment first, then the real, DB-backed bucket_order
+        # in its own live sequence — never a hardcoded P0/P1/P2-P5 list
+        # (CLAUDE.md rule 7). bucket_order is already sorted by
+        # rotation_position (allocator.py's _seed_and_read_buckets(), which
+        # pinned rows default to but aren't locked into — pinned-role task),
+        # so a vendor's rank is simply its own bucket's position in that
+        # live sequence, no separate pinned-row special case needed.
+        bucket_order, _, _, _, _ = _seed_and_read_buckets(session)
+        tag_rank = {bucket: i for i, bucket in enumerate(bucket_order)}
+        # Undecided edge case, flagged (house style, see allocator.py's own
+        # FALLBACK_BUCKET comment): a vendor can carry no priority_tag at all
+        # (allocator.py's own defensive-fallback comment confirms this
+        # happens). docs/06's confirmation doesn't say what to do with one —
+        # ranked one past every real tag, i.e. dead last within their week,
+        # rather than erroring or defaulting to first/highest.
+        untagged_rank = len(tag_rank)
         today = date.today()
         # planning_month=None (every pre-existing caller) keeps the exact
         # prior behavior — always pull forward against today's real week.
@@ -84,7 +103,7 @@ def build_weekly_view(
             if not vendor.assigned_week:  # None or 0 -> not part of this cycle's plan
                 continue
             ledger_rows = ledger_by_vendor[vendor.id]
-            minimum_required, rule = required_amount(vendor, ledger_rows, as_of=as_of)
+            minimum_required, rule = required_amount_v2(vendor, ledger_rows, as_of=as_of)
             rows.append(
                 {
                     "vendor_id": vendor.id,
@@ -96,6 +115,7 @@ def build_weekly_view(
                     "assigned_week": max(vendor.assigned_week, current_week),
                     "minimum_required": minimum_required,
                     "rule": rule,
+                    "priority_tag": vendor.priority_tag,
                     "actual_planned": allocated_by_vendor.get(vendor.id, 0.0),
                     "score": scores.get(vendor.id, 0.0),
                     # Live, never stored redundantly — real payments already
@@ -119,13 +139,20 @@ def build_weekly_view(
             weekly_summary = pd.DataFrame(columns=["minimum_required", "actual_planned"])
             weekly_summary.index.name = "assigned_week"
         else:
-            # DEFAULT — confirm with Sarath: within-week execution order uses
-            # the shared vendor score (backend/shared/scoring.py), highest
-            # first (ties broken by original row order).
-            detail["within_week_order"] = (
-                detail.groupby("assigned_week")["score"].rank(method="first", ascending=False).astype(int)
-            )
-            detail = detail.sort_values(["assigned_week", "within_week_order"]).reset_index(drop=True)
+            # CONFIRMED (docs/06): within-week execution order is priority
+            # tag first (P0/P1, then the live bucket_order), score only
+            # breaking ties within the same tag — no longer pure score.
+            detail["_tag_rank"] = detail["priority_tag"].map(tag_rank).fillna(untagged_rank).astype(int)
+            # kind="mergesort": stable, so vendors tied on both tag and score
+            # still break by original row order, same tiebreak the old
+            # score-only rank() gave via method="first".
+            detail = detail.sort_values(
+                ["assigned_week", "_tag_rank", "score"], ascending=[True, True, False], kind="mergesort"
+            ).reset_index(drop=True)
+            # Dense 1..N per week (same contract as before — plan_history.py
+            # and vendors.py both read this as a plain rank, not a sort key).
+            detail["within_week_order"] = detail.groupby("assigned_week").cumcount() + 1
+            detail = detail.drop(columns="_tag_rank")
             weekly_summary = detail.groupby("assigned_week")[["minimum_required", "actual_planned"]].sum()
 
         plan_run_id = None
@@ -154,20 +181,36 @@ def build_weekly_view(
                     # task) — stamp whatever it currently is onto the fresh
                     # row directly. Only a brand-new vendor with no
                     # distribution edit yet at all this month (still None)
-                    # falls back to the original default: the full suggested
-                    # amount under this row's own assigned_week, every other
-                    # week blank. Deliberately NOT written back onto the
-                    # vendor here — see plan_history.py's
+                    # falls back to the original default: the full EFFECTIVE
+                    # amount (override, if Finance has set one, else the
+                    # model's own suggested figure) under this row's own
+                    # assigned_week, every other week blank. Deliberately NOT
+                    # written back onto the vendor here — see plan_history.py's
                     # build_plan_run_history_response() for why (this
                     # per-row default must keep re-deriving fresh every
                     # regeneration for as long as Finance hasn't actually
                     # edited a week; freezing it here the first time it's
                     # computed would stop it from following a later
                     # assigned_week/amount change).
+                    #
+                    # Bug fix: this used to seed from row.actual_planned (the
+                    # raw suggested amount) unconditionally, so a vendor who
+                    # already had an override BEFORE this regeneration still
+                    # got the week bucket reseeded to their pre-override
+                    # suggested figure — override+regenerate silently
+                    # reverted the weekly amount back to the old number.
+                    # float(...): Vendor.override_amount is a Numeric column,
+                    # which SQLAlchemy loads back as decimal.Decimal (not
+                    # float) whenever a vendor already has a real, persisted
+                    # override — json (week_distribution_plan's column type)
+                    # can't serialize Decimal, so this would otherwise crash
+                    # the very next regeneration for any vendor with an
+                    # existing override.
+                    effective_amount = float(override_amount) if override_amount is not None else row.actual_planned
                     week_distribution_plan = (
                         vendor.week_distribution_plan
                         if vendor.week_distribution_plan is not None
-                        else {str(row.assigned_week): row.actual_planned}
+                        else {str(row.assigned_week): effective_amount}
                     )
                     allocation = PlanAllocation(
                         plan_run_id=plan_run.id,
@@ -178,8 +221,8 @@ def build_weekly_view(
                         override_amount=override_amount,
                         week_distribution_plan=week_distribution_plan,
                         # Frozen denominator (this task's fix) — the same
-                        # required_amount() call already made a few lines up
-                        # for this row, not recomputed.
+                        # required_amount_v2() call already made a few lines
+                        # up for this row, not recomputed.
                         required_amount_snapshot=row.minimum_required,
                     )
                     session.add(allocation)
@@ -205,12 +248,19 @@ def build_weekly_view(
             # Not persisted -> no real row to stamp, but still reflect the
             # vendor's current sticky week_distribution_plan (if any) rather
             # than always showing the plain default, same convention as the
-            # persist=True branch above.
+            # persist=True branch above — including the same effective-
+            # amount (override, if set, else suggested) fix.
             detail["week_distribution_plan"] = detail.apply(
                 lambda r: (
                     vendor_by_id[r["vendor_id"]].week_distribution_plan
                     if vendor_by_id[r["vendor_id"]].week_distribution_plan is not None
-                    else {str(r["assigned_week"]): r["actual_planned"]}
+                    else {
+                        str(r["assigned_week"]): (
+                            float(vendor_by_id[r["vendor_id"]].override_amount)
+                            if vendor_by_id[r["vendor_id"]].override_amount is not None
+                            else r["actual_planned"]
+                        )
+                    }
                 ),
                 axis=1,
             )

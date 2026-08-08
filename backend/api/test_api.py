@@ -3,7 +3,7 @@ pytest backend/api/test_api.py
 
 Never touches the real backend/db/app.db or data/Vendor's Details.xlsx.
 Follows the same isolation convention already used by
-backend/ingestion/test_load_excel.py and backend/month_end/test_rollover.py:
+backend/ingestion/test_load_excel.py and backend/ingestion/test_upload.py:
 point PAYMENTS_DB_PATH at a fresh temp file and pop every cached `backend.*`
 module so the whole import graph (app -> routers -> models -> db.session)
 re-binds to that temp DB. A temp copy of the real Excel is used for
@@ -16,7 +16,7 @@ function -> response JSON, and that ValueError surfaces as 400.
 """
 import shutil
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 import os
 
@@ -28,9 +28,9 @@ from backend.ingestion.load_excel import EXCEL_PATH
 
 def _fresh_app(tmp_path):
     """Forces the entire backend.* import graph to re-bind against a brand
-    new temp SQLite file, same re-import trick the existing ingestion/
-    rollover tests use — just applied to every backend module instead of a
-    hand-picked few, since the API pulls in the whole graph at once."""
+    new temp SQLite file, same re-import trick the existing ingestion tests
+    use — just applied to every backend module instead of a hand-picked
+    few, since the API pulls in the whole graph at once."""
     os.environ["PAYMENTS_DB_PATH"] = str(tmp_path / "test.db")
     for name in list(sys.modules):
         if name == "backend" or name.startswith("backend."):
@@ -88,6 +88,56 @@ def test_vendor_aging_and_payments(seeded_client):
     assert resp.json() == []  # nothing logged yet
 
 
+@pytest.mark.parametrize("erp_code", ["V00193", "V00204", "V00194", "V00393", "V00226"])
+def test_vendor_aging_min_funds_required_matches_the_planning_table_rule(seeded_client, erp_code):
+    """Bug fix: GET /vendors/{id}/aging and GET /vendors/aging used to call
+    the retired old-model min_funds.min_funds_tranche_breakdown() — for
+    these 5 real vendors that disagrees with the Planning table's own
+    required_amount_v2() figure (the old rule returns 0.0 for all five;
+    their real outstanding money is in an older month the old Must Pay
+    rule — "last month's own payable only" — never looks at). Confirmed
+    real cases from the min-funds-verification-export Exceptions
+    investigation. Both the single-vendor and bulk aging endpoints must
+    now agree with the Planning table for every one of them.
+    """
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.shared.min_funds_v2 import required_amount_v2
+
+    session = SessionLocal()
+    try:
+        vendor = session.query(Vendor).filter_by(erp_code=erp_code).one()
+        vendor_id = vendor.id
+        ledger_rows = session.query(MonthlyLedger).filter_by(vendor_id=vendor_id).order_by(MonthlyLedger.month).all()
+        expected_total, _ = required_amount_v2(vendor, ledger_rows)
+    finally:
+        session.close()
+
+    single = seeded_client.get(f"/vendors/{vendor_id}/aging").json()
+    assert single["min_funds_required"] == pytest.approx(expected_total, abs=0.01)
+    assert sum(t["remaining_amount"] for t in single["min_funds_tranches"]) == pytest.approx(expected_total, abs=0.01)
+
+    bulk = seeded_client.get("/vendors/aging").json()
+    bulk_item = next(item for item in bulk if item["vendor_id"] == vendor_id)
+    assert bulk_item["min_funds_required"] == pytest.approx(expected_total, abs=0.01)
+    assert single["min_funds_required"] == bulk_item["min_funds_required"]
+
+
+def test_vendor_categories_endpoint_matches_the_shared_enum(seeded_client):
+    """P2 demo-polish task: the frontend's category dropdown reads from
+    here instead of hardcoding its own copy — confirms every
+    backend/shared/enums.py::VendorCategory member is present with a
+    non-empty label, and that this static route isn't shadowed by the
+    dynamic /vendors/{vendor_id} route registered after it."""
+    from backend.shared.enums import VendorCategory
+
+    resp = seeded_client.get("/vendors/categories")
+    assert resp.status_code == 200
+    categories = resp.json()
+    assert {c["value"] for c in categories} == {c.value for c in VendorCategory}
+    assert all(c["label"] for c in categories)
+
+
 def test_patch_vendor_writes_db_and_audit_log(seeded_client, tmp_path):
     vendor_id = seeded_client.get("/vendors").json()[0]["id"]
     patch_excel = str(tmp_path / "patch_copy.xlsx")
@@ -105,7 +155,7 @@ def test_patch_vendor_writes_db_and_audit_log(seeded_client, tmp_path):
 
     resp = seeded_client.get("/audit-log", params={"vendor_id": vendor_id})
     assert resp.status_code == 200
-    assert any(row["field_name"] == "commitment_months" for row in resp.json())
+    assert any(row["field_name"] == "commitment_months" for row in resp.json()["items"])
 
 
 def test_patch_vendor_invalid_field_is_400(seeded_client):
@@ -118,7 +168,7 @@ def test_patch_vendor_invalid_field_is_400(seeded_client):
 # ---- AI layer — talking scripts (Gemini mocked, never a real network call) --------
 
 
-def _seed_zero_status_vendor(client):
+def _seed_zero_status_vendor(client, tmp_path):
     """New Model 2's floor percentages (10%/25%) mean a real vendor's
     allocation almost never rounds to literal zero purely from a tiny
     available_funds figure (unlike the old score-based models) — a vendor
@@ -128,14 +178,28 @@ def _seed_zero_status_vendor(client):
     filtered out of the plan entirely) but small enough that
     `allocated = required_amount * floor_pct(25%) = 0.5` still lands under
     MONEY_EPSILON, regardless of what the rest of the real dataset looks
-    like."""
+    like.
+
+    Bug fix: these PATCHes used to omit `excel_path`, so update_vendor_field()
+    fell back to its own default (the real EXCEL_PATH) and wrote straight
+    into the real production master Excel — confirmed to actually create a
+    stray "Priority Tag" column there (the real header is "Prioity") and
+    silently overwrite a real vendor's Category cell. Every vendor-editing
+    PATCH in this file must pass its own tmp_path copy, never the real file.
+    """
+    patch_excel = str(tmp_path / "seed_zero_status_patch.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
     vendor_id = _seed_known_balance_vendor(client, amount=2.0)
-    client.patch(f"/vendors/{vendor_id}", json={"field": "category", "new_value": "normal"})
-    client.patch(f"/vendors/{vendor_id}", json={"field": "priority_tag", "new_value": "P2"})
+    client.patch(
+        f"/vendors/{vendor_id}", json={"field": "category", "new_value": "normal", "excel_path": patch_excel}
+    )
+    client.patch(
+        f"/vendors/{vendor_id}", json={"field": "priority_tag", "new_value": "P2", "excel_path": patch_excel}
+    )
     return vendor_id
 
 
-def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch):
+def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch, tmp_path):
     import backend.ai_layer.gemini_client as gemini_client
 
     monkeypatch.setattr(
@@ -143,7 +207,7 @@ def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch
         "generate_text",
         lambda prompt: "**Why we're not paying this cycle**\n- test\n\n**Talking points (step by step)**\n- test",
     )
-    _seed_zero_status_vendor(seeded_client)
+    _seed_zero_status_vendor(seeded_client, tmp_path)
 
     plan_resp = seeded_client.post(
         "/models/5/generate-plan-and-weekly-view",
@@ -161,10 +225,10 @@ def test_ai_talking_scripts_only_for_zero_status_rows(seeded_client, monkeypatch
     assert all("Why we're not paying this cycle" in s["script_text"] for s in scripts)
 
 
-def test_ai_talking_scripts_missing_key_is_400(seeded_client, monkeypatch):
+def test_ai_talking_scripts_missing_key_is_400(seeded_client, monkeypatch, tmp_path):
     monkeypatch.setenv("GEMINI_API_KEY", "your-gemini-api-key-here")
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    _seed_zero_status_vendor(seeded_client)
+    _seed_zero_status_vendor(seeded_client, tmp_path)
 
     plan_resp = seeded_client.post(
         "/models/5/generate-plan-and-weekly-view",
@@ -198,6 +262,73 @@ def test_patch_vendor_invalid_category_value_is_400(seeded_client):
 # of deleting that coverage outright.
 
 NM2_PLANNING_MONTH = "2026-08"  # arbitrary but fixed, matches test_new_model_2_router.py's own convention
+
+
+# ---- Planning month persistence (Main-tab upload-confirm task) -----------
+
+
+def test_minimum_funds_required_no_planning_month_is_400_when_nothing_resolvable(seeded_client):
+    """seeded_client only ever ran /ingestion/load — no plan_run, and no
+    planning_month ever confirmed via commit-upload — so the newly-optional
+    param must still 400 rather than silently guessing a month."""
+    resp = seeded_client.get("/models/5/minimum-funds-required")
+    assert resp.status_code == 400
+
+
+def _commit_upload_with_planning_month(client, excel_copy, tmp_path, monkeypatch, planning_month):
+    import backend.ingestion.upload as upload_module
+
+    fake_master = str(tmp_path / "master.xlsx")
+    shutil.copy(excel_copy, fake_master)
+    fake_backup = str(tmp_path / "master.backup.xlsx")
+    monkeypatch.setattr(upload_module, "EXCEL_PATH", fake_master)
+    monkeypatch.setattr(upload_module, "MASTER_EXCEL_BACKUP_PATH", fake_backup)
+    with open(excel_copy, "rb") as f:
+        resp = client.post(
+            "/master-data/commit-upload",
+            data={"planning_month": planning_month},
+            files={"file": ("upload.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+    assert resp.status_code == 200
+    return resp
+
+
+def test_minimum_funds_required_no_planning_month_resolves_from_persisted_config(seeded_client, excel_copy, tmp_path, monkeypatch):
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
+    resp = seeded_client.get("/models/5/minimum-funds-required")
+    assert resp.status_code == 200
+    assert resp.json()["planning_month"] == NM2_PLANNING_MONTH
+
+
+def test_current_planning_month_endpoint_reflects_persisted_config_then_latest_plan_run(seeded_client, excel_copy, tmp_path, monkeypatch):
+    resp = seeded_client.get("/models/5/current-planning-month")
+    assert resp.json()["planning_month"] is None  # nothing resolvable yet
+
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
+    resp = seeded_client.get("/models/5/current-planning-month")
+    assert resp.json()["planning_month"] == NM2_PLANNING_MONTH
+
+    # Once a plan_run exists, that (not the persisted config value) wins —
+    # same fallback order _resolve_planning_month() itself uses.
+    later_month = "2026-09"
+    resp = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": 100_000, "planning_month": later_month},
+    )
+    assert resp.status_code == 200
+    resp = seeded_client.get("/models/5/current-planning-month")
+    assert resp.json()["planning_month"] == later_month
+
+
+def test_generate_plan_falls_back_to_persisted_planning_month_when_no_plan_run_exists(seeded_client, excel_copy, tmp_path, monkeypatch):
+    """Nothing explicit passed in the request body, and no PlanRun exists yet
+    this cycle — must still resolve via the persisted config value set by a
+    prior commit-upload, not 400."""
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
+    resp = seeded_client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": 100_000})
+    assert resp.status_code == 200
+    resp = seeded_client.get("/models/5/plan-runs")
+    assert resp.json()["plan_runs"][-1]["month"].startswith(NM2_PLANNING_MONTH)
 
 
 def test_new_model_2_generate_plan_and_weekly_view_returns_both_pieces(seeded_client):
@@ -292,7 +423,7 @@ def test_override_endpoint_valid_override_succeeds_and_audit_logs(seeded_client)
     assert body["override_amount"] == pytest.approx(override_amount)
     assert body["effective_amount"] == pytest.approx(override_amount)
 
-    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()
+    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()["items"]
     assert any(
         a["field_name"] == "vendor.override_amount" and float(a["new_value"]) == pytest.approx(override_amount)
         for a in audit
@@ -308,7 +439,7 @@ def test_override_endpoint_rejects_above_opening_balance(seeded_client):
     assert resp.status_code == 400
 
     # Rejected — override must not have been written to the audit log.
-    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()
+    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()["items"]
     assert not any(a["new_value"] and float(a["new_value"]) == pytest.approx(too_much) for a in audit)
 
 
@@ -412,7 +543,7 @@ def test_delete_plan_run_hard_deletes_audits_and_latest_falls_back(seeded_client
     vendor_id = first["vendor_id"]
     second = _nm2_row_for_vendor(seeded_client, vendor_id, available_funds=150_000)
 
-    audit_before = len(seeded_client.get("/audit-log").json())
+    audit_before = seeded_client.get("/audit-log").json()["total"]
 
     resp = seeded_client.delete(f"/plan-runs/{second['plan_run_id']}")
     assert resp.status_code == 200
@@ -426,9 +557,9 @@ def test_delete_plan_run_hard_deletes_audits_and_latest_falls_back(seeded_client
     assert first["plan_run_id"] in ids  # untouched
 
     audit_after = seeded_client.get("/audit-log").json()
-    assert len(audit_after) == audit_before + 1  # exactly one new entry, no AuditLog row removed
-    assert audit_after[0]["field_name"] == "plan_run_deleted"  # order_by(id.desc()) -> most recent first
-    assert str(second["plan_run_id"]) in audit_after[0]["old_value"]
+    assert audit_after["total"] == audit_before + 1  # exactly one new entry, no AuditLog row removed
+    assert audit_after["items"][0]["field_name"] == "plan_run_deleted"  # order_by(id.desc()) -> most recent first
+    assert str(second["plan_run_id"]) in audit_after["items"][0]["old_value"]
 
     # Latest-plan_run fallback (confirmed, intended behavior, not a bug to
     # guard against): with Plan 2 gone, Plan 1 is now correctly recognized
@@ -511,7 +642,7 @@ def test_week_distribution_patch_writes_an_audit_log_entry(seeded_client):
     )
     assert resp.status_code == 200
 
-    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()
+    audit = seeded_client.get("/audit-log", params={"vendor_id": row["vendor_id"]}).json()["items"]
     assert any(
         a["field_name"] == "plan_allocation.week_distribution_plan" and '"2": 42.0' in a["new_value"] for a in audit
     )
@@ -852,6 +983,50 @@ def test_vendor_payment_tracking_zero_before_any_payment(seeded_client):
     assert row["actual_paid_this_month"] == 0.0
     assert row["balance_outstanding"] == pytest.approx(1_200_000.0)
     assert row["balance"] == pytest.approx(row["budget"])  # nothing paid yet -> balance == budget
+
+
+def test_vendor_payment_tracking_min_funds_required_uses_v2_not_old_formula(seeded_client):
+    """Confirmed real bug (2026-07-31 investigation, vendor V00400): this
+    endpoint's min_funds_required was calling the OLD, retired-model-era
+    required_amount() (backend/shared/min_funds.py) — for a Must Pay
+    vendor that's just "last month's own payable" — instead of New Model
+    2's required_amount_v2() (backend/shared/min_funds_v2.py), the figure
+    the Planning table/weekly view already show. Constructed so the two
+    formulas disagree: an older 500,000 tranche that's > 50% of the latest
+    900,000 tranche makes v2 return the oldest tranche ALONE (500,000,
+    rule v2_oldest_only), while the old Must-Pay branch would have
+    returned just the latest month's raw payable (900,000).
+    """
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.shared.enums import VendorCategory
+
+    vendor_id = seeded_client.get("/vendors").json()[0]["id"]
+    session = SessionLocal()
+    try:
+        vendor = session.query(Vendor).filter_by(id=vendor_id).one()
+        vendor.category = VendorCategory.MUST_PAY
+        vendor.opening_balance = 1_400_000.0
+        vendor.paid_so_far_this_month = 0.0
+        session.query(MonthlyLedger).filter_by(vendor_id=vendor_id).delete()
+        session.add(
+            MonthlyLedger(
+                vendor_id=vendor_id, month=date(2025, 9, 1), payable=500_000.0, payment=0.0,
+                opening_balance=0.0, closing_balance=500_000.0,
+            )
+        )
+        session.add(
+            MonthlyLedger(
+                vendor_id=vendor_id, month=date(2026, 6, 1), payable=900_000.0, payment=0.0,
+                opening_balance=500_000.0, closing_balance=1_400_000.0,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    row = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == vendor_id)
+    assert row["min_funds_required"] == pytest.approx(500_000.0)  # v2_oldest_only, NOT 900,000
 
 
 def test_vendor_payment_tracking_reflects_a_logged_payment(seeded_client):
@@ -1338,10 +1513,15 @@ def test_config_priority_buckets_crud_round_trip(seeded_client):
     assert "P6" not in {b["bucket_key"] for b in resp.json()}
 
 
-def test_config_priority_bucket_remove_blocked_when_vendor_tagged(seeded_client):
+def test_config_priority_bucket_remove_blocked_when_vendor_tagged(seeded_client, tmp_path):
+    patch_excel = str(tmp_path / "priority_bucket_patch.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
     vendors = seeded_client.get("/vendors").json()
     normal_vendor = next(v for v in vendors if v["category"] == "normal")
-    resp = seeded_client.patch(f"/vendors/{normal_vendor['id']}", json={"field": "priority_tag", "new_value": "P3"})
+    resp = seeded_client.patch(
+        f"/vendors/{normal_vendor['id']}",
+        json={"field": "priority_tag", "new_value": "P3", "excel_path": patch_excel},
+    )
     assert resp.status_code == 200
 
     resp = seeded_client.delete("/config/priority-buckets/P3")
@@ -1361,10 +1541,99 @@ def test_audit_log_list(seeded_client, tmp_path):
 
     resp = seeded_client.get("/audit-log")
     assert resp.status_code == 200
-    assert len(resp.json()) >= 1
+    assert resp.json()["total"] >= 1
+    assert len(resp.json()["items"]) >= 1
 
 
-# ---- Ops: ingestion & rollover (temp DB/Excel only) -------------------------
+def test_audit_log_includes_vendor_name_and_erp_code(seeded_client, tmp_path):
+    vendor = seeded_client.get("/vendors").json()[0]
+    patch_excel = str(tmp_path / "audit_copy.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
+    seeded_client.patch(
+        f"/vendors/{vendor['id']}", json={"field": "commitment_months", "new_value": 2, "excel_path": patch_excel}
+    )
+
+    items = seeded_client.get("/audit-log", params={"vendor_id": vendor["id"]}).json()["items"]
+    assert any(
+        row["vendor_name"] == vendor["vendor_name"] and row["erp_code"] == vendor["erp_code"] for row in items
+    )
+
+
+def test_audit_log_search_matches_vendor_name_or_erp_code(seeded_client, tmp_path):
+    vendor = seeded_client.get("/vendors").json()[0]
+    patch_excel = str(tmp_path / "audit_copy.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
+    seeded_client.patch(
+        f"/vendors/{vendor['id']}", json={"field": "commitment_months", "new_value": 2, "excel_path": patch_excel}
+    )
+
+    by_name = seeded_client.get("/audit-log", params={"search": vendor["vendor_name"][:4]}).json()["items"]
+    assert any(row["vendor_id"] == vendor["id"] for row in by_name)
+
+    by_erp = seeded_client.get("/audit-log", params={"search": vendor["erp_code"]}).json()["items"]
+    assert any(row["vendor_id"] == vendor["id"] for row in by_erp)
+
+    no_match = seeded_client.get("/audit-log", params={"search": "no-such-vendor-xyz"}).json()["items"]
+    assert no_match == []
+
+
+def test_audit_log_source_filter(seeded_client, tmp_path):
+    vendor = seeded_client.get("/vendors").json()[0]
+    patch_excel = str(tmp_path / "audit_copy.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
+    seeded_client.patch(
+        f"/vendors/{vendor['id']}", json={"field": "commitment_months", "new_value": 2, "excel_path": patch_excel}
+    )
+
+    ui_edits = seeded_client.get("/audit-log", params={"source": "ui_edit"}).json()["items"]
+    assert all(row["source"] == "ui_edit" for row in ui_edits)
+    assert any(row["vendor_id"] == vendor["id"] for row in ui_edits)
+
+    none_of_this_source = seeded_client.get("/audit-log", params={"source": "excel_upload"}).json()["items"]
+    assert all(row["vendor_id"] != vendor["id"] for row in none_of_this_source)
+
+
+def test_audit_log_date_range_filter(seeded_client, tmp_path):
+    vendor_id = seeded_client.get("/vendors").json()[0]["id"]
+    patch_excel = str(tmp_path / "audit_copy.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
+    seeded_client.patch(
+        f"/vendors/{vendor_id}", json={"field": "commitment_months", "new_value": 2, "excel_path": patch_excel}
+    )
+
+    today = date.today().isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    future = (date.today() + timedelta(days=2)).isoformat()
+
+    in_range = seeded_client.get("/audit-log", params={"date_from": today, "date_to": tomorrow}).json()
+    assert in_range["total"] >= 1
+
+    out_of_range = seeded_client.get("/audit-log", params={"date_from": tomorrow, "date_to": future}).json()
+    assert out_of_range["total"] == 0
+    assert out_of_range["items"] == []
+
+
+def test_audit_log_pagination(seeded_client, tmp_path):
+    vendor = seeded_client.get("/vendors").json()[0]
+    patch_excel = str(tmp_path / "audit_copy.xlsx")
+    shutil.copy(EXCEL_PATH, patch_excel)
+    for months in (2, 3, 4):
+        seeded_client.patch(
+            f"/vendors/{vendor['id']}", json={"field": "commitment_months", "new_value": months, "excel_path": patch_excel}
+        )
+
+    full = seeded_client.get("/audit-log", params={"vendor_id": vendor["id"]}).json()
+    assert full["total"] >= 3
+
+    page1 = seeded_client.get("/audit-log", params={"vendor_id": vendor["id"], "limit": 2, "offset": 0}).json()
+    page2 = seeded_client.get("/audit-log", params={"vendor_id": vendor["id"], "limit": 2, "offset": 2}).json()
+    assert len(page1["items"]) == 2
+    assert page1["total"] == full["total"] == page2["total"]
+    assert [r["id"] for r in page1["items"]] != [r["id"] for r in page2["items"]]
+    assert page1["items"][0]["id"] not in [r["id"] for r in page2["items"]]
+
+
+# ---- Ops: ingestion (temp DB/Excel only) -------------------------------
 
 
 def test_ingestion_load_end_to_end(client, excel_copy):
@@ -1373,13 +1642,3 @@ def test_ingestion_load_end_to_end(client, excel_copy):
     body = resp.json()
     assert body["vendor_count"] == 83
     assert body["ledger_row_count"] == 83 * 14
-
-
-def test_rollover_same_month_refusal_is_400(seeded_client, excel_copy):
-    """Confirms the route wraps rollover_month() end to end against the temp
-    DB/Excel copy — re-ingesting the same-month sheet is the expected
-    refusal path (not a genuine new month), covered as a real ValueError->400
-    case rather than requiring a second synthetic month to be fabricated."""
-    resp = seeded_client.post("/rollover", json={"excel_path": excel_copy})
-    assert resp.status_code == 400
-    assert "not strictly after" in resp.json()["detail"]

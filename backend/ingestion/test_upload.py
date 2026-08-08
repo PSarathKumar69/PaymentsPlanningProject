@@ -15,6 +15,7 @@ import sys
 
 import openpyxl
 import pytest
+from sqlalchemy import func
 
 
 def _fresh_db_and_master(tmp_path):
@@ -62,7 +63,7 @@ def _add_unmapped_column(src_path, dest_path, header, value_fn):
     ws = wb.active
     sheet_map = build_sheet_map(ws)
     col = ws.max_column + 1
-    ws.cell(row=3, column=col, value=header)
+    ws.cell(row=sheet_map.header_row, column=col, value=header)
     offset = 0
     for row in range(sheet_map.data_start_row, ws.max_row + 1):
         erp_code = ws.cell(row=row, column=sheet_map.erp_code_col).value
@@ -120,6 +121,99 @@ def _remove_vendor_rows(src_path, dest_path, erp_codes):
     wb.save(dest_path)
 
 
+def _remove_vendor_row_by_entity(src_path, dest_path, erp_code, entity):
+    """Like _remove_vendor_rows(), but disambiguated by entity too —
+    entity-code-collision fix: erp_code alone can match more than one row
+    now (two different entities sharing a bare code), so removing "the"
+    V00149 row needs to say which one."""
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    wb = openpyxl.load_workbook(src_path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    for row in range(ws.max_row, sheet_map.data_start_row - 1, -1):  # bottom-up so row numbers stay valid
+        if (
+            ws.cell(row=row, column=sheet_map.erp_code_col).value == erp_code
+            and ws.cell(row=row, column=sheet_map.entity_col).value == entity
+        ):
+            ws.delete_rows(row, 1)
+            wb.save(dest_path)
+            return
+    raise AssertionError(f"vendor {erp_code!r}/{entity!r} not found")
+
+
+def _fresh_empty_db(tmp_path):
+    """Same fresh-temp-DB setup as _fresh_db_and_master(), but skips the
+    baseline load() — a genuinely empty DB with no prior ledger month at
+    all, for testing the very first upload ever."""
+    os.environ["PAYMENTS_DB_PATH"] = str(tmp_path / "test.db")
+    for mod in (
+        "backend.db.session",
+        "backend.ingestion.load_excel",
+        "backend.ingestion.upload",
+        "backend.configuration.vendor_edits",
+        "backend.configuration.extra_fields",
+    ):
+        sys.modules.pop(mod, None)
+    from backend.ingestion.load_excel import EXCEL_PATH
+
+    return EXCEL_PATH
+
+
+def _append_synthetic_month(excel_path, payable=10_000.0, payment=4_000.0):
+    """Appends one new month's Payable+Payment column pair immediately
+    before the existing Total Payable / Total Payment columns — mirrors
+    what a real monthly Excel refresh does (docs/07), just with synthetic
+    figures instead of a real new month's data. Row-2 merged header labels
+    (e.g. "Monthly Payable" spanning H2:V2) go stale after the column shift
+    since openpyxl's insert_cols doesn't adjust merge boundaries — but
+    column_mapping.py only ever reads the detected header row and below, so
+    this has no effect on ingestion correctness. Moved here from the
+    now-deleted backend/month_end/test_rollover.py (merge-rollover-into-
+    upload task) — same helper, new home.
+    """
+    from backend.ingestion.column_mapping import build_sheet_map, to_number
+
+    # The Closing Balance column holds a live formula (e.g. "=G4+V4-AK4"),
+    # not a literal — read cached values from a separate data_only load
+    # (same convention load_excel.py itself uses) before the formula-
+    # preserving workbook below overwrites that cell with a literal number.
+    wb_data = openpyxl.load_workbook(excel_path, data_only=True)
+    ws_data = wb_data.active
+    data_sheet_map = build_sheet_map(ws_data)
+    prior_closing_by_row = {
+        row: to_number(ws_data.cell(row=row, column=data_sheet_map.closing_balance_col).value)
+        for row in range(data_sheet_map.data_start_row, ws_data.max_row + 1)
+        if ws_data.cell(row=row, column=data_sheet_map.erp_code_col).value is not None
+    }
+
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    total_payable_col = sheet_map.total_payable_col
+    total_payment_col = sheet_map.total_payment_col
+
+    # Insert both new columns using pre-computed offsets, not a re-called
+    # build_sheet_map between the two inserts — the sheet is transiently
+    # asymmetric (one new payable column, no matching payment column yet)
+    # and build_sheet_map's own equal-block-length check would reject that.
+    ws.insert_cols(total_payable_col)
+    ws.cell(row=sheet_map.header_row, column=total_payable_col, value="synthetic-payable")
+    ws.insert_cols(total_payment_col + 1)
+    ws.cell(row=sheet_map.header_row, column=total_payment_col + 1, value="synthetic-payment")
+
+    sheet_map = build_sheet_map(ws)  # symmetric again — safe to rebuild now
+    new_payable_col = sheet_map.payable_cols[-1][1]
+    new_payment_col = sheet_map.payment_cols[-1][1]
+
+    for row, prior_closing in prior_closing_by_row.items():
+        ws.cell(row=row, column=new_payable_col, value=payable)
+        ws.cell(row=row, column=new_payment_col, value=payment)
+        ws.cell(row=row, column=sheet_map.closing_balance_col, value=prior_closing + payable - payment)
+
+    wb.save(excel_path)
+
+
 def _duplicate_row_as_new_vendor(src_path, dest_path, source_erp_code, new_erp_code):
     from backend.ingestion.column_mapping import build_sheet_map
 
@@ -138,6 +232,30 @@ def _duplicate_row_as_new_vendor(src_path, dest_path, source_erp_code, new_erp_c
     raise AssertionError(f"vendor {source_erp_code!r} not found")
 
 
+def _resave_only_commit_result(tmp_path, subdir):
+    """Baseline control: a pure openpyxl load+save round-trip of the real
+    master sheet, with zero cell edits, committed through commit_upload().
+    Confirmed (not guessed) that even this is enough to shift a handful of
+    unrelated vendors' derived fields — openpyxl's resave drops cached
+    formula results for the sheet's live Closing Balance formula cells,
+    which feeds into a few vendors' opening_balance/category/assigned_week
+    on the next load(). That noise is orthogonal to whatever a specific
+    test's own deliberate edit is trying to detect, and its exact vendor set
+    isn't something to hardcode (it would drift with the real sheet same as
+    any other count) — tests below diff against this control instead."""
+    control_dir = tmp_path / subdir
+    control_dir.mkdir()
+    master_path = _fresh_db_and_master(control_dir)
+    from backend.ingestion.upload import commit_upload
+
+    import openpyxl
+
+    upload_path = str(control_dir / "resave.xlsx")
+    openpyxl.load_workbook(master_path).save(upload_path)
+    backup_path = str(control_dir / "resave.backup.xlsx")
+    return commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
+
+
 # ---- Unit tests: diff computation, exercised through commit_upload() ------
 # (no more standalone preview_upload() — Sarath's course-correction, this
 # task — but commit_upload() computes and returns this same diff, it just
@@ -146,7 +264,13 @@ def _duplicate_row_as_new_vendor(src_path, dest_path, source_erp_code, new_erp_c
 
 def test_commit_detects_new_vendor(tmp_path):
     master_path = _fresh_db_and_master(tmp_path)
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
     from backend.ingestion.upload import commit_upload
+
+    session = SessionLocal()
+    existing_count = session.query(Vendor).count()  # derived, not hardcoded — real sheet's row count drifts
+    session.close()
 
     upload_path = str(tmp_path / "upload.xlsx")
     _duplicate_row_as_new_vendor(master_path, upload_path, "V00400", "V99999")
@@ -155,10 +279,13 @@ def test_commit_detects_new_vendor(tmp_path):
     result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
     assert "V99999" in result["new_vendors"]
     assert result["new_vendor_count"] == 1
-    assert result["existing_vendor_count"] == 83  # every other real vendor, unchanged
+    assert result["existing_vendor_count"] == existing_count  # every other real vendor, unchanged
 
 
 def test_commit_detects_changed_ledger_figure(tmp_path):
+    baseline = _resave_only_commit_result(tmp_path, "control")
+    baseline_changed = set(baseline["vendors_with_changed_ledger"])
+
     master_path = _fresh_db_and_master(tmp_path)
     from backend.ingestion.upload import commit_upload
 
@@ -168,11 +295,18 @@ def test_commit_detects_changed_ledger_figure(tmp_path):
 
     result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
     assert "V00400" in result["vendors_with_changed_ledger"]
-    assert result["vendors_with_changed_ledger_count"] == 1
+    # Derived against the resave-only baseline rather than a fresh hardcoded
+    # count — isolates the delta this test's own edit actually caused from
+    # the resave noise documented in _resave_only_commit_result() above.
+    assert set(result["vendors_with_changed_ledger"]) == baseline_changed | {"V00400"}
+    assert result["vendors_with_changed_ledger_count"] == len(baseline_changed) + 1
     assert any("Apr-25" in c for c in result["changed_fields_by_vendor"]["V00400"])
 
 
 def test_commit_detects_unmapped_column(tmp_path):
+    baseline = _resave_only_commit_result(tmp_path, "control")
+    baseline_unmapped = set(baseline["unmapped_columns"])
+
     master_path = _fresh_db_and_master(tmp_path)
     from backend.ingestion.upload import commit_upload
 
@@ -181,9 +315,68 @@ def test_commit_detects_unmapped_column(tmp_path):
     backup_path = str(tmp_path / "master.backup.xlsx")
 
     result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
-    assert "Status" in result["unmapped_columns"]
-    assert "Unique" in result["unmapped_columns"]  # already-known real unmapped columns, still reported
-    assert "VN" in result["unmapped_columns"]
+    # Derived against the resave-only baseline (same reasoning as
+    # test_commit_detects_changed_ledger_figure) instead of hardcoding the
+    # real sheet's current unmapped-column set, which drifts as the sheet
+    # gains/loses columns — "VN" existed in an earlier version of the real
+    # sheet and no longer does.
+    assert set(result["unmapped_columns"]) == baseline_unmapped | {"Status"}
+
+
+def test_commit_classifies_recovered_entity_collision_vendor_as_new_not_anomaly(tmp_path):
+    """Entity-code-collision fix, end to end: the real master sheet has
+    erp_code "V00149" on two rows — ARS "Instant Screening Services" (row
+    103) and FP "G-Task Services" (row 409) — a genuine two-entity code
+    reuse, not a duplicate. Before this fix, first-row-wins silently
+    dropped the FP row forever; after it, both are live DB rows from the
+    very first ingestion. This test simulates the one-time recovery
+    moment: a baseline DB seeded WITHOUT the FP row (mirroring the old,
+    already-broken state), then a normal upload of the real, complete
+    sheet — the previously-missing vendor must be classified as a genuine
+    new vendor, not merged into/confused with its same-code ARS sibling.
+    """
+    os.environ["PAYMENTS_DB_PATH"] = str(tmp_path / "test.db")
+    for mod in (
+        "backend.db.session",
+        "backend.ingestion.load_excel",
+        "backend.ingestion.upload",
+        "backend.configuration.vendor_edits",
+        "backend.configuration.extra_fields",
+    ):
+        sys.modules.pop(mod, None)
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import EXCEL_PATH, load
+    from backend.ingestion.upload import commit_upload
+
+    master_path = str(tmp_path / "master.xlsx")
+    shutil.copy(EXCEL_PATH, master_path)
+    baseline_path = str(tmp_path / "baseline.xlsx")
+    _remove_vendor_row_by_entity(master_path, baseline_path, "V00149", "FP")
+    shutil.copy(baseline_path, master_path)
+    load(excel_path=master_path)  # baseline: FP/"G-Task Services" not in the DB yet
+
+    session = SessionLocal()
+    assert session.query(Vendor).filter_by(erp_code="V00149").count() == 1  # only ARS, pre-fix-era state
+    session.close()
+
+    upload_path = str(tmp_path / "upload.xlsx")
+    shutil.copy(EXCEL_PATH, upload_path)  # the real, complete sheet — both V00149 rows present
+    backup_path = str(tmp_path / "master.backup.xlsx")
+
+    result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
+
+    assert "V00149 (FP)" in result["new_vendors"]  # ambiguous code -> disambiguated label, classified new
+    assert "V00149" not in result["new_vendors"]  # never the bare, ambiguous form
+    assert "V00149 (ARS)" not in result["new_vendors"]  # ARS sibling already existed — not "new"
+
+    session = SessionLocal()
+    try:
+        vendors = session.query(Vendor).filter_by(erp_code="V00149").order_by(Vendor.entity).all()
+        assert {v.entity for v in vendors} == {"ARS", "FP"}
+        assert {v.vendor_name for v in vendors} == {"Instant Screening Services", "G-Task Services"}
+    finally:
+        session.close()
 
 
 # ---- Integration tests: full upload -> commit -> DB+Excel state -----------
@@ -229,7 +422,7 @@ def test_commit_updates_db_and_master_excel_to_match_upload(tmp_path):
 
 def test_commit_writes_audit_log_entries_with_excel_upload_source(tmp_path):
     master_path = _fresh_db_and_master(tmp_path)
-    from backend.db.models import AuditLog, Vendor
+    from backend.db.models import AuditLog
     from backend.db.session import SessionLocal
     from backend.ingestion.upload import commit_upload
     from backend.shared.enums import ChangeSource
@@ -241,14 +434,21 @@ def test_commit_writes_audit_log_entries_with_excel_upload_source(tmp_path):
 
     session = SessionLocal()
     try:
-        vendor = session.query(Vendor).filter_by(erp_code="V00400").one()
+        # Audit-log revamp (Task B): one summary row per upload now, not
+        # one per vendor touched — no longer keyed to a specific vendor_id.
+        # Doesn't assert an exact "changed" count: a pure openpyxl
+        # load+save round-trip of the real master sheet, even with zero
+        # OTHER cell edits, already shifts some unrelated vendors' derived
+        # fields (Closing Balance's cached formula value, dropped on
+        # resave — see CLAUDE.md's Class-1 dataset-drift note) — this test
+        # only needs to confirm a summary row exists and mentions "changed".
         entry = (
             session.query(AuditLog)
-            .filter_by(vendor_id=vendor.id, source=ChangeSource.EXCEL_UPLOAD.value)
+            .filter_by(vendor_id=None, source=ChangeSource.EXCEL_UPLOAD.value)
             .one()
         )
-        assert "Apr-25" in entry.new_value
-        assert entry.old_value is None  # per-vendor summary, not a cell-by-cell before/after log
+        assert "changed" in entry.new_value
+        assert entry.old_value is None  # summary, not a cell-by-cell before/after log
     finally:
         session.close()
 
@@ -361,12 +561,15 @@ def test_commit_soft_deactivates_vendor_missing_from_upload(tmp_path):
             assert vendor.is_active is False
             assert vendor.removed_at is not None
             assert session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).count() == 0
-            entry = (
-                session.query(AuditLog)
-                .filter_by(vendor_id=vendor.id, source=ChangeSource.EXCEL_UPLOAD.value)
-                .one()
-            )
-            assert "removed" in entry.new_value.lower()
+
+        # Audit-log revamp (Task B): one summary row per upload now, not
+        # one per vendor removed — names the count, not each vendor.
+        entry = (
+            session.query(AuditLog)
+            .filter_by(vendor_id=None, source=ChangeSource.EXCEL_UPLOAD.value)
+            .one()
+        )
+        assert "2 removed" in entry.new_value
 
         # Total row count is unchanged (soft-deactivate, not delete)...
         assert session.query(Vendor).count() == total_before
@@ -619,6 +822,152 @@ def test_upload_data_reaches_payment_logging(tmp_path):
         assert live_outstanding == pytest.approx(new_opening_balance - payment_amount, abs=1)
     finally:
         session.close()
+
+
+# ---- Month-end cycle reset, folded into commit_upload() (merge-rollover-
+# into-upload task) — replaces the now-deleted standalone
+# backend/month_end/test_rollover.py, since rollover_month() itself is gone
+# and this behavior now lives inside commit_upload() instead. ----------------
+
+
+def test_commit_upload_resets_cycle_state_on_genuine_new_month(tmp_path):
+    master_path = _fresh_db_and_master(tmp_path)
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.upload import commit_upload
+    from backend.shared.enums import PaymentStatus
+
+    session = SessionLocal()
+    original_vendor_count = session.query(Vendor).count()
+    # Give one real vendor actual payment-cycle state before the upload, so
+    # the reset is proven against a genuinely non-default prior state.
+    vendor = session.query(Vendor).order_by(Vendor.id).first()
+    vendor_id = vendor.id
+    vendor.payment_status = PaymentStatus.PARTIAL
+    vendor.paid_so_far_this_month = 250_000.0
+    vendor.override_amount = 999_999.0
+    vendor.week_distribution_plan = {"1": 999_999.0}
+    vendor.finalized_budget_amount = 999_999.0
+    session.commit()
+    session.close()
+
+    upload_path = str(tmp_path / "upload.xlsx")
+    shutil.copy(master_path, upload_path)
+    _append_synthetic_month(upload_path)
+    backup_path = str(tmp_path / "master.backup.xlsx")
+
+    result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
+    assert result["cycle_reset"] is True
+    assert result["vendors_reset"] == original_vendor_count
+
+    session = SessionLocal()
+    reloaded = session.query(Vendor).filter_by(id=vendor_id).one()
+    assert reloaded.payment_status == PaymentStatus.NOT_PAID  # before: PARTIAL
+    assert float(reloaded.paid_so_far_this_month) == 0.0  # before: 250,000
+    assert reloaded.override_amount is None  # before: 999,999
+    assert reloaded.week_distribution_plan is None  # before: {"1": 999,999}
+    assert reloaded.finalized_budget_amount is None  # before: 999,999
+    # The new month's own ledger rows genuinely landed too — this isn't
+    # just a reset with the ingestion skipped.
+    latest_month = session.query(func.max(MonthlyLedger.month)).scalar()
+    assert len(session.query(MonthlyLedger).filter_by(month=latest_month).all()) == original_vendor_count
+    session.close()
+
+
+def test_commit_upload_same_month_correction_does_not_reset_or_error(tmp_path):
+    """The routine case now that every re-upload takes this same path —
+    must NOT raise (the old standalone rollover_month() refused this with a
+    ValueError; that framing no longer applies once this is the only
+    upload path) and must NOT reset anything."""
+    master_path = _fresh_db_and_master(tmp_path)
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.upload import commit_upload
+    from backend.shared.enums import PaymentStatus
+
+    session = SessionLocal()
+    vendor = session.query(Vendor).order_by(Vendor.id).first()
+    vendor_id = vendor.id
+    vendor.payment_status = PaymentStatus.PARTIAL
+    vendor.paid_so_far_this_month = 99_999.0
+    session.commit()
+    session.close()
+
+    # No new month appended — an ordinary same-month correction re-upload.
+    upload_path = str(tmp_path / "upload.xlsx")
+    _change_vendor_cell(master_path, upload_path, "V00400", "Apr-25", 555_555.0)
+    backup_path = str(tmp_path / "master.backup.xlsx")
+
+    result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)  # must not raise
+    assert result["cycle_reset"] is False
+    assert result["vendors_reset"] == 0
+
+    session = SessionLocal()
+    reloaded = session.query(Vendor).filter_by(id=vendor_id).one()
+    assert reloaded.payment_status == PaymentStatus.PARTIAL  # unchanged
+    assert float(reloaded.paid_so_far_this_month) == 99_999.0  # unchanged
+    session.close()
+
+
+def test_commit_upload_first_upload_ever_does_not_reset_or_error(tmp_path):
+    """No prior ledger month to compare against at all — must not attempt a
+    reset and must not error either."""
+    excel_path = _fresh_empty_db(tmp_path)
+    from backend.ingestion.upload import commit_upload
+
+    upload_path = str(tmp_path / "upload.xlsx")
+    shutil.copy(excel_path, upload_path)
+    master_path = str(tmp_path / "master.xlsx")  # doesn't exist yet — a genuinely fresh environment
+    backup_path = str(tmp_path / "master.backup.xlsx")
+
+    result = commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
+    assert result["cycle_reset"] is False
+    assert result["vendors_reset"] == 0
+
+
+def test_commit_upload_reset_failure_rolls_back_ingestion_too(tmp_path, monkeypatch):
+    """A genuine failure during the reset step — after the new-month check
+    has already confirmed a real new month — must roll back BOTH the reset
+    attempt and this call's re-ingestion together. Without that, the new
+    month's ledger data would already be committed, and a retry would
+    immediately look like a same-month correction (no reset attempted
+    again) with no way to force the reset through short of manual DB
+    surgery."""
+    master_path = _fresh_db_and_master(tmp_path)
+    import backend.month_end.rollover as rollover_module
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.upload import commit_upload
+
+    session = SessionLocal()
+    original_latest_month = session.query(func.max(MonthlyLedger.month)).scalar()
+    vendor = session.query(Vendor).order_by(Vendor.id).first()
+    vendor_id, original_status = vendor.id, vendor.payment_status
+    session.close()
+
+    upload_path = str(tmp_path / "upload.xlsx")
+    shutil.copy(master_path, upload_path)
+    _append_synthetic_month(upload_path)
+    backup_path = str(tmp_path / "master.backup.xlsx")
+
+    class _ExplodingPaymentStatus:
+        @property
+        def NOT_PAID(self):
+            raise RuntimeError("simulated failure during the reset loop")
+
+    monkeypatch.setattr(rollover_module, "PaymentStatus", _ExplodingPaymentStatus())
+
+    with pytest.raises(RuntimeError):
+        commit_upload(upload_path, excel_path=master_path, backup_path=backup_path)
+
+    session = SessionLocal()
+    # Both the reset AND the re-ingestion it was sharing a transaction with
+    # must be undone — the ledger must still show the ORIGINAL latest
+    # month, not the new one the failed attempt tried to land.
+    assert session.query(func.max(MonthlyLedger.month)).scalar() == original_latest_month
+    reloaded = session.query(Vendor).filter_by(id=vendor_id).one()
+    assert reloaded.payment_status == original_status
+    session.close()
 
 
 if __name__ == "__main__":

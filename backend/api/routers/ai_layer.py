@@ -93,7 +93,7 @@ def _vendor_companion_fields(session, vendor_id):
         "vendor_id": vendor.id,
         "erp_code": vendor.erp_code,
         "vendor_name": vendor.vendor_name,
-        "category": vendor.category.value,
+        "category": vendor.category,
         "priority_tag": vendor.priority_tag,  # already a plain string (or None)
         "aging": {
             "oldest_bucket": aging.oldest_bucket,
@@ -119,11 +119,20 @@ def post_vendor_talking_points(body: VendorTalkingPointsRequest):
     session = SessionLocal()
     try:
         vendor_fields = _vendor_companion_fields(session, body.vendor_id)
-        script_text = companion.generate_vendor_talking_points(**vendor_fields)
+        script_text = companion.generate_vendor_talking_points(format=body.format, **vendor_fields)
+        required_amount = vendor_fields["required_amount"]
+        allocated_amount = vendor_fields["allocated_amount"]
         return {
             "vendor_id": vendor_fields["vendor_id"],
             "erp_code": vendor_fields["erp_code"],
             "vendor_name": vendor_fields["vendor_name"],
+            "category": vendor_fields["category"],
+            "priority_tag": vendor_fields["priority_tag"],
+            "status": vendor_fields["status"],
+            "required_amount": required_amount,
+            "allocated_amount": allocated_amount,
+            "cut_from_full": allocated_amount < required_amount - MONEY_EPSILON,
+            "aging_bucket": vendor_fields["aging"]["oldest_bucket"],
             "script_text": script_text,
         }
     except ValueError:

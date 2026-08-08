@@ -48,6 +48,20 @@ export interface VendorAging {
   min_funds_tranches: MinFundsTranche[];
 }
 
+export interface Payment {
+  id: number;
+  vendor_id: number;
+  payment_date: string; // ISO date (YYYY-MM-DD)
+  amount: number;
+  week: number | null;
+  note: string | null;
+}
+
+export interface VendorCategoryOption {
+  value: string;
+  label: string;
+}
+
 export interface VendorPaymentTracking {
   vendor_id: number;
   erp_code: string;
@@ -69,6 +83,16 @@ export interface NewModel2MinimumFundsRequired {
   breakdown: Array<{ vendor_id: number; required_amount: number; [k: string]: unknown }>;
   planning_month: string;
   as_of: string;
+  planning_month_warning: string | null;
+}
+
+export interface SuggestedPlanningMonth {
+  last_recorded_month: string | null;
+  suggested_planning_month: string | null;
+}
+
+export interface CurrentPlanningMonth {
+  planning_month: string | null;
 }
 
 export interface AllVendorMinFundsRequired {
@@ -131,6 +155,10 @@ export interface NewModel2Plan {
   bucket_ceiling: Record<string, number>;
   bucket_pct: Record<string, number>;
   exceptional_shortfall: boolean;
+  // Real post-allocation "money left over" figure — what the "Funds Left"
+  // card should show. NOT the same as funds_left_for_regeneration below
+  // (a different, pre-allocation figure).
+  leftover_remaining: number;
   allocations: PlanAllocationRow[];
 }
 
@@ -164,6 +192,13 @@ export interface FinalizeCheckResponse {
   vendor_count: number;
 }
 
+export interface ResetCycleResponse {
+  planning_month: string;
+  deleted_plan_runs: number;
+  deleted_allocations: number;
+  vendors_reset: number;
+}
+
 // ---- Plan-run history (backend/api/schemas/plan_runs.py) -------------------
 
 export interface PlanRunAllocation {
@@ -182,6 +217,8 @@ export interface PlanRun {
   month: string;
   model_used: string;
   funds_figure: number | null;
+  min_funds_required: number | null;
+  leftover_remaining: number | null;
   allocations: PlanRunAllocation[];
 }
 
@@ -231,6 +268,12 @@ export interface MasterDataCommitResult {
   changed_fields_by_vendor: Record<string, string[]>;
   vendors_changed: number;
   ai_column_mapping_messages: string[];
+  // Merge-rollover-into-upload task: whether this upload's own re-ingestion
+  // landed a genuinely new month and reset every vendor's payment-cycle
+  // state — false/0 for the ordinary same-month-correction and
+  // first-upload-ever cases, never an error either way.
+  cycle_reset: boolean;
+  vendors_reset: number;
 }
 
 export interface MasterDataRevertResult {
@@ -265,10 +308,25 @@ export interface GridVendorRow {
   values: Record<string, unknown>;
 }
 
+export interface DuplicateDroppedRow {
+  erp_code: string;
+  vendor_name: unknown;
+  row: number;
+}
+
 export interface MasterGrid {
   columns: GridColumn[];
   vendors: GridVendorRow[];
   extra_field_widgets: Record<string, { widget: string; options: string[] | null }>;
+  // False before any vendor has ever been ingested, or if the master file
+  // has since gone missing — columns/vendors are then both empty, but
+  // that's a consequence of this flag, not the signal itself.
+  has_data: boolean;
+  // Go-live "show every row" task: ERP codes the sheet had duplicated —
+  // the live (winning) vendor row for each is flagged red in the grid.
+  duplicate_erp_codes: string[];
+  // Every row that did NOT win (i.e. was silently dropped by last-row-wins).
+  duplicate_dropped_rows: DuplicateDroppedRow[];
 }
 
 // ---- Configuration (backend/api/schemas/configuration.py) ------------------
@@ -276,9 +334,104 @@ export interface MasterGrid {
 export interface PriorityBucket {
   bucket_key: string;
   display_label: string;
+  category_name: string;
   ceiling_pct: number;
   floor_pct: number;
   rotation_position: number;
+  // Pinned-role task (2026-08-07): false only for the Must Pay/Commitment
+  // guaranteed-funding rows, however Finance has renamed them — key off
+  // this, never a hardcoded "P0"/"P1" bucket_key check.
+  deletable: boolean;
+}
+
+// ---- Audit log (backend/api/routers/audit_log.py) --------------------------
+
+export interface AuditLogEntry {
+  id: number;
+  timestamp: string;
+  vendor_id: number | null; // null for system-level entries (e.g. priority-bucket edits, column-mapping decisions)
+  vendor_name: string | null; // server-side joined against vendors — null whenever vendor_id is null
+  erp_code: string | null;
+  field_name: string;
+  old_value: string | null;
+  new_value: string | null;
+  source: string;
+  changed_by: string | null;
+}
+
+export interface AuditLogListResult {
+  items: AuditLogEntry[];
+  total: number;
+}
+
+export interface AuditLogQuery {
+  vendor_id?: number;
+  search?: string;
+  source?: string;
+  date_from?: string; // ISO date (YYYY-MM-DD)
+  date_to?: string;
+  limit?: number;
+  offset?: number;
+}
+
+// ---- Analytics (backend/api/schemas/analytics.py) --------------------------
+
+export interface AnalyticsHistoryPoint {
+  month: string; // ISO date, first-of-month
+  payable: number;
+  payment: number;
+}
+
+export interface AnalyticsMonthlyBreakdownRow {
+  months_back: number;
+  month: string; // ISO date, first-of-month
+  label: string;
+  amount: number; // still-owed balance (post-FIFO)
+  payable: number;
+  payment: number;
+}
+
+export interface AnalyticsVendor {
+  vendor_id: number;
+  erp_code: string;
+  vendor_name: string;
+  outstanding_balance: number;
+  aging_buckets: Record<string, number>;
+  oldest_bucket: string | null;
+  oldest_bucket_months_back: number | null;
+  oldest_bucket_amount: number;
+  // Aligned 1:1 with AnalyticsDashboard.months — same length, same order.
+  history: AnalyticsHistoryPoint[];
+  // Oldest -> newest, every calendar month incl. zero-balance ones —
+  // drives the vendor detail modal's per-month list.
+  monthly_breakdown: AnalyticsMonthlyBreakdownRow[];
+}
+
+export interface AnalyticsMonthAggregate {
+  month: string;
+  total_payable: number;
+  total_payment: number;
+  cumulative_debt: number;
+  cumulative_paid: number;
+}
+
+export interface AnalyticsDashboard {
+  vendors: AnalyticsVendor[];
+  // Dynamic length — sheet_start_month through the latest recorded ledger
+  // month, never a fixed count (CLAUDE.md rule 7).
+  months: string[];
+  aggregates: AnalyticsMonthAggregate[];
+  aging_totals: Record<string, number>;
+}
+
+export interface FundsTrendPoint {
+  month: string;
+  available_funds: number;
+  min_funds_required: number;
+}
+
+export interface FundsTrend {
+  trend: FundsTrendPoint[];
 }
 
 // ---- AI companion (backend/api/schemas/ai_layer.py) ------------------------
@@ -287,6 +440,13 @@ export interface VendorTalkingPointsResult {
   vendor_id: number;
   erp_code: string;
   vendor_name: string;
+  category: string;
+  priority_tag: string | null;
+  status: string;
+  required_amount: number;
+  allocated_amount: number;
+  cut_from_full: boolean;
+  aging_bucket: string | null;
   script_text: string;
 }
 

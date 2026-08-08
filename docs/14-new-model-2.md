@@ -19,9 +19,37 @@ Finance thinks about prioritization under a shortfall.
 
 ## Vendor categories and priority tags
 
-Must Pay, Commitment, Normal, and **Inactive** are the four top-level
-categories — Must Pay and Commitment are always funded at 100% first,
-regardless of shortfall.
+Must Pay, Commitment, Normal, and **Inactive** are the four categories
+Finance started with — Must Pay and Commitment are funded at their own
+**P0/P1 ceiling/floor** first, ahead of every other bucket.
+
+**P0/P1-ceiling task (2026-08-06):** Must Pay/Commitment's "always funded
+in full, regardless of shortfall" behavior is no longer hardcoded into the
+allocator — P0/P1 are now two more rows in the same Configuration-tab
+priority-bucket table as P2-P5, with their own ceiling/floor, seeded at
+**100%/100%** by default. At that default they behave exactly as before
+(never shrink under any shortfall) — this only changes if Finance
+explicitly lowers P0's or P1's floor. Unlike P2-P5, P0/P1 are **pinned**:
+always funded first / cut last, not draggable, not removable, not
+renamable — only their ceiling/floor percentages are Finance-editable. See
+"Bucket ceilings" and "Allocation logic" below for the mechanics.
+
+**Category-configuration task (2026-08-05):** Normal/Inactive are no longer
+the only two "everything else" categories — Finance can now add further
+custom categories (e.g. "Contractor") through the Configuration tab's
+unified table. Every one of them, present or future, is always cuttable —
+only Must Pay/Commitment (P0/P1, checked by category OR tag — see below)
+land in the pinned tier; `allocator.py`'s `PINNED_BUCKET_KEYS`/
+`_CATEGORY_DEFAULT_BUCKET` are what enforce this today (as of the
+P0/P1-ceiling task — the older `_is_guaranteed()` helper this paragraph
+used to name no longer exists, folded into the same bucket math every
+other category uses).
+`Vendor.category` itself is a plain string now (`backend/db/models.py`),
+not a hardcoded enum, to make this possible without a schema change per
+new category. See `docs/12-database.md`'s `priority_buckets` entry and
+`docs/18-project-status-tracker.md`'s open-incident note before assuming
+this is fully settled — an unresolved empty-DB issue from verifying this
+exact change is still open as of 2026-08-06.
 
 **Added 2026-07-22, signed off by Sarath:** Exit (this category's
 original name) was added as its own category, not a Normal vendor with a
@@ -66,10 +94,15 @@ configuration come later.
 Each priority bucket has a **ceiling percentage** — the percentage of a
 vendor's required amount (see below) that bucket receives whenever funds
 are short, before any cutting happens. Starting values for this build:
-P2 = 95%, P3 = 90%, P4 = 85%, **P5 (Inactive) = 50%** — confirmed with
-Finance 2026-07-24. Confirmed extensible — Finance can add further
-buckets beyond P5 with their own ceiling, keeping the priority order
-clean (P2 ≥ P3 ≥ P4 ≥ P5 ≥ ...).
+**P0 (Must Pay) = 100%, P1 (Commitment) = 100%**, P2 = 95%, P3 = 90%,
+P4 = 85%, **P5 (Inactive) = 50%** — confirmed with Finance 2026-07-24 for
+P2-P5; P0/P1's 100%/100% default confirmed 2026-08-06 (P0/P1-ceiling
+task) as the value that reproduces the old hard guarantee exactly.
+Confirmed extensible — Finance can add further buckets beyond P5 with
+their own ceiling, keeping the priority order clean
+(P0 ≥ P1 ≥ P2 ≥ P3 ≥ P4 ≥ P5 ≥ ...). P0/P1 themselves are the one
+exception to "extensible/reorderable" — they're pinned permanently at the
+front of this order, never draggable.
 
 A bucket's ceiling percentage applies against the **carry-forward-
 adjusted required amount** (see "Minimum Funds Required" below) — i.e. a
@@ -79,11 +112,14 @@ like the raw monthly bill.
 
 Each bucket also has its own **floor percentage** (see "Allocation
 logic" step 6) — this is no longer a single value shared by every
-bucket. P2/P3/P4 keep the original 25% floor; **P5 (Inactive) has its
+bucket. **P0/P1's floor defaults to 100%** (same as their ceiling — see
+above), P2/P3/P4 keep the original 25% floor; **P5 (Inactive) has its
 own, lower floor of 10%** — confirmed with Finance 2026-07-24, since P5
 is the lowest-priority bucket and cut first. Both ceiling and floor
 percentages are stored per-bucket in a configurable table (Configuration
-module), never hardcoded literals in the allocation code.
+module), never hardcoded literals in the allocation code — P0/P1
+included, as of the P0/P1-ceiling task; only their bucket_key/category/
+position stay fixed (see `backend/configuration/priority_bucket_edits.py`).
 
 ## Planning month (as_of) — new, confirmed 2026-07-23
 
@@ -196,22 +232,68 @@ no aging/tranche walk at all. Finance maintains `commitment_months` as the
 / `_carry_forward_normal_amount()` in `backend/shared/min_funds.py` are
 genuinely shared infra today — not old-model leftovers waiting to be
 deleted. Models 1/2/3 and New Model 1 are gone from the codebase, but
-`backend/api/routers/vendors.py`'s vendor list/aging endpoint and
-`backend/weekly_planning/planner.py`'s weekly-view builder (which New
-Model 2's own generate-plan-and-weekly-view calls) both still call these
-functions live. They were **not** modified for this change — New Model 2
-got its **own new function** instead, added to `backend/shared/` (not
-inside New Model 2's own package: `backend/shared/min_funds_v2.py`) so a
-future model can reuse it too, without touching this shared behavior or
-its tests at all.
+`backend/api/routers/vendors.py`'s vendor list/aging endpoint still calls
+these functions live. They were **not** modified for this change — New
+Model 2 got its **own new function** instead, added to `backend/shared/`
+(not inside New Model 2's own package: `backend/shared/min_funds_v2.py`)
+so a future model can reuse it too, without touching this shared behavior
+or its tests at all.
 
-Known open gap (flagged, not resolved): `planner.py`'s weekly-view builder
-still computes each row's `minimum_required` via the OLD `required_amount()`
-rule above, not `required_amount_v2()` — so New Model 2's own Planning
-table (correctly on the new capped rule) and its own Weekly view (still on
-the old rule) can show two different Min Funds figures for the same
-vendor. This may be intentional or may be a real gap; raise with Sarath
-before assuming either way.
+**Resolved**: `backend/weekly_planning/planner.py`'s weekly-view builder
+(which New Model 2's own generate-plan-and-weekly-view calls) now computes
+each row's `minimum_required` via `required_amount_v2()` too, not the OLD
+`required_amount()` above — the Planning table and the Weekly view now
+agree on Min Funds Required for the same vendor. This was safe once Models
+1/2/3/New Model 1 (`build_weekly_view()`'s only other historical callers)
+were fully removed from the codebase; `planner.py` still uses
+`min_funds.py`'s `_load_vendors_and_ledger()`, just not its
+`required_amount()` anymore.
+
+### Duplicate-vendor rule (ERP-code-only, revised 2026-08-06)
+
+A real-data investigation (Finance manually checking Min Funds Required
+against a vendor-name list) originally found 14 vendor NAMES in the real
+sheet that each resolve to **two** separate `Vendor` rows under two
+different ERP codes — e.g. "G-Task Services" is both a Commitment row
+(₹22.3L) and a Must Pay row (₹2,659). Confirmed with Finance: a shared
+vendor_name alone is **not** proof of duplication — these 14 are genuinely
+two different billing lines and must keep calculating independently. A
+same-name/all-fields-exact-match check was briefly added on top of the
+ERP-code check below to handle that case, then removed outright on
+Sarath's later, explicit call: **one duplicate check only, keyed on ERP
+code** — `detect_duplicate_vendor_rows()` no longer exists.
+
+The one remaining duplicate check lives at ingestion
+(`backend/ingestion/load_excel.py`, `column_mapping.find_duplicate_erp_codes()`):
+when the same **(entity, ERP code) pair** appears on more than one row in
+the uploaded sheet (a data-entry error, not one vendor split across rows),
+the **first** occurrence is kept — ingested and calculated normally — and
+every later occurrence for that same (entity, ERP code) pair is **skipped
+entirely**: never read, never overwrites the first row, never contributes
+to any calculation. Loud, never silent: a `duplicate_erp_code_notes` entry
+names the code, every row, and the winner, surfaced on the upload banner.
+The Master Data grid marks the surviving row with a red "Duplicate" badge
+and lists every skipped row in a table below the grid
+(`duplicate_dropped_rows`).
+
+**Entity-code-collision fix**: grouping by bare ERP code alone used to
+flag 29 groups, but 28 of those were never real duplicates — two different
+legal entities (e.g. ARS/FP) legitimately reusing the same bare numeric
+code, disambiguated by the sheet's own "Unique" column and `Vendor`'s real
+uniqueness key, `(entity, erp_code)` (`uq_vendor_entity_erp_code` in
+`backend/db/models.py`). Those now ingest as two separate vendor rows and
+never appear here at all. What's left is the one genuine same-entity
+data-entry collision confirmed in the real sheet — ARS "INC" ("Phyllo
+Inc." vs "PrimeRole, Inc.") — still first-row-wins, still loud, and this
+fix doesn't resolve it automatically; Finance still needs to assign the
+skipped vendor a distinct ERP code. Both exports below now also surface
+this same pair (and any future one) on their own "Exceptions" tab, not
+just the upload banner and Master Data grid.
+
+Deliberately does **not** touch Commitment's own formula, `required_amount()`,
+or anything about how a vendor's individual required amount is computed —
+and does not affect two vendors that genuinely have different, unique ERP
+codes, however similar their names.
 
 ## Available funds
 
@@ -232,29 +314,42 @@ excess elsewhere (FD) before it reaches this system.
 
 ## Allocation logic
 
-1. **Fund Must Pay and Commitment vendors first, always, at their full
-   required amount.** Never shrinks, regardless of shortfall elsewhere.
-2. **Remaining Pool = Available Funds − (Must Pay + Commitment total) −
-   (sum of currently locked/overridden Normal vendors' amounts).**
+1. **Must Pay and Commitment vendors (P0/P1) go through the exact same
+   bucket ceiling/floor/cutting math below as every other bucket** —
+   P0/P1-ceiling task, 2026-08-06. There is no separate hardcoded
+   pre-funding step anymore. What makes them behave as "always funded in
+   full" is purely their **default ceiling/floor of 100%/100%** (see
+   "Bucket ceilings" above) — at that default, any attempted cut
+   immediately re-clamps back to 100%, reproducing the old guarantee
+   exactly. P0/P1 sit at the front of the priority order (funded first,
+   cut last), same as before.
+2. **Remaining Pool = Available Funds − (sum of currently
+   locked/overridden vendors' amounts, across every bucket).**
 3. **First check the absolute-funds scenario: if the Remaining Pool
-   covers every unlocked Normal vendor's full 100% required amount,
-   that's what they get.** Bucket ceilings never apply in this case —
-   they exist only to soften an actual shortfall, not to cap a vendor
-   below 100% when funds don't require it.
-4. **Otherwise (funds short of that), try giving every unlocked Normal
-   vendor their bucket's ceiling percentage simultaneously.** If the
-   total cost fits within the Remaining Pool, every vendor gets their
-   bucket's ceiling — done, no cutting needed.
+   covers every unlocked vendor's full 100% required amount, that's what
+   they get.** Bucket ceilings never apply in this case — they exist only
+   to soften an actual shortfall, not to cap a vendor below 100% when
+   funds don't require it.
+4. **Otherwise (funds short of that), try giving every unlocked vendor
+   their bucket's ceiling percentage simultaneously.** If the total cost
+   fits within the Remaining Pool, every vendor gets their bucket's
+   ceiling — done, no cutting needed. At the default P0/P1 ceiling of
+   100%, this means P0/P1 already get their full amount in this step.
 5. **If it doesn't fit, cut in fixed 5% steps, cycling through the
    buckets in priority order from lowest to highest, repeating:** P5,
-   then P4, then P3, then P2, then back to P5, and so on — P5 (Inactive)
-   is cut first since it's the lowest-priority bucket. Check after each
-   single 5% cut whether the new total fits within the Remaining Pool.
+   then P4, then P3, then P2, then P1, then P0, then back to P5, and so
+   on — P5 (Inactive) is cut first since it's the lowest-priority bucket;
+   P0/P1 are tried last. At their default 100% floor, an attempted cut on
+   P0/P1 immediately re-clamps back to 100% and they drop out of the
+   rotation without ever actually losing anything — only a Finance edit
+   lowering their floor lets a cut actually land. Check after each single
+   5% cut whether the new total fits within the Remaining Pool.
 6. **A bucket drops out of the rotation once it reaches its own floor**
-   — P2/P3/P4's floor is 25%, P5's floor is 10% (see "Bucket ceilings"
-   above) — cutting continues among whichever buckets remain active.
-   Example: if P5 hits 10% first, the cycle continues P4 → P3 → P2 →
-   P4 → P3 → P2 only, skipping P5 entirely from then on.
+   — P0/P1's floor is 100% by default, P2/P3/P4's floor is 25%, P5's
+   floor is 10% (see "Bucket ceilings" above) — cutting continues among
+   whichever buckets remain active. Example: if P5 hits 10% first, the
+   cycle continues P4 → P3 → P2 → P4 → P3 → P2 only, skipping P5 entirely
+   from then on.
 7. **Only once every bucket has separately reached its own floor and
    the total still doesn't fit is this treated as an exceptional,
    escalate-to-a-human situation** — not something the model keeps
@@ -313,11 +408,14 @@ vendor down, you pay it, you don't hold it back on principle."
   already resolved that contention, so there's no one else left with a
   competing claim on this specific leftover money.
 
-**Scope:** Normal (P2/P3/P4) and Inactive (P5) vendors — P5 now swept as
-its own real bucket, last in the sweep order, no longer folded into
-another bucket's pass (see "Vendor categories and priority tags" above).
-Must Pay and Commitment are never touched here — already funded at 100%
-in step 1 of the main logic.
+**Scope (updated, P0/P1-ceiling task):** the sweep now runs P0 → P1 → P2 →
+P3 → P4 → P5, covering every bucket, not just Normal/Inactive. At P0/P1's
+default 100%/100% they're already at their required amount (or their own
+outstanding-balance cap) before this step ever runs, so it's a no-op for
+them exactly like before — this only matters once Finance has lowered
+P0's/P1's floor and a cut actually landed; leftover then tops P0/P1 back
+up first, ahead of every other bucket, consistent with them being funded
+first everywhere else in this model.
 
 **Nature:** fully automatic, system-generated — **not** a Finance
 override. A vendor topped up this way is not locked; the next

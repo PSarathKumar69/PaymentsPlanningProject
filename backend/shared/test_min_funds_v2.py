@@ -47,12 +47,65 @@ CURRENT = date(2026, 7, 1)  # planning_month=Aug-26 -> as_of (planning_month - 1
 
 
 def test_only_current_month_outstanding_is_the_trivial_full_amount():
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=10_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [_FakeLedgerRow(CURRENT, payable=10_000_000, payment=0, opening_balance=0)]
 
     amount, rule = required_amount_v2(vendor, ledger_rows, as_of=CURRENT)
     assert amount == pytest.approx(10_000_000)
     assert rule == "v2_only_current"
+
+
+# ---- Rule 1b: no current AND no older — every tranche is newer than as_of.
+# Only possible when as_of (planning month - 1) predates the vendor's/
+# sheet's very first recorded month, e.g. Finance's first-ever planning
+# cycle right after a fresh upload — real bug report: this used to silently
+# return 0 for every vendor since `current` was None (as_of not found) and
+# `older` was empty (nothing predates a sheet's first month either).
+
+
+def test_no_data_before_as_of_uses_the_earliest_real_tranche_not_zero():
+    """The exact real bug: planning month == the sheet's own first recorded
+    month, so as_of (planning month - 1) has no ledger row at all, and
+    nothing before it either. The vendor's only real bill (the sheet's
+    first month) is NEWER than as_of, not "current" and not "older" — must
+    not fall through to a flat 0."""
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=6_243_763.07, paid_so_far_this_month=0.0)
+    sheet_first_month = date(2026, 7, 1)
+    ledger_rows = [_FakeLedgerRow(sheet_first_month, payable=6_243_763.07, payment=0, opening_balance=0)]
+
+    amount, rule = required_amount_v2(vendor, ledger_rows, as_of=date(2026, 6, 1))
+    assert amount == pytest.approx(6_243_763.07)
+    assert rule == "v2_no_history_before_as_of"
+
+
+def test_no_data_before_as_of_picks_the_earliest_outstanding_tranche_when_several_exist():
+    """Same shape, but the vendor's first FEW months are already fully paid
+    off (FIFO) by the time as_of is evaluated — must pick whichever month is
+    still the oldest with a real remaining balance, not blindly "the
+    sheet's very first month" if that one's since been cleared."""
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=2_000_000.0, paid_so_far_this_month=0.0)
+    ledger_rows = [
+        _FakeLedgerRow(date(2026, 7, 1), payable=1_000_000, payment=1_000_000, opening_balance=0),  # fully paid
+        _FakeLedgerRow(date(2026, 8, 1), payable=2_000_000, payment=0, opening_balance=0),  # still outstanding
+    ]
+
+    amount, rule = required_amount_v2(vendor, ledger_rows, as_of=date(2026, 6, 1))
+    assert amount == pytest.approx(2_000_000)
+    assert rule == "v2_no_history_before_as_of"
+
+
+def test_breakdown_v2_no_data_before_as_of_names_the_earliest_month_as_current():
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=6_243_763.07, paid_so_far_this_month=0.0)
+    sheet_first_month = date(2026, 7, 1)
+    ledger_rows = [_FakeLedgerRow(sheet_first_month, payable=6_243_763.07, payment=0, opening_balance=0)]
+
+    detail = min_funds_breakdown_v2(vendor, ledger_rows, as_of=date(2026, 6, 1))
+    assert detail["total"] == pytest.approx(6_243_763.07)
+    assert detail["rule"] == "v2_no_history_before_as_of"
+    assert detail["current_month"] == sheet_first_month
+    assert detail["current_amount"] == pytest.approx(6_243_763.07)
+    assert detail["oldest_month"] is None  # this isn't rule 2/4's "oldest" concept
+    assert detail["second_month"] is None
 
 
 # ---- Rule 2: current bucket zero, an older month outstanding --------------
@@ -61,7 +114,7 @@ def test_only_current_month_outstanding_is_the_trivial_full_amount():
 def test_current_bucket_zero_falls_back_to_oldest_month_only():
     """No bill at all this cycle (no ledger row for CURRENT), but Mar-26 is
     still outstanding -> Min Funds Required is just that oldest month."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=6_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [_FakeLedgerRow(date(2026, 3, 1), payable=6_000_000, payment=0, opening_balance=0)]
 
     amount, rule = required_amount_v2(vendor, ledger_rows, as_of=CURRENT)
@@ -79,7 +132,7 @@ def test_current_bucket_zero_via_an_explicit_zero_payable_row_falls_back_to_olde
     aging.py) always drains the oldest outstanding tranche first, so as
     long as an older month is still outstanding, the current month's own
     tranche cannot have received any payment at all yet."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=6_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 3, 1), payable=6_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(CURRENT, payable=0, payment=0, opening_balance=0),
@@ -101,7 +154,7 @@ def test_adjacent_case_second_month_is_current():
     """docs/14's own worked example: oldest May-26 ₹10L, current Jun-26
     ₹100L, nothing in between (they're adjacent) -> second month IS
     current -> Min Funds = 10L + 100L = 110L."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=11_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 5, 1), payable=1_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(date(2026, 6, 1), payable=10_000_000, payment=0, opening_balance=0),
@@ -115,7 +168,7 @@ def test_adjacent_case_second_month_is_current():
 def test_oldest_exactly_50_percent_of_current_is_inclusive():
     """docs/14: "inclusive — exactly 50% counts as qualifying". Adjacent
     shape (oldest is directly one month before current), so second == current."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=15_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 3, 1), payable=5_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(CURRENT, payable=10_000_000, payment=0, opening_balance=0),
@@ -132,7 +185,7 @@ def test_gap_case_second_month_found_by_skipping_one_run_of_zero_months():
     and Mar (zero), lands on Apr -> Min Funds = Jan + Apr = ₹23L. May and
     Jun (current) are excluded even though the running total (23L) is
     nowhere near 50L — the 50% check never re-runs against the sum."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=12_300_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 1, 1), payable=1_500_000, payment=0, opening_balance=0),  # oldest
         _FakeLedgerRow(date(2026, 2, 1), payable=0, payment=0, opening_balance=0),
@@ -157,7 +210,7 @@ def test_gap_case_second_month_is_a_real_nonzero_month_not_current():
     Mar(3L) + Jul(10L) = 13L, "v2_oldest_and_current" — silently wrong,
     since Apr's own 4L is a real, unpaid, closer-to-oldest bill that should
     have been picked over jumping straight to current."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=17_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 3, 1), payable=3_000_000, payment=0, opening_balance=0),  # oldest
         _FakeLedgerRow(date(2026, 4, 1), payable=4_000_000, payment=0, opening_balance=0),  # second (real, nonzero)
@@ -176,7 +229,7 @@ def test_never_looks_for_a_third_month_even_when_running_total_still_under_50_pe
     second(5L) sum to 10L, still comfortably under 50% of current's 100L —
     but a genuinely outstanding third month (Mar, 5L) must still be
     excluded."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=11_500_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 1, 1), payable=500_000, payment=0, opening_balance=0),  # oldest
         _FakeLedgerRow(date(2026, 2, 1), payable=500_000, payment=0, opening_balance=0),  # second
@@ -196,7 +249,7 @@ def test_oldest_above_50_percent_of_current_is_oldest_only():
     """docs/14's own worked example: oldest Mar-26 ₹60L is more than 50% of
     this month's ₹100L bill -> Min Funds Required = 60L only, current
     month's own bill is NOT added."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=16_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 3, 1), payable=6_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(CURRENT, payable=10_000_000, payment=0, opening_balance=0),
@@ -237,9 +290,9 @@ def test_must_pay_and_inactive_use_the_identical_rule_as_normal():
         _FakeLedgerRow(date(2026, 3, 1), payable=6_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(CURRENT, payable=10_000_000, payment=0, opening_balance=0),
     ]
-    normal = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
-    must_pay = _FakeVendor(category=VendorCategory.MUST_PAY, opening_balance=0.0, paid_so_far_this_month=0.0)
-    inactive_vendor = _FakeVendor(category=VendorCategory.INACTIVE, opening_balance=0.0, paid_so_far_this_month=0.0)
+    normal = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=16_000_000.0, paid_so_far_this_month=0.0)
+    must_pay = _FakeVendor(category=VendorCategory.MUST_PAY, opening_balance=16_000_000.0, paid_so_far_this_month=0.0)
+    inactive_vendor = _FakeVendor(category=VendorCategory.INACTIVE, opening_balance=16_000_000.0, paid_so_far_this_month=0.0)
 
     normal_amount, normal_rule = required_amount_v2(normal, ledger_rows, as_of=CURRENT)
     mp_amount, mp_rule = required_amount_v2(must_pay, ledger_rows, as_of=CURRENT)
@@ -270,7 +323,7 @@ def test_default_as_of_falls_back_to_latest_ledger_month():
     """Same convention as backend/shared/aging.py's compute_vendor_aging() —
     lets a caller/test that doesn't care about New Model 2's own planning-
     month plumbing still get a sensible "current" reference."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=5_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [_FakeLedgerRow(date(2026, 6, 1), payable=5_000_000, payment=0, opening_balance=0)]
 
     amount, rule = required_amount_v2(vendor, ledger_rows, as_of=None)
@@ -282,7 +335,7 @@ def test_default_as_of_falls_back_to_latest_ledger_month():
 
 
 def test_breakdown_v2_adjacent_case_second_equals_current():
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=13_000_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 3, 1), payable=3_000_000, payment=0, opening_balance=0),
         _FakeLedgerRow(CURRENT, payable=10_000_000, payment=0, opening_balance=0),
@@ -303,7 +356,7 @@ def test_breakdown_v2_gap_case_second_is_not_current():
     """The vendor-detail-card template's "gap" wording depends on
     second_month != current_month being distinguishable — confirm the
     breakdown dict actually carries both, correctly, at once."""
-    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=0.0, paid_so_far_this_month=0.0)
+    vendor = _FakeVendor(category=VendorCategory.NORMAL, opening_balance=12_300_000.0, paid_so_far_this_month=0.0)
     ledger_rows = [
         _FakeLedgerRow(date(2026, 1, 1), payable=1_500_000, payment=0, opening_balance=0),
         _FakeLedgerRow(date(2026, 4, 1), payable=800_000, payment=0, opening_balance=0),
@@ -388,6 +441,9 @@ def test_calculate_minimum_funds_required_v2_differs_from_the_old_rule_for_must_
 if __name__ == "__main__":
     # ponytail: smallest runnable self-check, no framework/fixtures.
     test_only_current_month_outstanding_is_the_trivial_full_amount()
+    test_no_data_before_as_of_uses_the_earliest_real_tranche_not_zero()
+    test_no_data_before_as_of_picks_the_earliest_outstanding_tranche_when_several_exist()
+    test_breakdown_v2_no_data_before_as_of_names_the_earliest_month_as_current()
     test_current_bucket_zero_falls_back_to_oldest_month_only()
     test_current_bucket_zero_via_an_explicit_zero_payable_row_falls_back_to_oldest_only()
     test_adjacent_case_second_month_is_current()

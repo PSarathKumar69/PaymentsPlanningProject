@@ -20,6 +20,7 @@ Rules:
 - Bullet points only. One short phrase or sentence per bullet. Never a paragraph.
 - Keep the whole response under 120 words.
 - No markdown beyond the two bold headers above and simple "- " bullets.
+- Every amount is in Indian Rupees. Always write the Rupee symbol "₹" before the number, using Indian-style digit grouping (e.g. "₹12,34,567", not "₹1,234,567"). Never use the US dollar symbol, "USD", "dollars", or any other currency — this is never a US Dollar amount.
 """
 
 
@@ -46,7 +47,9 @@ _GUARDRAILS = """Non-negotiable rules for the script's content:
 3. Never compare this vendor to any other vendor, in any way — no "you're getting less than others," no naming or alluding to another vendor at all.
 4. Never use language that could read as threatening, discriminatory, or non-compliant — stay respectful and professional even when the news is a cut or zero payment. AuthBridge is a compliance-conscious company.
 5. Use ONLY the facts given below. Never invent a number, date, vendor name, or reason that isn't explicitly present in the facts.
-6. If a fact you'd need is missing from what's given below, say so plainly in the script rather than inventing plausible-sounding filler."""
+6. If a fact you'd need is missing from what's given below, say so plainly in the script rather than inventing plausible-sounding filler.
+7. Every amount is in Indian Rupees — always write the Rupee symbol "₹" before the number, using Indian-style digit grouping (e.g. "₹12,34,567", not "₹1,234,567"). Never use the US dollar symbol, "USD", "dollars", or any other currency — this is never a US Dollar amount.
+8. Never explain the internal reasoning or process behind why this amount was chosen — not even in plain-sounding words. Phrases like "our current operational plan", "prioritizes invoices", "aging period", or "as per the plan" are exactly as unwelcome to a vendor as the internal jargon banned in rule 2 above, even though they don't literally name a bucket or model term. State the amount and status plainly instead, and stop there. If brief context is genuinely needed, use only simple, human framing a vendor would actually find natural — referring to "this payment cycle" is fine; explaining the bucket/aging mechanics or prioritization logic behind it is not."""
 
 
 def build_talking_points_prompt(fact_pack):
@@ -67,6 +70,34 @@ Structure, in order:
 3. Closing line: next steps or when to expect payment — vague enough to not overpromise beyond what this cycle's plan actually decided.
 
 Keep the whole script phone-call length — something a person can read aloud in under a minute, roughly 120-150 words total.
+
+Facts about this vendor:
+{json.dumps(fact_pack, indent=2, default=str)}"""
+
+
+def build_vendor_email_prompt(fact_pack):
+    """Written-email generalization of build_talking_points_prompt() above —
+    same fact pack, same non-negotiable _GUARDRAILS (currency, no internal
+    jargon/process language, no invented facts, no vendor comparisons, no
+    legal-commitment language), but an email-shaped structure instead of a
+    spoken script. No vendor contact name is available in the fact pack, so
+    the greeting stays generic (the vendor's own name, not a fabricated
+    person); the sign-off is the team, never a fabricated personal name."""
+    return f"""{_OPERATOR_VOICE}
+
+WHAT THE EMAIL ITSELF MUST SOUND LIKE (these are the literal words sent to the vendor in a real email): professional, warm, and respectful throughout — never slangy or casual, regardless of your own internal register above. This is a real external party, not the Finance user you're helping.
+
+{_GUARDRAILS}
+
+Write the email as plain written prose in short paragraphs — no bullet points, no markdown headers, no bold text. This is read on screen as an email, not read aloud.
+
+Structure, in order:
+1. Greeting: "Dear [Vendor Name] team," using the vendor's actual name from the facts below — never a fabricated contact person's name.
+2. 1-3 short paragraphs: the real amount and status for this cycle, translated into plain language, plus brief context per the rules above (no internal process/reasoning language).
+3. Next steps or when to expect payment — vague enough to not overpromise beyond what this cycle's plan actually decided.
+4. Sign-off: "Regards,\\nAuthBridge Finance Team" — never a fabricated personal name.
+
+Keep it noticeably shorter and tighter than a formal letter — this is a routine payment-update email, not a legal notice. Roughly 100-150 words total, excluding the greeting and sign-off lines.
 
 Facts about this vendor:
 {json.dumps(fact_pack, indent=2, default=str)}"""

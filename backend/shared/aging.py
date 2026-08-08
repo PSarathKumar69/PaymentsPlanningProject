@@ -1,4 +1,6 @@
-"""Tranche-based FIFO aging — shared by Model 1 and (later) Model 2.
+"""Tranche-based FIFO aging — shared infra, used by New Model 2
+(transitively via planner.py/vendors.py) and originally built for Model 1
+(now retired).
 
 Each month's payable is a dated tranche. Payments are applied FIFO: the
 oldest still-unpaid tranche is paid down first, regardless of which month
@@ -183,16 +185,27 @@ def compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0):
 
     tranches = build_vendor_tranches(ledger_rows, already_paid_this_cycle=already_paid_this_cycle)
 
-    # Raw per-month Payable/Payment, for the vendor detail card's own
-    # Payable | Payment | Owed breakdown table (transparency alongside the
-    # Aging bucket view above) — opening_balance folded into month 0's
-    # payable, same as build_vendor_tranches()'s tranche.original, so
-    # Payable and Owed stay mutually consistent for that first month.
-    payable_by_month = {}
-    payment_by_month = {}
+    # FLAGGED DEFAULT (house style, see allocator.py's FALLBACK_BUCKET
+    # comment) — docs/14 assumes as_of (planning month minus one) always
+    # equals the sheet's own latest ledger month. In practice Finance can
+    # set the planning month to the same cycle a fresh upload just ingested
+    # real data for, leaving a ledger row dated AFTER as_of — negative
+    # months-back, which bucket_for_months_back() correctly rejects as a
+    # bug everywhere else. docs/14 frames the planning month itself as "the
+    # cycle being funded, not a bucket that ages against itself" — so a row
+    # at or after as_of isn't overdue yet, and is clamped into "0-30"
+    # (never excluded outright: real money, so it must still land
+    # somewhere in total_outstanding/bucket_balances). remaining_by_mb and
+    # the payable/payment maps below accumulate (+=) rather than overwrite,
+    # so if more than one real month clamps to the same months_back, their
+    # amounts are summed, never one silently overwriting the other.
+    payable_by_mb = {}
+    payment_by_mb = {}
     for i, row in enumerate(ledger_rows):
-        payable_by_month[row.month] = float(row.payable) + (float(row.opening_balance) if i == 0 else 0.0)
-        payment_by_month[row.month] = float(row.payment)
+        mb = max(0, _months_back(as_of, row.month))
+        billed = float(row.payable) + (float(row.opening_balance) if i == 0 else 0.0)
+        payable_by_mb[mb] = payable_by_mb.get(mb, 0.0) + billed
+        payment_by_mb[mb] = payment_by_mb.get(mb, 0.0) + float(row.payment)
 
     bucket_balances = {label: 0.0 for label, _, _ in AGING_BUCKETS}
     remaining_by_months_back = {}
@@ -201,14 +214,14 @@ def compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0):
     for t in tranches:
         if t.remaining <= MONEY_EPSILON:  # rounding noise, not real outstanding balance
             continue
-        months_back = _months_back(as_of, t.month)
+        months_back = max(0, _months_back(as_of, t.month))
         bucket_balances[bucket_for_months_back(months_back)] += t.remaining
-        remaining_by_months_back[months_back] = t.remaining
+        remaining_by_months_back[months_back] = remaining_by_months_back.get(months_back, 0.0) + t.remaining
         total_outstanding += t.remaining
         if oldest_month is None or t.month < oldest_month:
             oldest_month = t.month
 
-    oldest_months_back = _months_back(as_of, oldest_month) if oldest_month else None
+    oldest_months_back = max(0, _months_back(as_of, oldest_month)) if oldest_month else None
     oldest_bucket = bucket_for_months_back(oldest_months_back) if oldest_month else None
 
     # docs/04 redefinition: the oldest bill's own amount, isolated from
@@ -216,6 +229,14 @@ def compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0):
     # lumped sum. Every calendar month is walked down to 0, including
     # months with nothing outstanding (no tranche object at all), so
     # Finance sees the full monthly shape, not just the non-zero months.
+    #
+    # Known residual limitation from the future-dated-row clamp above: if a
+    # vendor somehow has more than one real ledger row dated after as_of
+    # (as_of trailing the sheet's latest month by 2+ cycles — not the
+    # expected planning workflow, docs/14), they'd all clamp into the same
+    # months_back=0 bucket and this would isolate their combined amount,
+    # not just the true oldest one. Not fixed here — not worth a bigger
+    # rework for a compounding of an already-rare edge case.
     oldest_bucket_amount = remaining_by_months_back.get(oldest_months_back, 0.0) if oldest_month else 0.0
     monthly_breakdown = (
         [
@@ -224,8 +245,8 @@ def compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0):
                 "month": _month_minus(as_of, mb),  # real calendar month, alongside the day-range label
                 "label": _day_range_label(mb),
                 "amount": remaining_by_months_back.get(mb, 0.0),  # still-owed balance (post-FIFO)
-                "payable": payable_by_month.get(_month_minus(as_of, mb), 0.0),  # that month's own billed amount
-                "payment": payment_by_month.get(_month_minus(as_of, mb), 0.0),  # raw ledger payment recorded that month
+                "payable": payable_by_mb.get(mb, 0.0),  # that bucket's own billed amount
+                "payment": payment_by_mb.get(mb, 0.0),  # raw ledger payment recorded for that bucket
             }
             for mb in range(oldest_months_back, -1, -1)
         ]

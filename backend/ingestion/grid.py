@@ -26,7 +26,15 @@ import openpyxl
 
 from backend.db.models import MonthlyLedger, Vendor, VendorExtraField
 from backend.ingestion.load_excel import EXCEL_PATH
-from backend.ingestion.column_mapping import FIELD_TO_EXCEL_HEADER, build_sheet_map, find_column, unmapped_header_columns
+from backend.ingestion import column_mapping_store
+from backend.ingestion.column_mapping import (
+    build_sheet_map,
+    find_column,
+    find_duplicate_erp_codes,
+    format_header_value,
+    resolve_header,
+    unmapped_header_columns,
+)
 from backend.configuration.extra_fields import list_extra_fields
 
 
@@ -37,8 +45,8 @@ def _describe_columns(ws, sheet_map, category_col, commitment_months_col, assign
     unmapped_by_col = dict(unmapped)
 
     columns = []
-    for cell in (ws.cell(row=3, column=c) for c in range(1, ws.max_column + 1)):
-        header = str(cell.value).strip() if cell.value is not None else None
+    for cell in (ws.cell(row=sheet_map.header_row, column=c) for c in range(1, ws.max_column + 1)):
+        header = format_header_value(cell.value)
         if header is None:
             continue
         c = cell.column
@@ -81,22 +89,65 @@ def _describe_columns(ws, sheet_map, category_col, commitment_months_col, assign
     return columns
 
 
+_NO_DATA_GRID = {
+    "columns": [],
+    "vendors": [],
+    "extra_field_widgets": {},
+    "has_data": False,
+    "duplicate_erp_codes": [],
+    "duplicate_dropped_rows": [],
+}
+
+
 def build_master_grid(session, excel_path=None):
     """Read-only. `session` supplies every value; `excel_path` (defaults to
     the real master) is opened only to learn column identity/order —
     values always come from the DB, never straight from this workbook read,
-    so a grid built mid-preview never shows uncommitted data."""
+    so a grid built mid-preview never shows uncommitted data.
+
+    "No data yet" fix (Main-tab task): judged by whether any active vendor
+    row exists in the DB, not by whether a file happens to sit at
+    excel_path — a genuinely fresh environment has no master file at all,
+    and the DB (not the filesystem) is what actually reflects "Finance has
+    successfully uploaded something." Cheaper too: skips opening the
+    workbook entirely in the common empty case, rather than opening it just
+    to throw the result away. Returns has_data=False (empty columns/
+    vendors, never a raw exception) in that case — same shape a caller gets
+    from the FileNotFoundError backstop below, for the rarer DB/file-desync
+    case (vendor rows exist but the file itself has since gone missing).
+    """
     excel_path = excel_path or EXCEL_PATH
-    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    if session.query(Vendor).filter(Vendor.is_active.isnot(False)).count() == 0:
+        return _NO_DATA_GRID
+
+    header_overrides = column_mapping_store.load_overrides(session)
+    sheet_start_month = column_mapping_store.get_sheet_start_month(session)
+    try:
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+    except FileNotFoundError:
+        return _NO_DATA_GRID
     ws = wb.active
-    sheet_map = build_sheet_map(ws)
-    category_col = find_column(ws, FIELD_TO_EXCEL_HEADER["category"])
-    commitment_months_col = find_column(ws, FIELD_TO_EXCEL_HEADER["commitment_months"])
-    assigned_week_col = find_column(ws, FIELD_TO_EXCEL_HEADER["assigned_week"])
-    priority_tag_col = find_column(ws, FIELD_TO_EXCEL_HEADER["priority_tag"])
+    sheet_map = build_sheet_map(ws, header_overrides=header_overrides, sheet_start_month=sheet_start_month)
+    category_col = find_column(ws, resolve_header("category", header_overrides), sheet_map.header_row)
+    commitment_months_col = find_column(ws, resolve_header("commitment_months", header_overrides), sheet_map.header_row)
+    assigned_week_col = find_column(ws, resolve_header("assigned_week", header_overrides), sheet_map.header_row)
+    priority_tag_col = find_column(ws, resolve_header("priority_tag", header_overrides), sheet_map.header_row)
     unmapped = unmapped_header_columns(
         ws, sheet_map, extra_cols=(category_col, commitment_months_col, assigned_week_col, priority_tag_col)
     )
+
+    # Go-live "show every row" task: recomputed fresh on every call (cheap
+    # at this row count, always accurate after a re-upload) — never
+    # persisted. The winning row (first occurrence, same as load()'s own
+    # upsert) is the one live Vendor record, flagged in the main grid;
+    # every other row is display-only "here's what you're missing".
+    duplicate_groups = find_duplicate_erp_codes(ws, sheet_map)
+    duplicate_erp_codes = [str(g["erp_code"]) for g in duplicate_groups]
+    duplicate_dropped_rows = [
+        {"erp_code": str(g["erp_code"]), "vendor_name": r["vendor_name"], "row": r["row"]}
+        for g in duplicate_groups
+        for r in g["rows"][1:]
+    ]
     columns = _describe_columns(
         ws, sheet_map, category_col, commitment_months_col, assigned_week_col, priority_tag_col, unmapped
     )
@@ -144,7 +195,7 @@ def build_master_grid(session, excel_path=None):
             elif kind in ("week", "week_total", "assigned_week_order_legacy"):
                 values[h] = None  # see module docstring's flagged ambiguity
             elif kind == "category":
-                values[h] = vendor.category.value
+                values[h] = vendor.category
             elif kind == "commitment_months":
                 values[h] = vendor.commitment_months
             elif kind == "assigned_week":
@@ -155,4 +206,11 @@ def build_master_grid(session, excel_path=None):
                 values[h] = extra_values.get(col["column_name"])
         vendors_out.append({"vendor_id": vendor.id, "erp_code": vendor.erp_code, "values": values})
 
-    return {"columns": columns, "vendors": vendors_out, "extra_field_widgets": extra_widgets}
+    return {
+        "columns": columns,
+        "vendors": vendors_out,
+        "extra_field_widgets": extra_widgets,
+        "has_data": True,
+        "duplicate_erp_codes": duplicate_erp_codes,
+        "duplicate_dropped_rows": duplicate_dropped_rows,
+    }
