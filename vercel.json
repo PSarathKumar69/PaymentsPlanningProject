@@ -5,14 +5,26 @@
       "entrypoint": "backend.api.main:app",
       "functions": {
         "backend/api/main.py": {
-          "excludeFiles": "{frontend/**,test_data/**,data/**,backend/db/*.db,backend/db/*.db.backup_*,backend/db/*.bak-erpfix-*,**/__pycache__/**,**/*.pyc,.pytest_cache/**,**/test_*.py,**/*_test.py,backend/_tmp_guardrail_probe_test.py,backend/ingestion/verify_ai_first_mapping_manually.py,node_modules/**}"
+          "excludeFiles": "{frontend/**,test_data/**,data/**,backend/db/*.db*,**/__pycache__/**,**/*.pyc,.pytest_cache/**,**/test_*.py,**/*_test.py}"
         }
       }
     },
-    "frontend": { "root": "frontend/" }
+    "frontend": {
+      "root": "frontend/"
+    }
   },
   "rewrites": [
-    { "source": "/(ai|analytics|audit-log|calendar|config|ingestion|master-data|models|payments|plan-allocations|plan-runs|vendors|weekly-view|static)(/.*)?", "destination": { "service": "backend" } },
-    { "source": "/(.*)", "destination": { "service": "frontend" } }
+    {
+      "source": "/(ai|analytics|audit-log|calendar|config|ingestion|master-data|models|payments|plan-allocations|plan-runs|vendors|weekly-view|static)(/.*)?",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "frontend"
+      }
+    }
   ]
 }
