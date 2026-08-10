@@ -393,24 +393,6 @@ class PriorityBucket(Base):
     pinned_role: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
-class MasterWorkbook(Base):
-    """Master Excel workbook bytes (Vercel-migration task) — Vercel
-    Functions are stateless/ephemeral (backend/db/session.py's DATABASE_URL
-    comment), so the file can no longer live on local disk in production.
-    Two rows, keyed by slot ("current"/"backup") — same two-slot model
-    upload.py/revert_upload() already had on disk, just backed by Postgres
-    now instead of os.replace()/shutil.copyfile(). Not business data, pure
-    blob storage — no FK, no relationship.
-    """
-
-    __tablename__ = "master_workbook"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    slot: Mapped[str] = mapped_column(String, unique=True, index=True)
-    content: Mapped[bytes] = mapped_column(LargeBinary)
-    updated_at: Mapped[datetime] = mapped_column(DateTime)
-
-
 class Config(Base):
     """System-level settings: Model 1 weights, Model 3 bucket thresholds.
 
@@ -424,3 +406,30 @@ class Config(Base):
     key: Mapped[str] = mapped_column(String, unique=True, index=True)
     value: Mapped[str] = mapped_column(String)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class MasterExcelBlob(Base):
+    """Durable Postgres copy of the master Excel file's raw bytes.
+
+    Vercel Functions have a read-only filesystem outside /tmp, and /tmp
+    itself does not survive between separate container instances — so the
+    literal on-disk file at load_excel.EXCEL_PATH can vanish between the
+    request that uploads it and a later, different container's request
+    that needs to read it back (the master-data grid, exports — see
+    grid.py/new_model_2.py, which open EXCEL_PATH directly, unmodified).
+
+    This one-row table is that durable source of truth once DATABASE_URL
+    points at Postgres: load_excel.py rehydrates EXCEL_PATH's on-disk copy
+    from here once per cold start, and upload.py's commit_upload()/
+    revert_upload() write back here (current + the one backup slot) in the
+    SAME transaction as everything else they commit. Exactly one row
+    (id=1) — same "exactly one backup slot" design upload.py already uses
+    for the file-level backup.
+    """
+
+    __tablename__ = "master_excel_blob"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    backup_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)

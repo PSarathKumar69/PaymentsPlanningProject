@@ -54,39 +54,35 @@ def build_exceptions(session, ws_for_duplicates, as_of):
 
     `ws_for_duplicates` is an already-open openpyxl worksheet of the live
     master sheet (read-only use only — find_duplicate_erp_codes() never
-    mutates it), or None to skip the duplicate-ERP-code check entirely
-    (Vercel-migration task: the DB-backed master workbook blob can
-    genuinely not exist yet — e.g. vendor data seeded via the ops-only
-    /ingestion/load endpoint with an explicit path — in which case there's
-    nothing to check, not an error). Callers that already have one open
-    (finalized-plan-export) should pass it directly; min-funds-
-    verification-export passes None when no master workbook blob exists.
+    mutates it). Callers that already have one open (finalized-plan-export)
+    should pass it directly; a caller with none open yet
+    (min-funds-verification-export) opens EXCEL_PATH read-only just for
+    this.
     """
     rows = []
 
-    if ws_for_duplicates is not None:
-        header_overrides = column_mapping_store.load_overrides(session)
-        sheet_start_month = column_mapping_store.get_sheet_start_month(session)
-        sheet_map = build_sheet_map(
-            ws_for_duplicates, header_overrides=header_overrides, sheet_start_month=sheet_start_month
-        )
-        for group in find_duplicate_erp_codes(ws_for_duplicates, sheet_map):
-            winner = group["rows"][0]
-            for skipped in group["rows"][1:]:
-                rows.append(
-                    {
-                        "vendor_name": skipped["vendor_name"],
-                        "erp_code": group["erp_code"],
-                        "entity": group["entity"],
-                        "category": "Duplicate ERP code — dropped at ingestion",
-                        "reason": (
-                            f"Same entity+ERP-code ({group['entity']}/{group['erp_code']}) as "
-                            f"{winner['vendor_name']!r} (row {winner['row']}, kept) — this row "
-                            f"(row {skipped['row']}) was skipped entirely at upload and never became "
-                            "a vendor record. Assign a distinct ERP code to resolve."
-                        ),
-                    }
-                )
+    header_overrides = column_mapping_store.load_overrides(session)
+    sheet_start_month = column_mapping_store.get_sheet_start_month(session)
+    sheet_map = build_sheet_map(
+        ws_for_duplicates, header_overrides=header_overrides, sheet_start_month=sheet_start_month
+    )
+    for group in find_duplicate_erp_codes(ws_for_duplicates, sheet_map):
+        winner = group["rows"][0]
+        for skipped in group["rows"][1:]:
+            rows.append(
+                {
+                    "vendor_name": skipped["vendor_name"],
+                    "erp_code": group["erp_code"],
+                    "entity": group["entity"],
+                    "category": "Duplicate ERP code — dropped at ingestion",
+                    "reason": (
+                        f"Same entity+ERP-code ({group['entity']}/{group['erp_code']}) as "
+                        f"{winner['vendor_name']!r} (row {winner['row']}, kept) — this row "
+                        f"(row {skipped['row']}) was skipped entirely at upload and never became "
+                        "a vendor record. Assign a distinct ERP code to resolve."
+                    ),
+                }
+            )
 
     vendors, ledger_by_vendor = _load_vendors_and_ledger(session)
     for vendor in vendors:

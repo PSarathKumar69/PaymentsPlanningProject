@@ -6,7 +6,7 @@ import tempfile
 from datetime import datetime
 
 import pandas as pd
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -21,12 +21,18 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 @router.get("/dashboard", response_model=AnalyticsDashboardResponse)
-def get_dashboard():
+def get_dashboard(response: Response):
+    # No-store: these numbers change on every upload/reset/payment log, and
+    # Vercel's edge/CDN will otherwise happily serve a cached copy of this
+    # exact GET URL after the underlying data has changed (observed bug:
+    # analytics page still showing pre-reset numbers post-reset).
+    response.headers["Cache-Control"] = "no-store"
     return get_analytics_dashboard()
 
 
 @router.get("/funds-trend", response_model=FundsTrendResponse)
-def get_trend():
+def get_trend(response: Response):
+    response.headers["Cache-Control"] = "no-store"
     return {"trend": get_funds_trend()}
 
 

@@ -16,7 +16,6 @@ per-vendor audit_log summary — a separate governance requirement, docs/11 /
 CLAUDE.md rule 6) — only the "show Finance the diff and make them confirm
 before anything is written" gate is gone.
 """
-import io
 import os
 import shutil
 import tempfile
@@ -25,23 +24,22 @@ from datetime import date, datetime
 import openpyxl
 from sqlalchemy import func
 
-from backend.db.models import AuditLog, MonthlyLedger, Vendor, VendorExtraField
+from backend.db.models import AuditLog, MasterExcelBlob, MonthlyLedger, Vendor, VendorExtraField
 from backend.db.session import SessionLocal
 from backend.ingestion import ai_column_mapper, column_mapping_store
 from backend.ingestion.column_mapping import build_sheet_map, normalize_entity_text, sheet_start_month_warning
-from backend.ingestion.load_excel import EXCEL_PATH, get_workbook_bytes, load, set_workbook_bytes
+from backend.ingestion.load_excel import EXCEL_PATH, load
 from backend.month_end.rollover import _reset_vendor_cycle_state
 from backend.shared.constants import MONEY_EPSILON
 from backend.shared.enums import ChangeSource
 from backend.shared.planning_month_store import set_current_planning_month
 
 # Exactly one backup slot (decision #3) — overwritten every commit, never
-# timestamped/versioned. Vercel-migration task: production now stores both
-# slots as MasterWorkbook DB rows ("current"/"backup"), not local files —
-# Vercel Functions can't rely on local disk persisting across invocations.
-# This path constant (and the disk-based backup/replace mechanics below)
-# survive only as the explicit-excel_path test/ops escape hatch — see
-# commit_upload()/revert_upload()'s own docstrings.
+# timestamped/versioned. Same directory as the master file so the later
+# os.replace in _atomic_replace is same-filesystem and atomic. Keeps the
+# real .xlsx extension (".backup" inserted before it, not appended after)
+# so the backup stays directly openable by openpyxl/Excel itself, not just
+# by this module's own raw-byte copy — worth keeping valid on its own.
 _root, _ext = os.path.splitext(EXCEL_PATH)
 MASTER_EXCEL_BACKUP_PATH = f"{_root}.backup{_ext}"
 
@@ -59,6 +57,27 @@ def _atomic_replace(source_path, dest_path):
     except Exception:
         os.remove(tmp_path)
         raise
+
+
+def _persist_master_excel_blob(session, excel_path, backup_path=None):
+    """Vercel fix, write side of load_excel._rehydrate_excel_path_from_db():
+    copies whatever commit_upload()/revert_upload() just wrote to disk into
+    the durable MasterExcelBlob row, in the SAME session/transaction as
+    load()'s writes and the audit_log rows below — so a rolled-back upload
+    never leaves Postgres holding a file version the DB rows disagree with.
+
+    backup_path is optional (omitted from revert_upload's call) — passing
+    it updates the one backup slot too; omitting it leaves whatever backup
+    is already stored untouched.
+    """
+    row = session.get(MasterExcelBlob, 1) or MasterExcelBlob(id=1)
+    with open(excel_path, "rb") as f:
+        row.content = f.read()
+    if backup_path and os.path.exists(backup_path):
+        with open(backup_path, "rb") as f:
+            row.backup_content = f.read()
+    row.updated_at = datetime.now()
+    session.add(row)
 
 
 def _vendor_key(entity, erp_code):
@@ -216,13 +235,11 @@ def commit_upload(uploaded_excel_path, excel_path=None, backup_path=None, sheet_
     with nothing shown or confirmed in between (no preview step — Sarath's
     explicit course-correction on the original two-step design).
 
-    excel_path/backup_path: explicit path override — same convention
-    vendor_edits.py's own excel_path=None param already uses, so tests can
-    point this at a tmp_path copy instead of a real file. Production
-    callers omit both (Vercel-migration task): the master workbook then
-    lives as two Postgres rows (MasterWorkbook, "current"/"backup" slots)
-    instead of local disk, since Vercel Functions can't rely on local disk
-    persisting across invocations.
+    excel_path/backup_path: override the real master/backup paths — same
+    convention vendor_edits.py's own excel_path=None param already uses, so
+    tests can point this at a tmp_path copy instead of the real master file.
+    Production callers omit both and get the real EXCEL_PATH/
+    MASTER_EXCEL_BACKUP_PATH.
 
     sheet_start_month (P1 demo-readiness task, stretch goal): optional,
     Finance-supplied override for THIS upload's sheet start month — if
@@ -257,40 +274,31 @@ def commit_upload(uploaded_excel_path, excel_path=None, backup_path=None, sheet_
     the frontend can tell Finance when (and only when) it actually happened.
 
     Order (task's explicit spec, and it matters): (a) back up the CURRENT
-    master to the one fixed backup slot, (b) replace the master with the
-    uploaded one, (c) run load() for real against the new master, in the
-    same transaction as Part B's VendorExtraField upserts (already true —
-    load() upserts those itself), (d) one audit_log entry per vendor that
-    actually changed.
+    master to the one fixed backup slot, (b) atomically replace the master
+    file with the uploaded one, (c) run load() for real against the new
+    master, in the same transaction as Part B's VendorExtraField upserts
+    (already true — load() upserts those itself), (d) one audit_log entry
+    per vendor that actually changed.
 
-    Vercel-migration task: when excel_path/backup_path are omitted (every
-    production call), (a) and (b) are now DB writes (MasterWorkbook rows)
-    in the SAME transaction as everything else this call writes — strictly
-    MORE atomic than the old disk-based version, which had a documented
-    residual-risk window between replacing the file and the DB commit. The
-    explicit-path mode below (tests/ops) keeps the old disk-based
-    backup-then-atomic-replace mechanics unchanged, residual-risk window
-    and all, since two real files genuinely can't share one DB transaction.
+    RESIDUAL RISK — flagged, not solved here (same house style as
+    vendor_edits.py's own documented residual-risk window): steps (a)/(b)
+    replace the real master file before step (c)'s DB commit happens, because
+    load() must read the NEW file to produce the report/audit entries at
+    all. If the process dies or the DB commit fails between (b) and (c)'s
+    commit, the master Excel and the DB will disagree (Excel already
+    replaced, DB not yet updated) with nothing to reconcile them
+    automatically. Revert (below) is the recovery path for this, not a
+    silent auto-fix.
     """
-    use_disk = excel_path is not None
-    if use_disk:
-        backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
-        if os.path.exists(excel_path):
-            shutil.copyfile(excel_path, backup_path)  # (a) — exactly one slot, overwritten every time
-        _atomic_replace(uploaded_excel_path, excel_path)  # (b)
-
-    with open(uploaded_excel_path, "rb") as f:
-        uploaded_bytes = f.read()
+    excel_path = excel_path or EXCEL_PATH
+    backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
+    if os.path.exists(excel_path):
+        shutil.copyfile(excel_path, backup_path)  # (a) — exactly one slot, overwritten every time
+    _atomic_replace(uploaded_excel_path, excel_path)  # (b)
 
     session = SessionLocal()
     try:
         before = _snapshot_vendor_state(session)
-
-        if not use_disk:
-            current_bytes = get_workbook_bytes(session, "current")
-            if current_bytes is not None:
-                set_workbook_bytes(session, "backup", current_bytes)  # (a)
-            set_workbook_bytes(session, "current", uploaded_bytes)  # (b)
 
         if sheet_start_month is not None:
             column_mapping_store.set_sheet_start_month(session, sheet_start_month)
@@ -307,11 +315,9 @@ def commit_upload(uploaded_excel_path, excel_path=None, backup_path=None, sheet_
         # mapping or this raises a clear MissingRequiredColumnsError naming
         # the field, instead of load()'s own opaque ValueError deep inside
         # column_mapping.py. Opens the workbook once here purely to read
-        # headers/samples, straight from the just-uploaded bytes (same
-        # content whether or not this call is also writing it to disk/DB
-        # below); load() below opens it again for the real parse — a
-        # second cheap read, not a second copy of any parsing logic.
-        wb_for_mapping = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=True)
+        # headers/samples; load() below opens it again for the real parse —
+        # a second cheap read, not a second copy of any parsing logic.
+        wb_for_mapping = openpyxl.load_workbook(excel_path, data_only=True)
         mapping_result = ai_column_mapper.resolve_column_mapping(session, wb_for_mapping.active)
 
         # Non-blocking sheet-start-month sanity check (P1 demo-readiness
@@ -385,6 +391,7 @@ def commit_upload(uploaded_excel_path, excel_path=None, backup_path=None, sheet_
             )
         )
 
+        _persist_master_excel_blob(session, excel_path, backup_path)  # Vercel fix — durable copy, same transaction
         session.commit()  # (d) — load()'s own writes + every audit_log row above, one transaction
         # Sheet-start-month warning first (loudest, most demo-critical —
         # P1 task's "impossible to miss" instruction), then the AI
@@ -421,28 +428,16 @@ def revert_upload(excel_path=None, backup_path=None):
     made after the bad upload and before this revert is not part of the
     backup and will look "un-done" once the DB is re-ingested from the
     restored file — surfaced as a plain warning string below, not hidden.
-
-    excel_path/backup_path: explicit path override (tests/ops), same
-    escape hatch as commit_upload()'s own. Production callers omit both
-    (Vercel-migration task) — the backup then comes from the MasterWorkbook
-    "backup" DB row, restored into the "current" row in the same
-    transaction as the re-ingestion below, rather than a disk copy.
     """
-    use_disk = excel_path is not None
-    if use_disk:
-        backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
-        if not os.path.exists(backup_path):
-            raise ValueError("no backup available yet — nothing to revert to (an upload must be committed first)")
-        _atomic_replace(backup_path, excel_path)
+    excel_path = excel_path or EXCEL_PATH
+    backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
+    if not os.path.exists(backup_path):
+        raise ValueError("no backup available yet — nothing to revert to (an upload must be committed first)")
+
+    _atomic_replace(backup_path, excel_path)
 
     session = SessionLocal()
     try:
-        if not use_disk:
-            backup_bytes = get_workbook_bytes(session, "backup")
-            if backup_bytes is None:
-                raise ValueError("no backup available yet — nothing to revert to (an upload must be committed first)")
-            set_workbook_bytes(session, "current", backup_bytes)
-
         # Persisted overrides only (data_store read, no Gemini call) — the
         # restored file is a KNOWN-GOOD prior state whose headers were
         # already resolved (by the AI or by matching the fixed defaults)
@@ -450,6 +445,7 @@ def revert_upload(excel_path=None, backup_path=None):
         # re-invoke the AI, only remember what it already learned.
         header_overrides = column_mapping_store.load_overrides(session)
         load_report = load(excel_path=excel_path, session=session, header_overrides=header_overrides)
+        _persist_master_excel_blob(session, excel_path)  # Vercel fix — durable copy, same transaction
         session.commit()
         return {
             **load_report,

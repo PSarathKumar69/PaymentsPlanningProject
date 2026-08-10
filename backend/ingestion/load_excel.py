@@ -17,13 +17,14 @@ source of truth precisely because edits are written back into it.
 
 Run with: python -m backend.ingestion.load_excel
 """
-import io
 import logging
+import os
+import tempfile
 from datetime import datetime
 
 import openpyxl
 
-from backend.db.models import AuditLog, MasterWorkbook, MonthlyLedger, PlanAllocation, PlanRun, Vendor, VendorExtraField
+from backend.db.models import AuditLog, MasterExcelBlob, MonthlyLedger, PlanAllocation, PlanRun, Vendor, VendorExtraField
 from backend.db.session import SessionLocal, init_db
 from backend.ingestion import column_mapping, column_mapping_store
 from backend.ingestion.column_mapping import (
@@ -47,57 +48,52 @@ from backend.shared.enums import ChangeSource, VendorCategory
 
 EXCEL_PATH = "data/Vendor's Details.xlsx"
 
+
+def _rehydrate_excel_path_from_db(path):
+    """Vercel fix: make sure `path` exists and holds the latest upload
+    before anything below tries to open it.
+
+    Two separate problems on Vercel Functions, both real: (1) the
+    filesystem is read-only outside /tmp, and (2) vercel.json's
+    excludeFiles strips data/** from the deployed bundle entirely, so the
+    literal relative EXCEL_PATH above can never be written to or even
+    exist there. Redirecting EXCEL_PATH to /tmp (below) fixes "can I write
+    it", but /tmp does NOT survive between separate container instances —
+    a later request (master-grid load, an export) can land on a fresh
+    container that never saw the upload. This re-downloads the current
+    file from the durable Postgres copy (MasterExcelBlob, written by
+    upload.py's commit_upload()/revert_upload()) once per cold start, so
+    every existing EXCEL_PATH reader in this codebase (grid.py,
+    new_model_2.py, vendor_edits.py, this module) keeps working with zero
+    changes on their end — they just see a real file at whatever EXCEL_PATH
+    now is.
+
+    No-op (leaves no file) if nothing has ever been uploaded yet — same
+    pre-first-upload state as today; callers already handle a missing
+    EXCEL_PATH file (see grid.py's own FileNotFoundError backstop).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)  # so _atomic_replace's mkstemp has somewhere to land even pre-first-upload
+    session = SessionLocal()
+    try:
+        row = session.get(MasterExcelBlob, 1)
+        if row is None:
+            return
+        with open(path, "wb") as f:
+            f.write(row.content)
+    finally:
+        session.close()
+
+
+if os.environ.get("DATABASE_URL"):
+    EXCEL_PATH = os.path.join(tempfile.gettempdir(), "master_excel", "Vendor's Details.xlsx")
+    _rehydrate_excel_path_from_db(EXCEL_PATH)
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("ingestion")
 
 
-def get_workbook_bytes(session, slot):
-    """DB-backed master workbook read (Vercel-migration task) — `slot` is
-    "current" or "backup". None if nothing's been stored there yet."""
-    row = session.query(MasterWorkbook).filter_by(slot=slot).first()
-    return bytes(row.content) if row is not None else None
-
-
-def set_workbook_bytes(session, slot, content):
-    """DB-backed master workbook write. Caller commits — this only adds/
-    updates the row on the given session, same convention as every other
-    write helper in this codebase."""
-    row = session.query(MasterWorkbook).filter_by(slot=slot).first()
-    if row is None:
-        session.add(MasterWorkbook(slot=slot, content=content, updated_at=datetime.now()))
-    else:
-        row.content = content
-        row.updated_at = datetime.now()
-
-
-def workbook_source(excel_path, session, slot="current"):
-    """What openpyxl.load_workbook() should open: an explicit `excel_path`
-    (test/ops escape hatch — every existing test that already passes this
-    keeps working unmodified) if given, else the DB-backed blob for `slot`,
-    wrapped in io.BytesIO since openpyxl accepts a path or a file-like
-    object equally well. Raises FileNotFoundError (same exception type the
-    old direct-file-open path could raise) when neither is available, so
-    existing try/except FileNotFoundError callers (grid.py) keep working
-    unmodified too.
-    """
-    if excel_path is not None:
-        return excel_path
-    content = get_workbook_bytes(session, slot)
-    if content is None:
-        raise FileNotFoundError(f"no master workbook stored in the database yet (slot={slot!r})")
-    return io.BytesIO(content)
-
-
-def load(excel_path=None, session=None, header_overrides=None, sheet_start_month=None, header_row=None, data_start_row=None):
-    """excel_path: None (every production caller) reads the DB-backed
-    "current" master workbook blob (Vercel-migration task — Vercel
-    Functions can't rely on local disk) via workbook_source(). An explicit
-    path (tests, the /ingestion/load ops endpoint, or a direct script run
-    passing EXCEL_PATH) reads that file instead, exactly as before this
-    task — every existing caller that already passes excel_path keeps
-    working unmodified.
-
-    session: optional externally-supplied session — e.g.
+def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start_month=None, header_row=None, data_start_row=None):
+    """session: optional externally-supplied session — e.g.
     backend/month_end/rollover.py passes its own session so re-ingestion and
     its subsequent payment-cycle reset commit together as one transaction.
     Defaults to owning its own session/commit, unchanged for every other
@@ -132,7 +128,7 @@ def load(excel_path=None, session=None, header_overrides=None, sheet_start_month
     if sheet_start_month is None:
         sheet_start_month = column_mapping_store.get_sheet_start_month(session)
 
-    wb = openpyxl.load_workbook(workbook_source(excel_path, session), data_only=True)
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb.active
     sheet_map = build_sheet_map(
         ws,
@@ -659,4 +655,4 @@ def print_report(report):
 
 
 if __name__ == "__main__":
-    print_report(load(excel_path=EXCEL_PATH))  # direct-script convenience: local checked-out file, not the DB blob
+    print_report(load())
