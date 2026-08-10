@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from backend.ingestion.load_excel import EXCEL_PATH, load
+from backend.ingestion.load_excel import load
 
 router = APIRouter(tags=["ingestion"])
 
@@ -18,7 +18,8 @@ class IngestionLoadRequest(BaseModel):
     "/ingestion/load",
     response_model=dict[str, Any],
     description="Ops/admin action: full re-ingestion of the master Excel. Safely re-runnable, "
-    "but not part of Finance's day-to-day flow.",
+    "but not part of Finance's day-to-day flow. excel_path is an explicit override (tests/ops); "
+    "omitted, this re-ingests the DB-backed 'current' master workbook.",
 )
 def post_ingestion_load(body: IngestionLoadRequest):
-    return load(excel_path=body.excel_path or EXCEL_PATH, session=None)
+    return load(excel_path=body.excel_path, session=None)

@@ -18,9 +18,14 @@ def _load_against_fresh_db():
     os.environ["PAYMENTS_DB_PATH"] = os.path.join(tempfile.mkdtemp(), "test.db")
     for mod in ("backend.db.session", "backend.ingestion.load_excel"):
         sys.modules.pop(mod, None)
-    from backend.ingestion.load_excel import load
+    from backend.ingestion.load_excel import EXCEL_PATH, load
 
-    return load()
+    # Vercel-migration task: load()'s own default is now the DB-backed
+    # "current" blob, not this local checked-out file — this helper
+    # genuinely wants to bootstrap a fresh DB straight from the real
+    # sample file, so it passes the path explicitly (same escape hatch
+    # every other test in this codebase already uses).
+    return load(excel_path=EXCEL_PATH)
 
 
 def test_parse_assigned_week_order():
@@ -237,7 +242,7 @@ def test_assigned_week_survives_reingestion_when_sheet_gives_nothing():
     _load_against_fresh_db()
     from backend.db.models import Vendor
     from backend.db.session import SessionLocal
-    from backend.ingestion.load_excel import load
+    from backend.ingestion.load_excel import EXCEL_PATH, load
 
     session = SessionLocal()
     vendor = session.query(Vendor).filter_by(erp_code="V00400").one()
@@ -246,7 +251,7 @@ def test_assigned_week_survives_reingestion_when_sheet_gives_nothing():
     session.commit()
     session.close()
 
-    load()  # re-ingestion of the same, still-corrupted real sheet, same DB
+    load(excel_path=EXCEL_PATH)  # re-ingestion of the same, still-corrupted real sheet, same DB
 
     session = SessionLocal()
     reloaded = session.query(Vendor).filter_by(id=vendor_id).one()

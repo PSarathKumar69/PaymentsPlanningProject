@@ -3,36 +3,39 @@
 Model 3 thresholds) and replacement-Excel-upload diffing are separate,
 later work — not in scope here.
 
-Every edit spans two systems: the DB and the real Excel file — but only
-when this call *owns* its own session (no session= passed in) does it
-touch Excel at all. Session ownership is the deciding line:
+Every edit spans two systems — but only when this call *owns* its own
+session (no session= passed in) does it touch the Excel side at all.
+Session ownership is the deciding line:
 
 - Owns the session (the normal call, no session= argument): stage the
-  Excel edit to a temp file, commit the DB, and only then publish the
-  staged file (atomic os.replace) — narrowing the drift window to "DB
-  committed, but the Excel replace hasn't happened or failed yet," rather
-  than the older "Excel already saved, DB commit then fails" ordering. On
-  any failure before a successful publish: roll back, never publish.
+  Excel edit, commit the DB, and only then publish the staged edit. On any
+  failure before a successful publish: roll back, never publish.
 - Caller supplies the session (composing into a larger transaction): this
   function is DB-only. It flushes the vendor-field change and audit_log
   row into the shared session and returns — it never commits, never rolls
-  back, and never touches the real Excel file. It has no way to know
-  whether or when the caller's transaction will actually commit, and an
-  Excel publish can't be undone the way a DB row can, so both are left
-  entirely to the caller (any exception here propagates untouched, so the
-  caller's own rollback covers this function's own pending changes too).
+  back, and never touches Excel. It has no way to know whether or when the
+  caller's transaction will actually commit, and an Excel publish can't be
+  undone the way a DB row can, so both are left entirely to the caller
+  (any exception here propagates untouched, so the caller's own rollback
+  covers this function's own pending changes too).
 
-# RESIDUAL RISK — flagged, not fully solved: this is not a real two-phase
-# commit across the DB and the filesystem. If the DB commit succeeds but
-# the subsequent os.replace() fails or the process dies in that narrow
-# window, the DB and Excel will disagree (DB updated, Excel still old)
-# with nothing to reconcile them automatically. A full fix would need a
-# write-ahead log / reconciliation pass across both systems, which is a
-# bigger change than this pass calls for — flagging for Sarath rather than
-# building it now. See test_db_commit_failure_after_excel_write_staged for
-# what's proven today: a commit failure no longer leaves Excel ahead of
-# the DB (the case that was previously untested).
+Two storage backends for the "Excel side" (Vercel-migration task,
+excel_path param on update_vendor_field()/update_extra_field()):
+
+- excel_path given (tests/ops): the real Excel file, on disk — "the DB and
+  the real Excel file" are genuinely two separate systems, so this stays a
+  real two-phase stage-to-temp-file/commit-DB/os.replace() dance, unchanged
+  from before this task. RESIDUAL RISK, not fully solved: if the DB commit
+  succeeds but the subsequent os.replace() fails or the process dies in
+  that narrow window, the DB and Excel will disagree (DB updated, Excel
+  still old) with nothing to reconcile them automatically.
+- excel_path=None (production default): the master workbook is a Postgres
+  blob (MasterWorkbook, "current" slot) now, same database as everything
+  else — so the workbook write folds into the SAME transaction as the
+  vendor-field/audit-log changes, no separate publish phase and no residual
+  risk window at all.
 """
+import io
 import os
 import tempfile
 from datetime import datetime
@@ -53,7 +56,7 @@ from backend.ingestion.column_mapping import (
     resolve_header,
 )
 from backend.configuration.priority_bucket_edits import list_buckets
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import get_workbook_bytes, set_workbook_bytes, workbook_source
 from backend.models.new_model_2.allocator import _seed_and_read_buckets
 from backend.shared.enums import ChangeSource, VendorCategory, VendorPriorityTag
 from backend.weekly_planning.calendar_utils import weeks_in_month
@@ -287,11 +290,11 @@ def _clean_value(field, value):
 
 
 def _save_workbook_to_temp(wb, excel_path):
-    """Shared tail of every staging helper below: saves `wb` to a fresh temp
-    file (same directory as excel_path, so the later os.replace is
-    same-filesystem and atomic) and returns its path. Nothing is published
-    to excel_path yet — that's always the caller's job, after its own DB
-    commit succeeds."""
+    """Shared tail of every staging helper below, explicit-path mode only:
+    saves `wb` to a fresh temp file (same directory as excel_path, so the
+    later os.replace is same-filesystem and atomic) and returns its path.
+    Nothing is published to excel_path yet — that's always the caller's
+    job, after its own DB commit succeeds."""
     directory = os.path.dirname(os.path.abspath(excel_path)) or "."
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=directory)
     os.close(fd)
@@ -299,21 +302,41 @@ def _save_workbook_to_temp(wb, excel_path):
     return tmp_path
 
 
-def _stage_excel_cell_write(header_text, erp_code, entity, cell_value, excel_path, header_overrides=None, sheet_start_month=None):
+def _stage_or_serialize(wb, excel_path):
+    """Explicit excel_path (tests/ops): saves to a fresh temp file, same
+    stage-then-caller-publishes contract as before this task — the caller
+    os.replace()s it into place after its own DB commit succeeds. None
+    (production, Vercel-migration task): returns the workbook's bytes
+    directly instead — the caller writes them straight into the DB-backed
+    "current" blob in the SAME transaction as everything else, no separate
+    staging/publish phase needed once both sides are Postgres."""
+    if excel_path is not None:
+        return _save_workbook_to_temp(wb, excel_path)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _stage_excel_cell_write(
+    header_text, erp_code, entity, cell_value, excel_path, header_overrides=None, sheet_start_month=None, session=None
+):
     """Generic version of the staging step: writes one (header, vendor row)
-    cell to a fresh temp file. Shared by update_extra_field() (data-
-    pipeline-upload task's generic passthrough columns, header is the
-    literal Excel text) — _stage_field_writes() below is the known-field
-    equivalent for update_vendor_field(), writing one or more cells in a
-    single workbook load/save cycle.
+    cell. Shared by update_extra_field() (data-pipeline-upload task's
+    generic passthrough columns, header is the literal Excel text) —
+    _stage_field_writes() below is the known-field equivalent for
+    update_vendor_field(), writing one or more cells in a single workbook
+    load/save cycle.
 
     header_overrides/sheet_start_month (P1 demo-readiness fix): without
     these, build_sheet_map() below falls back to the fixed default headers/
     Apr-2025 start — if the real sheet needed an AI-resolved header for a
     REQUIRED field (erp_code/entity/vendor_name/opening_balance/
     total_payable/total_payment), that raised MissingRequiredColumnsError
-    here even though ingestion itself worked fine."""
-    wb = openpyxl.load_workbook(excel_path)
+    here even though ingestion itself worked fine.
+
+    session: only needed to resolve the DB-backed "current" blob when
+    excel_path is None — see workbook_source()."""
+    wb = openpyxl.load_workbook(workbook_source(excel_path, session))
     ws = wb.active
     sheet_map = build_sheet_map(ws, header_overrides=header_overrides, sheet_start_month=sheet_start_month)
 
@@ -324,10 +347,10 @@ def _stage_excel_cell_write(header_text, erp_code, entity, cell_value, excel_pat
     # actually blank a cell (needed when assigned_week is cleared to None).
     ws.cell(row=row, column=col).value = cell_value
 
-    return _save_workbook_to_temp(wb, excel_path)
+    return _stage_or_serialize(wb, excel_path)
 
 
-def _stage_field_writes(erp_code, entity, field_values, excel_path, header_overrides=None, sheet_start_month=None):
+def _stage_field_writes(erp_code, entity, field_values, excel_path, header_overrides=None, sheet_start_month=None, session=None):
     """Known-field (category/commitment_months/assigned_week/priority_tag)
     staging — writes ONE OR MORE fields for the same vendor row in a single
     workbook load/save cycle. Needed since the Category<->Priority Tag
@@ -341,8 +364,11 @@ def _stage_field_writes(erp_code, entity, field_values, excel_path, header_overr
     field's OWN header is resolved through header_overrides too (these are
     AI-mappable fields, column_mapping.ALL_MAPPABLE_FIELDS) rather than
     always the fixed FIELD_TO_EXCEL_HEADER default, so an edit lands on the
-    same column ingestion/the grid already resolved it to."""
-    wb = openpyxl.load_workbook(excel_path)
+    same column ingestion/the grid already resolved it to.
+
+    session: only needed to resolve the DB-backed "current" blob when
+    excel_path is None — see workbook_source()."""
+    wb = openpyxl.load_workbook(workbook_source(excel_path, session))
     ws = wb.active
     sheet_map = build_sheet_map(ws, header_overrides=header_overrides, sheet_start_month=sheet_start_month)
     row = _find_vendor_row(ws, sheet_map, erp_code, entity)
@@ -352,7 +378,7 @@ def _stage_field_writes(erp_code, entity, field_values, excel_path, header_overr
         col = _find_or_create_column(ws, header_text, sheet_map.header_row)
         ws.cell(row=row, column=col).value = _excel_cell_value(field, new_value)
 
-    return _save_workbook_to_temp(wb, excel_path)
+    return _stage_or_serialize(wb, excel_path)
 
 
 def update_vendor_field(vendor_id, field, new_value, source=ChangeSource.UI_EDIT, session=None, excel_path=None):
@@ -390,8 +416,6 @@ def update_vendor_field(vendor_id, field, new_value, source=ChangeSource.UI_EDIT
     exactly like before this task; new callers read
     `.sibling_update`/`.commitment_months_warning` off it directly.
     """
-    excel_path = excel_path or EXCEL_PATH
-
     owns_session = session is None
     session = session or SessionLocal()
     tmp_path = None
@@ -452,12 +476,22 @@ def update_vendor_field(vendor_id, field, new_value, source=ChangeSource.UI_EDIT
         field_writes = [(field, new_value)]
         if sibling_update is not None:
             field_writes.append((sibling_field, sibling_value))
-        tmp_path = _stage_field_writes(
-            vendor.erp_code, vendor.entity, field_writes, excel_path, header_overrides, sheet_start_month
+        staged = _stage_field_writes(
+            vendor.erp_code, vendor.entity, field_writes, excel_path, header_overrides, sheet_start_month, session=session
         )
-        session.commit()  # publish only happens below, after this succeeds
-        os.replace(tmp_path, excel_path)
-        tmp_path = None  # published — nothing left to clean up
+        if excel_path is not None:
+            tmp_path = staged
+            session.commit()  # publish only happens below, after this succeeds
+            os.replace(tmp_path, excel_path)
+            tmp_path = None  # published — nothing left to clean up
+        else:
+            # DB-backed default (Vercel-migration task): both sides are
+            # Postgres now, so the workbook write folds into the SAME
+            # transaction as the vendor field/audit-log changes above —
+            # strictly more atomic than the stage-then-publish dance the
+            # explicit-path (disk) mode above still needs.
+            set_workbook_bytes(session, "current", staged)
+            session.commit()
         return VendorFieldEditResult(old_value, new_value, sibling_update, commitment_months_warning)
     except Exception:
         if owns_session:
@@ -491,7 +525,6 @@ def update_extra_field(vendor_id, column_name, new_value, source=ChangeSource.UI
 
     Returns (old_value, new_value).
     """
-    excel_path = excel_path or EXCEL_PATH
     new_value = None if new_value is None else str(new_value)
 
     owns_session = session is None
@@ -522,12 +555,18 @@ def update_extra_field(vendor_id, column_name, new_value, source=ChangeSource.UI
 
         header_overrides = column_mapping_store.load_overrides(session)
         sheet_start_month = column_mapping_store.get_sheet_start_month(session)
-        tmp_path = _stage_excel_cell_write(
-            column_name, vendor.erp_code, vendor.entity, new_value, excel_path, header_overrides, sheet_start_month
+        staged = _stage_excel_cell_write(
+            column_name, vendor.erp_code, vendor.entity, new_value, excel_path, header_overrides, sheet_start_month,
+            session=session,
         )
-        session.commit()  # publish only happens below, after this succeeds
-        os.replace(tmp_path, excel_path)
-        tmp_path = None  # published — nothing left to clean up
+        if excel_path is not None:
+            tmp_path = staged
+            session.commit()  # publish only happens below, after this succeeds
+            os.replace(tmp_path, excel_path)
+            tmp_path = None  # published — nothing left to clean up
+        else:
+            set_workbook_bytes(session, "current", staged)  # same-transaction publish — see update_vendor_field()
+            session.commit()
         return old_value, new_value
     except Exception:
         if owns_session:

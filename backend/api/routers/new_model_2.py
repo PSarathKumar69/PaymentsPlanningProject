@@ -15,6 +15,7 @@ _current_cycle_month() (backend/shared/payment_logging.py), the ledger-
 ingestion-anchored value every other model still uses unchanged. See
 _resolve_planning_month()/_month_minus_one() below.
 """
+import io
 import os
 import tempfile
 from datetime import date, datetime
@@ -32,7 +33,7 @@ from backend.db.models import AuditLog, MonthlyLedger, PlanAllocation, PlanRun, 
 from backend.db.session import SessionLocal
 from backend.ingestion import column_mapping_store
 from backend.ingestion.column_mapping import build_sheet_map
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import get_workbook_bytes, workbook_source
 from backend.models.new_model_2.allocator import generate_plan
 from backend.month_end.rollover import _reset_vendor_cycle_state
 from backend.shared.aging import compute_vendor_aging
@@ -448,11 +449,16 @@ def get_new_model_2_min_funds_verification_export():
         # Exceptions tab (investigation task, this task's own implementation)
         # — a second worksheet, added by reopening the just-written file
         # rather than reworking this function's pandas-based main sheet.
-        # Read-only open of the live master sheet, purely for the
+        # Read-only open of the live master workbook, purely for the
         # duplicate-ERP-code check inside build_exceptions() — never saved
-        # back to EXCEL_PATH.
-        dup_wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
-        exceptions = build_exceptions(session, dup_wb.active, as_of)
+        # back. Vercel-migration task: the master workbook may genuinely not
+        # exist yet (a fresh DB whose only vendor data came via the
+        # ops-only /ingestion/load endpoint with an explicit path never
+        # populates the DB-backed blob) — gracefully skips the duplicate
+        # check in that case rather than 500ing the whole export over it.
+        current_bytes = get_workbook_bytes(session, "current")
+        dup_ws = openpyxl.load_workbook(io.BytesIO(current_bytes), data_only=True).active if current_bytes else None
+        exceptions = build_exceptions(session, dup_ws, as_of)
         wb = openpyxl.load_workbook(tmp_path)
         write_exceptions_sheet(wb, exceptions)
         wb.save(tmp_path)
@@ -814,9 +820,12 @@ def get_new_model_2_finalized_plan_export():
     of actual payments made, so this export always agrees with what Finance
     already sees on screen.
 
-    Read-only: this only ever loads EXCEL_PATH and saves the modified copy
-    to a fresh temp file — it must NEVER write back to EXCEL_PATH itself
-    (see test_new_model_2_export.py's byte-identical regression test).
+    Read-only: this only ever loads the master workbook (DB-backed
+    "current" blob by default, or excel_path for tests/ops — see
+    load_excel.workbook_source()) and saves the modified copy to a fresh
+    temp file — it must NEVER publish back to the "current" blob/file
+    itself (see test_new_model_2_export.py's byte-identical regression
+    test).
 
     Also always includes an "Exceptions" tab (investigation task, this
     task's own implementation) — a second WORKSHEET added to this same
@@ -866,7 +875,10 @@ def get_new_model_2_finalized_plan_export():
         header_overrides = column_mapping_store.load_overrides(session)
         sheet_start_month = column_mapping_store.get_sheet_start_month(session)
 
-        wb = openpyxl.load_workbook(EXCEL_PATH)
+        try:
+            wb = openpyxl.load_workbook(workbook_source(None, session))
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         ws = wb.active
         sheet_map = build_sheet_map(ws, header_overrides=header_overrides, sheet_start_month=sheet_start_month)
 

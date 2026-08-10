@@ -25,7 +25,7 @@ Planning tab's own tables, so this grid intentionally doesn't duplicate it.
 import openpyxl
 
 from backend.db.models import MonthlyLedger, Vendor, VendorExtraField
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import workbook_source
 from backend.ingestion import column_mapping_store
 from backend.ingestion.column_mapping import (
     build_sheet_map,
@@ -100,30 +100,30 @@ _NO_DATA_GRID = {
 
 
 def build_master_grid(session, excel_path=None):
-    """Read-only. `session` supplies every value; `excel_path` (defaults to
-    the real master) is opened only to learn column identity/order —
-    values always come from the DB, never straight from this workbook read,
-    so a grid built mid-preview never shows uncommitted data.
+    """Read-only. `session` supplies every value; the workbook (DB-backed
+    "current" blob by default, or `excel_path` for tests/ops — see
+    load_excel.workbook_source()) is opened only to learn column identity/
+    order — values always come from the DB, never straight from this
+    workbook read, so a grid built mid-preview never shows uncommitted data.
 
     "No data yet" fix (Main-tab task): judged by whether any active vendor
-    row exists in the DB, not by whether a file happens to sit at
-    excel_path — a genuinely fresh environment has no master file at all,
-    and the DB (not the filesystem) is what actually reflects "Finance has
+    row exists in the DB, not by whether a workbook happens to be stored —
+    a genuinely fresh environment has no master data at all, and the DB
+    (not the workbook blob) is what actually reflects "Finance has
     successfully uploaded something." Cheaper too: skips opening the
     workbook entirely in the common empty case, rather than opening it just
     to throw the result away. Returns has_data=False (empty columns/
     vendors, never a raw exception) in that case — same shape a caller gets
-    from the FileNotFoundError backstop below, for the rarer DB/file-desync
-    case (vendor rows exist but the file itself has since gone missing).
+    from the FileNotFoundError backstop below, for the rarer DB-desync case
+    (vendor rows exist but the master workbook blob has since gone missing).
     """
-    excel_path = excel_path or EXCEL_PATH
     if session.query(Vendor).filter(Vendor.is_active.isnot(False)).count() == 0:
         return _NO_DATA_GRID
 
     header_overrides = column_mapping_store.load_overrides(session)
     sheet_start_month = column_mapping_store.get_sheet_start_month(session)
     try:
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = openpyxl.load_workbook(workbook_source(excel_path, session), data_only=True)
     except FileNotFoundError:
         return _NO_DATA_GRID
     ws = wb.active

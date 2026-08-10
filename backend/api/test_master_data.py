@@ -45,6 +45,19 @@ def excel_copy(tmp_path):
 def seeded_client(client, excel_copy):
     resp = client.post("/ingestion/load", json={"excel_path": excel_copy})
     assert resp.status_code == 200
+    # Vercel-migration task: /ingestion/load with an explicit excel_path
+    # (this fixture's whole point) never touches the DB-backed master
+    # workbook blob — but /master-data/grid's own default (no override)
+    # now reads from that blob, not a file, so tests exercising the real
+    # grid endpoint need it seeded directly.
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import set_workbook_bytes
+
+    session = SessionLocal()
+    with open(excel_copy, "rb") as f:
+        set_workbook_bytes(session, "current", f.read())
+    session.commit()
+    session.close()
     return client
 
 
@@ -60,13 +73,18 @@ def test_grid_endpoint_returns_no_data_shape_when_nothing_ingested_yet(client):
     }
 
 
-def test_grid_endpoint_returns_no_data_shape_when_master_file_is_missing(seeded_client, tmp_path, monkeypatch):
+def test_grid_endpoint_returns_no_data_shape_when_master_file_is_missing(seeded_client):
     """Backstop case: vendor rows already exist (a prior upload succeeded),
-    but the master file itself has since gone missing — same clean empty
-    shape, not a raw 500."""
-    import backend.ingestion.grid as grid_module
+    but the master workbook blob itself has since gone missing — same
+    clean empty shape, not a raw 500."""
+    from backend.db.models import MasterWorkbook
+    from backend.db.session import SessionLocal
 
-    monkeypatch.setattr(grid_module, "EXCEL_PATH", str(tmp_path / "nonexistent.xlsx"))
+    session = SessionLocal()
+    session.query(MasterWorkbook).filter_by(slot="current").delete()
+    session.commit()
+    session.close()
+
     resp = seeded_client.get("/master-data/grid")
     assert resp.status_code == 200
     assert resp.json() == {
@@ -108,7 +126,7 @@ def test_grid_endpoint_formats_datetime_typed_header_cells(seeded_client):
     assert any(month_year_pattern.match(h) for h in payable_headers)
 
 
-def test_grid_endpoint_flags_duplicate_erp_codes_and_lists_dropped_rows(client, tmp_path, monkeypatch):
+def test_grid_endpoint_flags_duplicate_erp_codes_and_lists_dropped_rows(client, tmp_path):
     """Go-live "show every row" task: a sheet with a duplicate ERP code
     (unrelated vendors sharing a code by data-entry error, same fixture
     shape as test_load_excel.py's own duplicate-detection test) must have
@@ -135,13 +153,18 @@ def test_grid_endpoint_flags_duplicate_erp_codes_and_lists_dropped_rows(client, 
     resp = client.post("/ingestion/load", json={"excel_path": path})
     assert resp.status_code == 200
 
-    # build_master_grid() defaults to opening the real EXCEL_PATH for
-    # column identity/order — point it at the same file we just ingested
-    # so the duplicate scan lines up with what's actually in the DB (same
-    # override pattern as the missing-master-file test above).
-    import backend.ingestion.grid as grid_module
+    # build_master_grid() defaults to reading the DB-backed "current" blob
+    # for column identity/order — seed it with the same file we just
+    # ingested so the duplicate scan lines up with what's actually in the
+    # DB (same reasoning as seeded_client's own fixture in this file).
+    from backend.db.session import SessionLocal
+    from backend.ingestion.load_excel import set_workbook_bytes
 
-    monkeypatch.setattr(grid_module, "EXCEL_PATH", path)
+    session = SessionLocal()
+    with open(path, "rb") as f:
+        set_workbook_bytes(session, "current", f.read())
+    session.commit()
+    session.close()
 
     body = client.get("/master-data/grid").json()
     assert body["duplicate_erp_codes"] == ["VT0001"]
@@ -184,20 +207,12 @@ def test_patch_extra_field_endpoint_writes_db_and_audit_log(seeded_client, tmp_p
     assert any(e["field_name"] == "Unique" and e["new_value"] == "test-value" for e in resp.json()["items"])
 
 
-def test_commit_upload_endpoint_then_revert_endpoint(seeded_client, excel_copy, tmp_path, monkeypatch):
+def test_commit_upload_endpoint_then_revert_endpoint(seeded_client, excel_copy):
     """Full round trip through the real HTTP routes: commit an upload, then
-    revert it — both use the real EXCEL_PATH/backup-path module constants
-    (no override at the API layer, unlike the function-level tests), so
-    this points those constants at tmp_path copies via monkeypatch rather
-    than ever touching the real master file."""
-    import backend.ingestion.upload as upload_module
-
-    fake_master = str(tmp_path / "master.xlsx")
-    shutil.copy(excel_copy, fake_master)
-    fake_backup = str(tmp_path / "master.backup.xlsx")
-    monkeypatch.setattr(upload_module, "EXCEL_PATH", fake_master)
-    monkeypatch.setattr(upload_module, "MASTER_EXCEL_BACKUP_PATH", fake_backup)
-
+    revert it — both use the DB-backed master workbook blob by default
+    (no override at the API layer, unlike the function-level tests), which
+    lives inside this test's own isolated temp DB (PAYMENTS_DB_PATH), so
+    this never touches the real master file."""
     with open(excel_copy, "rb") as f:
         resp = seeded_client.post(
             "/master-data/commit-upload",
@@ -211,7 +226,13 @@ def test_commit_upload_endpoint_then_revert_endpoint(seeded_client, excel_copy, 
     # never actually reached the frontend through the real HTTP endpoint,
     # only when a test called commit_upload() directly in-process.
     assert "ai_column_mapping_messages" in resp.json()
-    assert os.path.exists(fake_backup)
+
+    from backend.db.models import MasterWorkbook
+    from backend.db.session import SessionLocal
+
+    session = SessionLocal()
+    assert session.query(MasterWorkbook).filter_by(slot="backup").first() is not None
+    session.close()
 
     resp = seeded_client.post("/master-data/revert")
     assert resp.status_code == 200
@@ -224,18 +245,10 @@ def test_sheet_start_month_endpoint_returns_configured_value(seeded_client):
     assert resp.json()["sheet_start_month"]  # seeded default, never blank
 
 
-def test_commit_upload_persists_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch):
+def test_commit_upload_persists_planning_month(seeded_client, excel_copy):
     """Main-tab upload-confirm task (section 3): commit-upload's new optional
     planning_month field is readable back through
     GET /models/5/current-planning-month before any plan_run exists."""
-    import backend.ingestion.upload as upload_module
-
-    fake_master = str(tmp_path / "master.xlsx")
-    shutil.copy(excel_copy, fake_master)
-    fake_backup = str(tmp_path / "master.backup.xlsx")
-    monkeypatch.setattr(upload_module, "EXCEL_PATH", fake_master)
-    monkeypatch.setattr(upload_module, "MASTER_EXCEL_BACKUP_PATH", fake_backup)
-
     with open(excel_copy, "rb") as f:
         resp = seeded_client.post(
             "/master-data/commit-upload",
@@ -259,12 +272,10 @@ def test_commit_upload_planning_month_bad_format_is_400(seeded_client, excel_cop
     assert resp.status_code == 400
 
 
-def test_revert_endpoint_without_a_prior_upload_is_400(seeded_client, tmp_path, monkeypatch):
-    import backend.ingestion.upload as upload_module
-
-    monkeypatch.setattr(upload_module, "EXCEL_PATH", str(tmp_path / "master.xlsx"))
-    monkeypatch.setattr(upload_module, "MASTER_EXCEL_BACKUP_PATH", str(tmp_path / "nonexistent.backup.xlsx"))
-
+def test_revert_endpoint_without_a_prior_upload_is_400(seeded_client):
+    # seeded_client only ever ran /ingestion/load (never /master-data/commit-
+    # upload), so the DB-backed "backup" slot was never populated — no
+    # monkeypatching needed, this is genuinely the "no backup yet" state.
     resp = seeded_client.post("/master-data/revert")
     assert resp.status_code == 400
     assert "no backup available" in resp.json()["detail"]

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     UniqueConstraint,
@@ -390,6 +391,24 @@ class PriorityBucket(Base):
     # pre-existing table; backfilled once by
     # `db/session.py::_backfill_pinned_roles()`.
     pinned_role: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class MasterWorkbook(Base):
+    """Master Excel workbook bytes (Vercel-migration task) — Vercel
+    Functions are stateless/ephemeral (backend/db/session.py's DATABASE_URL
+    comment), so the file can no longer live on local disk in production.
+    Two rows, keyed by slot ("current"/"backup") — same two-slot model
+    upload.py/revert_upload() already had on disk, just backed by Postgres
+    now instead of os.replace()/shutil.copyfile(). Not business data, pure
+    blob storage — no FK, no relationship.
+    """
+
+    __tablename__ = "master_workbook"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slot: Mapped[str] = mapped_column(String, unique=True, index=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class Config(Base):
