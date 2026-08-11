@@ -25,7 +25,7 @@ Planning tab's own tables, so this grid intentionally doesn't duplicate it.
 import openpyxl
 
 from backend.db.models import MonthlyLedger, Vendor, VendorExtraField
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import EXCEL_PATH, sync_excel_path_from_db
 from backend.ingestion import column_mapping_store
 from backend.ingestion.column_mapping import (
     build_sheet_map,
@@ -122,6 +122,7 @@ def build_master_grid(session, excel_path=None):
 
     header_overrides = column_mapping_store.load_overrides(session)
     sheet_start_month = column_mapping_store.get_sheet_start_month(session)
+    sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload
     try:
         wb = openpyxl.load_workbook(excel_path, data_only=True)
     except FileNotFoundError:

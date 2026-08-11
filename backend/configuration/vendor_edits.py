@@ -53,7 +53,7 @@ from backend.ingestion.column_mapping import (
     resolve_header,
 )
 from backend.configuration.priority_bucket_edits import list_buckets
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import EXCEL_PATH, persist_excel_path_to_db, sync_excel_path_from_db
 from backend.models.new_model_2.allocator import _seed_and_read_buckets
 from backend.shared.enums import ChangeSource, VendorCategory, VendorPriorityTag
 from backend.weekly_planning.calendar_utils import weeks_in_month
@@ -452,11 +452,13 @@ def update_vendor_field(vendor_id, field, new_value, source=ChangeSource.UI_EDIT
         field_writes = [(field, new_value)]
         if sibling_update is not None:
             field_writes.append((sibling_field, sibling_value))
+        sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload/edit
         tmp_path = _stage_field_writes(
             vendor.erp_code, vendor.entity, field_writes, excel_path, header_overrides, sheet_start_month
         )
         session.commit()  # publish only happens below, after this succeeds
         os.replace(tmp_path, excel_path)
+        persist_excel_path_to_db()  # Vercel fix — durable copy, so other containers see this edit too
         tmp_path = None  # published — nothing left to clean up
         return VendorFieldEditResult(old_value, new_value, sibling_update, commitment_months_warning)
     except Exception:
@@ -522,11 +524,13 @@ def update_extra_field(vendor_id, column_name, new_value, source=ChangeSource.UI
 
         header_overrides = column_mapping_store.load_overrides(session)
         sheet_start_month = column_mapping_store.get_sheet_start_month(session)
+        sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload/edit
         tmp_path = _stage_excel_cell_write(
             column_name, vendor.erp_code, vendor.entity, new_value, excel_path, header_overrides, sheet_start_month
         )
         session.commit()  # publish only happens below, after this succeeds
         os.replace(tmp_path, excel_path)
+        persist_excel_path_to_db()  # Vercel fix — durable copy, so other containers see this edit too
         tmp_path = None  # published — nothing left to clean up
         return old_value, new_value
     except Exception:

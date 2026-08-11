@@ -49,44 +49,73 @@ from backend.shared.enums import ChangeSource, VendorCategory
 EXCEL_PATH = "data/Vendor's Details.xlsx"
 
 
-def _rehydrate_excel_path_from_db(path):
-    """Vercel fix: make sure `path` exists and holds the latest upload
-    before anything below tries to open it.
+def sync_excel_path_from_db():
+    """Vercel fix — call this immediately before opening EXCEL_PATH for
+    reading, anywhere in this codebase (grid.py, new_model_2.py,
+    vendor_edits.py, this module's own load()). Re-fetches the current file
+    from the durable Postgres copy (MasterExcelBlob) and rewrites it to disk
+    EVERY call — deliberately not a one-time cache.
 
-    Two separate problems on Vercel Functions, both real: (1) the
-    filesystem is read-only outside /tmp, and (2) vercel.json's
-    excludeFiles strips data/** from the deployed bundle entirely, so the
-    literal relative EXCEL_PATH above can never be written to or even
-    exist there. Redirecting EXCEL_PATH to /tmp (below) fixes "can I write
-    it", but /tmp does NOT survive between separate container instances —
-    a later request (master-grid load, an export) can land on a fresh
-    container that never saw the upload. This re-downloads the current
-    file from the durable Postgres copy (MasterExcelBlob, written by
-    upload.py's commit_upload()/revert_upload()) once per cold start, so
-    every existing EXCEL_PATH reader in this codebase (grid.py,
-    new_model_2.py, vendor_edits.py, this module) keeps working with zero
-    changes on their end — they just see a real file at whatever EXCEL_PATH
-    now is.
+    Why every call, not just once at cold start (the first version of this
+    fix): a container that started — and did its own one-time sync — BEFORE
+    the most recent upload has no way to learn a newer upload landed on a
+    DIFFERENT container later; /tmp does not survive between containers and
+    there is no push notification between them. A container can stay warm
+    across many requests spanning multiple uploads, so "sync once at import"
+    left an already-warm container silently serving pre-upload data
+    forever — this is the actual cause of "upload succeeded but the grid/
+    export still shows old data", not a second bug. The file is small
+    enough (a few hundred KB) that re-fetching on every call is cheap;
+    correctness matters far more here than saving one DB round trip.
 
-    No-op (leaves no file) if nothing has ever been uploaded yet — same
-    pre-first-upload state as today; callers already handle a missing
-    EXCEL_PATH file (see grid.py's own FileNotFoundError backstop).
+    No-op if nothing has ever been uploaded yet (pre-first-upload state —
+    callers already handle a missing EXCEL_PATH file, e.g. grid.py's own
+    FileNotFoundError backstop) or if DATABASE_URL isn't set (local/dev
+    SQLite keeps using the literal relative EXCEL_PATH untouched, no DB
+    round trip at all).
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)  # so _atomic_replace's mkstemp has somewhere to land even pre-first-upload
+    if not os.environ.get("DATABASE_URL"):
+        return
+    os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
     session = SessionLocal()
     try:
         row = session.get(MasterExcelBlob, 1)
         if row is None:
             return
-        with open(path, "wb") as f:
+        with open(EXCEL_PATH, "wb") as f:
             f.write(row.content)
+    finally:
+        session.close()
+
+
+def persist_excel_path_to_db():
+    """Vercel fix, write side of sync_excel_path_from_db() above — call this
+    immediately after writing new content to EXCEL_PATH on disk (a field
+    edit's os.replace() in vendor_edits.py, a fresh upload's
+    _atomic_replace() in upload.py) so every OTHER container's next
+    sync_excel_path_from_db() call actually sees it. Only ever touches
+    MasterExcelBlob.content — upload.py's commit_upload()/revert_upload()
+    manage .backup_content themselves (their own one-backup-slot design),
+    this is the shared piece every writer needs regardless of that.
+    No-op if DATABASE_URL isn't set — same as the read side.
+    """
+    if not os.environ.get("DATABASE_URL"):
+        return
+    session = SessionLocal()
+    try:
+        row = session.get(MasterExcelBlob, 1) or MasterExcelBlob(id=1)
+        with open(EXCEL_PATH, "rb") as f:
+            row.content = f.read()
+        row.updated_at = datetime.now()
+        session.add(row)
+        session.commit()
     finally:
         session.close()
 
 
 if os.environ.get("DATABASE_URL"):
     EXCEL_PATH = os.path.join(tempfile.gettempdir(), "master_excel", "Vendor's Details.xlsx")
-    _rehydrate_excel_path_from_db(EXCEL_PATH)
+sync_excel_path_from_db()  # initial materialization at cold start; every reader below also re-syncs before its own open
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("ingestion")

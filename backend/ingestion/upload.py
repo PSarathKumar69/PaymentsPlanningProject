@@ -28,7 +28,7 @@ from backend.db.models import AuditLog, MasterExcelBlob, MonthlyLedger, Vendor, 
 from backend.db.session import SessionLocal
 from backend.ingestion import ai_column_mapper, column_mapping_store
 from backend.ingestion.column_mapping import build_sheet_map, normalize_entity_text, sheet_start_month_warning
-from backend.ingestion.load_excel import EXCEL_PATH, load
+from backend.ingestion.load_excel import EXCEL_PATH, load, sync_excel_path_from_db
 from backend.month_end.rollover import _reset_vendor_cycle_state
 from backend.shared.constants import MONEY_EPSILON
 from backend.shared.enums import ChangeSource
@@ -60,7 +60,7 @@ def _atomic_replace(source_path, dest_path):
 
 
 def _persist_master_excel_blob(session, excel_path, backup_path=None):
-    """Vercel fix, write side of load_excel._rehydrate_excel_path_from_db():
+    """Vercel fix, write side of load_excel.sync_excel_path_from_db():
     copies whatever commit_upload()/revert_upload() just wrote to disk into
     the durable MasterExcelBlob row, in the SAME session/transaction as
     load()'s writes and the audit_log rows below — so a rolled-back upload
@@ -78,6 +78,31 @@ def _persist_master_excel_blob(session, excel_path, backup_path=None):
             row.backup_content = f.read()
     row.updated_at = datetime.now()
     session.add(row)
+
+
+def _sync_backup_path_from_db(backup_path):
+    """Vercel fix, read side for the backup slot specifically — same
+    reasoning as load_excel.sync_excel_path_from_db(), but for
+    MasterExcelBlob.backup_content: revert_upload() can land on a container
+    that never itself ran a commit_upload(), so the backup file may only
+    exist in Postgres, not on this container's local disk. No-op if there's
+    no backup yet (nothing to revert to — the caller's own
+    os.path.exists() check right after this surfaces that clearly) or if
+    DATABASE_URL isn't set (local/dev SQLite keeps whatever's already on
+    disk, no DB round trip).
+    """
+    if not os.environ.get("DATABASE_URL"):
+        return
+    session = SessionLocal()
+    try:
+        row = session.get(MasterExcelBlob, 1)
+        if row is None or row.backup_content is None:
+            return
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+        with open(backup_path, "wb") as f:
+            f.write(row.backup_content)
+    finally:
+        session.close()
 
 
 def _vendor_key(entity, erp_code):
@@ -292,6 +317,7 @@ def commit_upload(uploaded_excel_path, excel_path=None, backup_path=None, sheet_
     """
     excel_path = excel_path or EXCEL_PATH
     backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
+    sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload/edit; (a) below must back up the TRUE current file, not stale local state
     if os.path.exists(excel_path):
         shutil.copyfile(excel_path, backup_path)  # (a) — exactly one slot, overwritten every time
     _atomic_replace(uploaded_excel_path, excel_path)  # (b)
@@ -431,6 +457,7 @@ def revert_upload(excel_path=None, backup_path=None):
     """
     excel_path = excel_path or EXCEL_PATH
     backup_path = backup_path or MASTER_EXCEL_BACKUP_PATH
+    _sync_backup_path_from_db(backup_path)  # Vercel fix — this container may never have run commit_upload() itself, so the backup slot may only exist in Postgres, not on this container's local disk yet
     if not os.path.exists(backup_path):
         raise ValueError("no backup available yet — nothing to revert to (an upload must be committed first)")
 

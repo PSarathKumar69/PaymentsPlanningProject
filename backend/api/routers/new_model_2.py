@@ -32,7 +32,7 @@ from backend.db.models import AuditLog, MonthlyLedger, PlanAllocation, PlanRun, 
 from backend.db.session import SessionLocal
 from backend.ingestion import column_mapping_store
 from backend.ingestion.column_mapping import build_sheet_map
-from backend.ingestion.load_excel import EXCEL_PATH
+from backend.ingestion.load_excel import EXCEL_PATH, sync_excel_path_from_db
 from backend.models.new_model_2.allocator import generate_plan
 from backend.month_end.rollover import _reset_vendor_cycle_state
 from backend.shared.aging import compute_vendor_aging
@@ -451,6 +451,7 @@ def get_new_model_2_min_funds_verification_export():
         # Read-only open of the live master sheet, purely for the
         # duplicate-ERP-code check inside build_exceptions() — never saved
         # back to EXCEL_PATH.
+        sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload
         dup_wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
         exceptions = build_exceptions(session, dup_wb.active, as_of)
         wb = openpyxl.load_workbook(tmp_path)
@@ -866,6 +867,7 @@ def get_new_model_2_finalized_plan_export():
         header_overrides = column_mapping_store.load_overrides(session)
         sheet_start_month = column_mapping_store.get_sheet_start_month(session)
 
+        sync_excel_path_from_db()  # Vercel fix — this container may be warm from before the latest upload
         wb = openpyxl.load_workbook(EXCEL_PATH)
         ws = wb.active
         sheet_map = build_sheet_map(ws, header_overrides=header_overrides, sheet_start_month=sheet_start_month)
