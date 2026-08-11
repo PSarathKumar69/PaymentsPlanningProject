@@ -368,6 +368,68 @@ def test_export_falls_back_to_latest_allocation_distribution_when_vendor_field_n
     assert values == [21000.5, None, None, 34000.25, None]
 
 
+def test_export_survives_a_finalized_vendor_missing_from_the_current_sheet(seeded_client, caplog):
+    """Bug fix (prod crash): a vendor can have finalized_budget_amount set
+    from an earlier upload/cycle yet no longer exist in the CURRENT master
+    sheet (e.g. dropped in a later re-upload). Monkeypatches
+    _find_vendor_row (simpler than actually removing a row from the real
+    fixture sheet, per this task's own suggestion) to raise ValueError for
+    exactly one finalized vendor's erp_code, real behavior for everyone
+    else. The endpoint must return 200 with a valid workbook covering every
+    OTHER finalized vendor, and log a warning naming the skipped vendor's
+    erp_code and entity — never a 500."""
+    import logging
+
+    from backend.db.session import SessionLocal
+    from backend.db.models import Vendor
+    import backend.api.routers.new_model_2 as new_model_2_module
+
+    _finalize_a_plan(seeded_client)
+
+    session = SessionLocal()
+    vendors = session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).limit(2).all()
+    missing_vendor, surviving_vendor = vendors[0], vendors[1]
+    missing_vendor.finalized_budget_amount = 12345.0
+    surviving_vendor.finalized_budget_amount = 6789.0
+    missing_erp_code, missing_entity = missing_vendor.erp_code, missing_vendor.entity
+    surviving_erp_code = surviving_vendor.erp_code
+    session.commit()
+    session.close()
+
+    real_find_vendor_row = new_model_2_module._find_vendor_row
+
+    def _find_vendor_row_missing_one(ws, sheet_map, erp_code, entity):
+        if erp_code == missing_erp_code:
+            raise ValueError(f"{erp_code} ({entity}) not found in sheet")
+        return real_find_vendor_row(ws, sheet_map, erp_code, entity)
+
+    new_model_2_module._find_vendor_row = _find_vendor_row_missing_one
+    try:
+        with caplog.at_level(logging.WARNING, logger="new_model_2"):
+            resp = seeded_client.get("/models/5/finalized-plan-export")
+    finally:
+        new_model_2_module._find_vendor_row = real_find_vendor_row
+
+    assert resp.status_code == 200
+
+    warning_text = " ".join(r.getMessage() for r in caplog.records)
+    assert missing_erp_code in warning_text
+    assert missing_entity in warning_text
+
+    wb = openpyxl.load_workbook(BytesIO(resp.content))
+    ws = wb.active
+    from backend.ingestion.column_mapping import build_sheet_map, find_column
+
+    sheet_map = build_sheet_map(ws)
+    amt_col = find_column(ws, "Suggested Plan Amount", sheet_map.header_row)
+    for row in range(sheet_map.data_start_row, ws.max_row + 1):
+        if ws.cell(row=row, column=sheet_map.erp_code_col).value == surviving_erp_code:
+            assert ws.cell(row=row, column=amt_col).value == pytest.approx(6789.0)
+            break
+    else:
+        raise AssertionError(f"{surviving_erp_code} not found")
+
+
 def test_export_prefers_vendors_own_sticky_field_over_the_allocation_snapshot_when_finance_has_edited_it(seeded_client):
     """Regression guard for the fallback's precedence: once Finance HAS
     manually edited a vendor's distribution (Vendor.week_distribution_plan

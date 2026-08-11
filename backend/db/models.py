@@ -47,6 +47,21 @@ class Vendor(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     erp_code: Mapped[str] = mapped_column(String, index=True)
+    # Finance-provided identity key (new requirement, supersedes erp_code as
+    # the real vendor-matching key — see load_excel.py's upsert lookup).
+    # Nullable, no DB-level UniqueConstraint on purpose: (1) transition
+    # period — a vendor ingested before this column existed has NULL here
+    # until the next upload backfills it (NULLs never collide under a
+    # unique index, so this is safe either way, but there's no reason to
+    # add the constraint before every row actually has a value), and (2)
+    # erp_code's own history in this exact codebase (see the class
+    # docstring above) is a cautionary tale about a hard uniqueness
+    # constraint on a Finance-sourced code colliding with real data and
+    # silently dropping vendors — duplicate unique_code values are
+    # detected and reported by column_mapping.find_duplicate_unique_codes()
+    # instead (same soft-enforcement pattern erp_code itself now uses),
+    # never a hard DB constraint that could reject/crash an upload.
+    unique_code: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     entity: Mapped[str] = mapped_column(String)
     vendor_name: Mapped[str] = mapped_column(String)
 

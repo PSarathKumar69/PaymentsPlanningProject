@@ -298,6 +298,354 @@ def test_finance_edited_assigned_week_survives_reingestion():
     session.close()
 
 
+def _add_unique_code_column(ws, sheet_map, values, header_text="Unique Code"):
+    """Appends a brand-new column past the fixture's existing ones, writes
+    header_text into the header row, then values (a {row: code} dict) into
+    the data rows — mirrors how Finance's real, not-yet-existing column
+    would show up on re-ingestion."""
+    col = ws.max_column + 1
+    ws.cell(row=sheet_map.header_row, column=col, value=header_text)
+    for row, code in values.items():
+        ws.cell(row=row, column=col, value=code)
+    return col
+
+
+def _fresh_uc_db_and_load():
+    os.environ["PAYMENTS_DB_PATH"] = os.path.join(tempfile.mkdtemp(), "test.db")
+    for mod in ("backend.db.session", "backend.ingestion.load_excel"):
+        sys.modules.pop(mod, None)
+    from backend.ingestion.load_excel import load
+
+    return load
+
+
+def test_unique_code_basic_match(tmp_path):
+    """Scenario 1: every row gets a distinct Unique Code — persisted
+    verbatim onto the matching Vendor row."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "uc_basic.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    _add_unique_code_column(ws, sheet_map, {2: "UC-A", 3: "UC-B"})
+    wb.save(path)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+
+    report = load(excel_path=path)
+    assert report["vendor_count"] == 2
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).filter_by(erp_code="VT0001").one().unique_code == "UC-A"
+        assert session.query(Vendor).filter_by(erp_code="VT0002").one().unique_code == "UC-B"
+    finally:
+        session.close()
+
+
+def test_no_unique_code_column_behaves_exactly_as_before(tmp_path):
+    """Scenario 2 — the important regression check: every sheet in this
+    repo today has no Unique Code column at all. Must match/ingest exactly
+    as before, unique_code stays None, no spurious notes."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "no_uc.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+
+    report = load(excel_path=path)
+    assert report["vendor_count"] == 2
+    assert not any("Unique Code" in note for note in report["data_quality_notes"])
+
+    session = SessionLocal()
+    try:
+        vendors = session.query(Vendor).all()
+        assert len(vendors) == 2
+        assert all(v.unique_code is None for v in vendors)
+        assert {v.erp_code for v in vendors} == {"VT0001", "VT0002"}
+    finally:
+        session.close()
+
+
+def test_unique_code_backfills_on_second_upload_without_duplicating_vendors(tmp_path):
+    """Scenario 3: first load has no Unique Code column (vendors created
+    with unique_code=None, matched by (entity, erp_code) as always); a
+    second load of the same vendors, now with the column populated, must
+    backfill unique_code onto the SAME rows, not create duplicates."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path_v1 = str(tmp_path / "v1.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path_v1)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    report1 = load(excel_path=path_v1)
+    assert report1["vendor_count"] == 2
+
+    path_v2 = str(tmp_path / "v2.xlsx")
+    shutil.copy(path_v1, path_v2)
+    wb = openpyxl.load_workbook(path_v2)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    _add_unique_code_column(ws, sheet_map, {2: "UC-A", 3: "UC-B"})
+    wb.save(path_v2)
+
+    report2 = load(excel_path=path_v2)
+    assert report2["vendor_count"] == 2  # same 2 rows updated, not duplicated
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).count() == 2
+        assert session.query(Vendor).filter_by(erp_code="VT0001").one().unique_code == "UC-A"
+        assert session.query(Vendor).filter_by(erp_code="VT0002").one().unique_code == "UC-B"
+    finally:
+        session.close()
+
+
+def test_unique_code_match_survives_erp_code_change_but_soft_deactivates__REAL_BUG(tmp_path):
+    """Scenario 4, as specified, expected the vendor's erp_code field to be
+    updated to the sheet's new value once matched via Unique Code. That is
+    NOT what the code does — confirmed by reading load_excel.py's update
+    branch (~line 501-524): it reassigns entity/vendor_name/unique_code/
+    category/etc. but never `vendor.erp_code`. Flagging this rather than
+    asserting the spec's assumption, per this task's own instruction.
+
+    Worse, independently confirmed by running this exact scenario: because
+    vendor.erp_code is left stale while the end-of-load soft-deactivate
+    check (~line 704-712) compares (entity, vendor.erp_code) against the
+    SHEET's own (entity, erp_code) key set — built from the row's erp_code
+    cell, not the matched vendor's stored one — the stale erp_code no
+    longer appears in that set. The SAME load() call that just matched and
+    "updated" this vendor via Unique Code immediately soft-deactivates it
+    afterward. This is a real, functional bug in the Unique-Code-matching
+    feature as implemented, not a test-authoring assumption — this test
+    pins down the actual (buggy) behavior so a fix must touch this test
+    deliberately, not silently regress past it unnoticed.
+    """
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path_v1 = str(tmp_path / "v1.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path_v1)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    load(excel_path=path_v1)  # v1: no Unique Code column yet
+
+    path_v2 = str(tmp_path / "v2.xlsx")
+    shutil.copy(path_v1, path_v2)
+    wb = openpyxl.load_workbook(path_v2)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    _add_unique_code_column(ws, sheet_map, {2: "UC-A", 3: "UC-B"})
+    wb.save(path_v2)
+    load(excel_path=path_v2)  # v2: backfills unique_code onto both vendors
+
+    path_v3 = str(tmp_path / "v3.xlsx")
+    shutil.copy(path_v2, path_v3)
+    wb = openpyxl.load_workbook(path_v3)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    ws.cell(row=2, column=sheet_map.erp_code_col, value="VT0001-NEW")  # erp_code changed, Unique Code kept
+    wb.save(path_v3)
+    report3 = load(excel_path=path_v3)
+    assert report3["vendor_count"] == 2  # still processed as 2 rows
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).count() == 2  # matched via unique_code — not duplicated, that part works
+        vendor = session.query(Vendor).filter_by(unique_code="UC-A").one()
+        assert vendor.erp_code == "VT0001"  # NOT "VT0001-NEW" — erp_code is never reassigned on match
+        assert vendor.is_active is False  # REAL BUG: wrongly soft-deactivated by this same load() call
+    finally:
+        session.close()
+
+
+def test_unique_code_exact_duplicate_flags_and_collapses_but_also_hits_the_same_bug(tmp_path):
+    """Scenario 5: two rows, different erp_code/entity/vendor_name, same
+    Unique Code. Confirmed by running this exact scenario: load() does NOT
+    crash, a data_quality_notes entry names the code and both rows, and the
+    two rows DO collapse into one Vendor (find_duplicate_unique_codes()'s
+    own docstring says this is expected — Unique Code is now the matching
+    key, so the second row's upsert finds the first row's just-created
+    vendor).
+
+    Also observed, not assumed: the surviving vendor ends up
+    is_active=False — the SAME root cause as the erp_code-change test
+    above (vendor.erp_code is never reassigned to either row's value after
+    the merge, so it satisfies neither row's own (entity, erp_code) key,
+    and the end-of-load presence check deactivates it). Flagging this
+    combination to Sarath rather than deciding whether exact-duplicate
+    Unique Codes should be handled more strictly — see this task's own
+    request for that decision.
+    """
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "dup_uc.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    ws.cell(row=3, column=sheet_map.entity_col, value="FP")  # different entity too, not just erp_code/name
+    _add_unique_code_column(ws, sheet_map, {2: "DUP-1", 3: "DUP-1"})
+    wb.save(path)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+
+    report = load(excel_path=path)
+    assert any("DUP-1" in note and "collapse" in note for note in report["data_quality_notes"])
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).count() == 1  # collapsed, as the code's own docstring predicts
+        vendor = session.query(Vendor).filter_by(unique_code="DUP-1").one()
+        assert vendor.is_active is False  # observed — same underlying bug as the test above
+    finally:
+        session.close()
+
+
+def test_unique_code_fuzzy_typo_flagged_never_merges_and_respects_threshold(tmp_path):
+    """Scenario 6: "VC-1042" vs "VC-10042" is a 0.933 difflib ratio (computed
+    independently, well above the 0.85 threshold) — must produce a fuzzy
+    note, naming both rows/vendors and a similarity percentage, and must
+    NOT merge them (two different exact codes -> two separate vendors,
+    flag-only). "VC-1042" vs "ZQ-9987" (ratio 0.143, confirmed independently
+    well below threshold) must produce no fuzzy note at all.
+    """
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "fuzzy.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    _add_unique_code_column(ws, sheet_map, {2: "VC-1042", 3: "VC-10042"})
+    wb.save(path)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+
+    report = load(excel_path=path)
+    fuzzy_notes = [n for n in report["data_quality_notes"] if "typo" in n]
+    assert len(fuzzy_notes) == 1
+    assert "VC-1042" in fuzzy_notes[0] and "VC-10042" in fuzzy_notes[0]
+    assert "93%" in fuzzy_notes[0]
+
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).count() == 2  # not merged — flag-only
+        assert {v.is_active for v in session.query(Vendor).all()} == {True}
+    finally:
+        session.close()
+
+    # Below-threshold pair produces no fuzzy note at all.
+    path2 = str(tmp_path / "no_fuzzy.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path2)
+    wb2 = openpyxl.load_workbook(path2)
+    ws2 = wb2.active
+    sheet_map2 = build_sheet_map(ws2)
+    _add_unique_code_column(ws2, sheet_map2, {2: "VC-1042", 3: "ZQ-9987"})
+    wb2.save(path2)
+
+    load2 = _fresh_uc_db_and_load()
+    report2 = load2(excel_path=path2)
+    assert not any("typo" in n for n in report2["data_quality_notes"])
+
+
+@pytest.mark.parametrize("header_text", ["Unique ID", "Vendor Unique Code"])
+def test_unique_code_header_variants_recognized(tmp_path, header_text):
+    """Scenario 7: "Unique Code" is the primary expected header, but "Unique
+    ID"/"Vendor Unique Code" are accepted synonyms."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path = str(tmp_path / "variant.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
+
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    _add_unique_code_column(ws, sheet_map, {2: "UID-A", 3: "UID-B"}, header_text=header_text)
+    wb.save(path)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+
+    load(excel_path=path)
+    session = SessionLocal()
+    try:
+        assert session.query(Vendor).filter_by(erp_code="VT0001").one().unique_code == "UID-A"
+        assert session.query(Vendor).filter_by(erp_code="VT0002").one().unique_code == "UID-B"
+    finally:
+        session.close()
+
+
+def test_unique_code_blank_cell_falls_back_and_never_wipes_a_backfilled_value(tmp_path):
+    """Scenario 8: combines with scenario 3's backfill — a vendor already
+    backfilled with a real unique_code, then re-loaded with that row's
+    Unique Code cell now blank (erp_code/entity unchanged, so the
+    (entity, erp_code) fallback still matches correctly and the scenario
+    4/5 bug above doesn't apply here) must keep its unique_code untouched,
+    not wiped to None."""
+    fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
+    path_v1 = str(tmp_path / "v1.xlsx")
+    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path_v1)
+
+    load = _fresh_uc_db_and_load()
+    from backend.db.models import Vendor
+    from backend.db.session import SessionLocal
+    from backend.ingestion.column_mapping import build_sheet_map
+
+    load(excel_path=path_v1)
+
+    path_v2 = str(tmp_path / "v2.xlsx")
+    shutil.copy(path_v1, path_v2)
+    wb = openpyxl.load_workbook(path_v2)
+    ws = wb.active
+    sheet_map = build_sheet_map(ws)
+    uc_col = _add_unique_code_column(ws, sheet_map, {2: "UC-A", 3: "UC-B"})
+    wb.save(path_v2)
+    load(excel_path=path_v2)
+
+    path_v3 = str(tmp_path / "v3.xlsx")
+    shutil.copy(path_v2, path_v3)
+    wb = openpyxl.load_workbook(path_v3)
+    ws = wb.active
+    ws.cell(row=2, column=uc_col, value=None)  # blank out row 2's Unique Code cell only
+    wb.save(path_v3)
+    report3 = load(excel_path=path_v3)
+    assert report3["vendor_count"] == 2
+
+    session = SessionLocal()
+    try:
+        v1 = session.query(Vendor).filter_by(erp_code="VT0001").one()
+        v2 = session.query(Vendor).filter_by(erp_code="VT0002").one()
+        assert v1.unique_code == "UC-A"  # unchanged, not wiped
+        assert v2.unique_code == "UC-B"
+        assert v1.is_active is True and v2.is_active is True
+    finally:
+        session.close()
+
+
 def test_mislabeled_nov_column_resolves_by_position():
     """Regression test: the sheet's 8th payable column is headered "Nov'26"
     (a confirmed real typo) but is structurally Nov-25 — months are derived

@@ -15,6 +15,7 @@ _current_cycle_month() (backend/shared/payment_logging.py), the ledger-
 ingestion-anchored value every other model still uses unchanged. See
 _resolve_planning_month()/_month_minus_one() below.
 """
+import logging
 import os
 import tempfile
 from datetime import date, datetime
@@ -64,6 +65,7 @@ from ..schemas.new_model_2 import (
 from ..schemas.plan_runs import PlanRunHistoryResponse
 
 router = APIRouter(tags=["new_model_2"])
+log = logging.getLogger("new_model_2")
 
 
 def _plan_response(result: dict) -> dict:
@@ -880,12 +882,31 @@ def get_new_model_2_finalized_plan_export():
         pct_col = _find_or_create_column(ws, "Suggested Plan Percentage", sheet_map.header_row)
         amt_col = _find_or_create_column(ws, "Suggested Plan Amount", sheet_map.header_row)
 
+        # Bug fix (prod crash): a vendor can have finalized_budget_amount
+        # set from an EARLIER upload/cycle yet no longer exist in the
+        # CURRENT master sheet (dropped/renamed in a later re-upload) —
+        # _find_vendor_row() raising ValueError for that one vendor used to
+        # kill this entire export for every vendor. Same "flag, never
+        # block" house rule this endpoint's own docstring already claims
+        # for Finalize itself (CLAUDE.md rule 2/docs/14) — skip just that
+        # vendor's row write and keep going; every vendor still present in
+        # the sheet still gets its real figures written.
+        vendors_missing_from_sheet = []
         for erp_code, entity, amount, percentage, week_amounts in rows:
-            row = _find_vendor_row(ws, sheet_map, erp_code, entity)
+            try:
+                row = _find_vendor_row(ws, sheet_map, erp_code, entity)
+            except ValueError:
+                vendors_missing_from_sheet.append(f"{erp_code} ({entity})")
+                continue
             for col, week_amount in zip(week_cols, week_amounts):
                 ws.cell(row=row, column=col).value = week_amount
             ws.cell(row=row, column=amt_col).value = amount
             ws.cell(row=row, column=pct_col).value = percentage
+        if vendors_missing_from_sheet:
+            log.warning(
+                "Finalized-plan export: %d finalized vendor(s) not found in the current master sheet, "
+                "skipped: %s", len(vendors_missing_from_sheet), ", ".join(vendors_missing_from_sheet),
+            )
 
         # Exceptions tab (investigation task, this task's own implementation)
         # — a second worksheet on this same wb, reusing the ws/sheet_map

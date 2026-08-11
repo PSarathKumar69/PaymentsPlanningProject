@@ -430,6 +430,79 @@ def test_finalize_plan_does_not_move_again_until_called_a_second_time():
         session.close()
 
 
+def test_finalize_plan_precedence_and_query_count_at_scale():
+    """Perf-fix test (prod bug: Finalize taking 60+ seconds for 450 vendors):
+    with 120 vendors split three ways — override set, plan_run allocation
+    only (no override), neither — confirm finalize_plan() applies the exact
+    same precedence _this_cycle_allocation() uses (override wins, else the
+    latest plan_run's allocation, else 0.0) for every vendor, AND that it
+    runs in a small constant number of queries regardless of vendor count
+    (not N+1) — counted via SQLAlchemy's before_cursor_execute event,
+    the same engine backend.db.session binds SessionLocal to.
+    """
+    from sqlalchemy import event
+
+    from backend.db.session import engine
+
+    session = SessionLocal()
+    try:
+        override_vendors = [_unallocated_vendor(session) for _ in range(40)]
+        allocation_vendors = [_unallocated_vendor(session) for _ in range(40)]
+        unallocated_vendors = [_unallocated_vendor(session) for _ in range(40)]
+
+        # Deliberately ONE shared plan_run for all 80 allocated vendors —
+        # matches the real production shape (one Generate Plan call writes
+        # one plan_run with a PlanAllocation row per vendor). Using the
+        # per-vendor _give_vendor_a_new_model_2_cycle_allocation() helper 80
+        # times would instead create 80 SEPARATE plan_runs, and
+        # finalize_plan()'s own "single latest plan_run" query would then
+        # only ever see one vendor's allocation — not what this test means
+        # to exercise.
+        cycle_month = session.query(func.max(MonthlyLedger.month)).scalar()
+        plan_run = PlanRun(created_at=_FUTURE, month=cycle_month, model_used=NEW_MODEL_2_PLAN_RUN_LABEL, funds_figure=1_000_000.0)
+        session.add(plan_run)
+        session.flush()
+
+        for vendor in override_vendors:
+            vendor.override_amount = 999.0
+            session.add(PlanAllocation(
+                plan_run_id=plan_run.id, vendor_id=vendor.id, assigned_week=1,
+                allocated_amount=111.0, override_amount=999.0,
+            ))
+        for vendor in allocation_vendors:
+            session.add(PlanAllocation(
+                plan_run_id=plan_run.id, vendor_id=vendor.id, assigned_week=1, allocated_amount=222.0,
+            ))
+        # unallocated_vendors: no PlanAllocation row at all this cycle.
+        session.flush()
+
+        query_count = 0
+
+        def _count(*args, **kwargs):
+            nonlocal query_count
+            query_count += 1
+
+        event.listen(engine, "before_cursor_execute", _count)
+        try:
+            finalize_plan(session)
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+
+        assert query_count <= 10  # small constant, not ~3 x 120 vendors
+
+        for vendor in override_vendors:
+            assert float(vendor.finalized_budget_amount) == pytest.approx(999.0)  # override wins over allocation
+            assert vendor.finalized_budget_amount == _this_cycle_allocation(session, vendor.id)
+        for vendor in allocation_vendors:
+            assert float(vendor.finalized_budget_amount) == pytest.approx(222.0)
+            assert vendor.finalized_budget_amount == _this_cycle_allocation(session, vendor.id)
+        for vendor in unallocated_vendors:
+            assert float(vendor.finalized_budget_amount) == pytest.approx(0.0)
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_vendor_fully_paid_against_suggestion_reaches_paid_in_full_end_to_end():
     """Reproduces the original bug end to end: a vendor fully paid against
     their suggested amount now correctly reaches PAID_IN_FULL — the exact

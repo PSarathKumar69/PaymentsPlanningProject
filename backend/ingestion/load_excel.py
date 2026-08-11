@@ -36,6 +36,9 @@ from backend.ingestion.column_mapping import (
     valid_priority_tag_values,
     find_column,
     find_duplicate_erp_codes,
+    find_duplicate_unique_codes,
+    find_fuzzy_duplicate_unique_codes,
+    find_unique_code_column,
     normalize_entity_text,
     parse_assigned_week_order,
     parse_week_number,
@@ -176,6 +179,17 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
     assigned_week_override_col = find_column(ws, resolve_header("assigned_week", header_overrides), sheet_map.header_row)
     priority_tag_col = find_column(ws, resolve_header("priority_tag", header_overrides), sheet_map.header_row)
 
+    # Unique Code (this task, Sarath's explicit decision, 2026-08): once
+    # populated, this REPLACES (entity, erp_code) as the real vendor-
+    # matching key — see the upsert lookup in the row loop below. None
+    # here just means this sheet doesn't have the column yet (true of
+    # every sheet tested so far, and of every pre-existing DB row) — load()
+    # falls straight back to the (entity, erp_code) matching it has always
+    # used, per-row, whenever this is None or a row's own cell is blank.
+    # Excluded from unmapped_columns below: it's a recognized, dedicated
+    # field now, not a generic passthrough.
+    unique_code_col = find_unique_code_column(ws, sheet_map.header_row)
+
     # Generic passthrough columns (data-pipeline-upload task, docs/11):
     # anything the mapping layer above doesn't recognize gets stored per
     # vendor as-is, never fed into any model (CLAUDE.md rule 3). Computed
@@ -183,7 +197,7 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
     unmapped_columns = unmapped_header_columns(
         ws,
         sheet_map,
-        extra_cols=(category_col, commitment_months_col, assigned_week_override_col, priority_tag_col),
+        extra_cols=(category_col, commitment_months_col, assigned_week_override_col, priority_tag_col, unique_code_col),
     )
 
     # Prefetched once (not per-vendor-per-column) so an existing extra-field
@@ -252,6 +266,33 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
                 )
         data_quality_notes.extend(duplicate_erp_code_notes)
 
+    # Unique Code duplicate detection (this task) — flag-only, never
+    # auto-drops a row (Sarath's explicit call, unlike the erp_code
+    # first-row-wins skip above): exact duplicates are reported so Finance
+    # can see two rows will collapse into one vendor (see
+    # find_duplicate_unique_codes()'s docstring for why that happens
+    # naturally once Unique Code is the matching key); fuzzy near-
+    # duplicates (stdlib difflib) are reported so Finance can catch a
+    # likely typo before it silently creates two vendors that should have
+    # been one. No-op (empty lists) whenever unique_code_col is None.
+    unique_code_notes = []
+    for group in find_duplicate_unique_codes(ws, sheet_map, unique_code_col):
+        rows = group["rows"]
+        unique_code_notes.append(
+            f"Unique Code {group['unique_code']!r} appears on {len(rows)} rows "
+            f"({[r['row'] for r in rows]}, vendors {[r['vendor_name'] for r in rows]}) — these rows will "
+            "collapse into a single vendor since Unique Code is now the matching key; Finance should assign "
+            "distinct codes if that isn't intended."
+        )
+    for pair in find_fuzzy_duplicate_unique_codes(ws, sheet_map, unique_code_col):
+        unique_code_notes.append(
+            f"Unique Code {pair['unique_code_a']!r} (row {pair['row_a']}, {pair['vendor_name_a']!r}) is a likely "
+            f"typo of {pair['unique_code_b']!r} (row {pair['row_b']}, {pair['vendor_name_b']!r}) — "
+            f"{pair['similarity']:.0%} similar; not auto-merged, Finance should confirm which one is correct."
+        )
+    if unique_code_notes:
+        data_quality_notes.extend(unique_code_notes)
+
     plan_run = PlanRun(
         created_at=datetime.now(),
         month=sheet_map.payable_cols[-1][0],
@@ -276,6 +317,14 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
         vendor_keys_in_file.append((entity, erp_code))
 
         vendor_name = ws.cell(row=row, column=sheet_map.vendor_name_col).value
+
+        # Unique Code (this task): blank cell -> None, same "blank means
+        # no signal from this row" convention as every other optional
+        # column below (commitment_months, assigned_week override,
+        # priority_tag) — never an empty string, so a later `is not None`
+        # backfill check can't be fooled by whitespace-only cells.
+        raw_unique_code = ws.cell(row=row, column=unique_code_col).value if unique_code_col else None
+        sheet_unique_code = None if raw_unique_code is None else (str(raw_unique_code).strip() or None)
 
         raw_opening = ws.cell(row=row, column=sheet_map.opening_balance_col).value
         if raw_opening is None:
@@ -308,11 +357,27 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
         # value, silently inserting a duplicate row instead of updating the
         # existing one — matched in Python via normalize_entity_text()
         # instead, same as find_duplicate_erp_codes()'s own grouping.
+        #
+        # Unique Code (this task, Sarath's explicit decision): once
+        # Finance's Unique Code column is populated, it REPLACES
+        # (entity, erp_code) as the real matching key — tried FIRST here,
+        # by exact value, since it's a dedicated Finance-assigned identity
+        # field (no normalization/casefolding of erp_code's kind needed).
+        # Falls straight back to the (entity, erp_code) loop below
+        # whenever this row has no Unique Code (column missing entirely,
+        # or this cell is blank) OR no existing vendor has been matched to
+        # that code yet (brand-new vendor, or a pre-existing vendor that
+        # predates this column and hasn't been backfilled — see the
+        # backfill assignments below, which fix that permanently after
+        # the vendor's first re-ingestion under this column).
         existing = None
-        for candidate in session.query(Vendor).filter_by(erp_code=erp_code).all():
-            if normalize_entity_text(candidate.entity) == normalize_entity_text(entity):
-                existing = candidate
-                break
+        if sheet_unique_code is not None:
+            existing = session.query(Vendor).filter_by(unique_code=sheet_unique_code).first()
+        if existing is None:
+            for candidate in session.query(Vendor).filter_by(erp_code=erp_code).all():
+                if normalize_entity_text(candidate.entity) == normalize_entity_text(entity):
+                    existing = candidate
+                    break
 
         # category/priority_tag (this task): two views of the same Finance
         # signal, reconciled by derive_category_and_priority_tag() below once
@@ -437,6 +502,14 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
             vendor = existing
             vendor.entity = entity
             vendor.vendor_name = vendor_name
+            # Backfill only when the sheet actually gave us a code this
+            # row (never overwrite an already-backfilled/matched value
+            # with None just because this particular re-upload's cell is
+            # blank or the column is entirely missing) — same "blank means
+            # no new signal, keep what's there" convention as
+            # commitment_months below.
+            if sheet_unique_code is not None:
+                vendor.unique_code = sheet_unique_code
             # opening_balance is set below, after the ledger walk recomputes
             # it — never from sheet_closing directly (see that assignment
             # for why).
@@ -455,6 +528,7 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
         else:
             vendor = Vendor(
                 erp_code=erp_code,
+                unique_code=sheet_unique_code,
                 entity=entity,
                 vendor_name=vendor_name,
                 opening_balance=0.0,  # placeholder — overwritten below, after the ledger walk recomputes it

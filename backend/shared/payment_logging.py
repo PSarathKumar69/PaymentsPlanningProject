@@ -89,10 +89,44 @@ def finalize_plan(session, model_number=5):
     as they go, and the Budget column only moves when this is explicitly
     called again — never silently drifts underneath an in-progress payment
     round. Resets to None at month-end rollover, same as override_amount.
+
+    Perf fix (prod bug: Finalize was taking 60+ seconds for 450 vendors):
+    calling _this_cycle_allocation() per vendor re-ran its OWN "find the
+    latest plan_run for this model" query every single time, even though
+    that query's answer is identical for every vendor in this loop — same
+    for the per-vendor PlanAllocation lookup, one query each instead of one
+    query for all of them. That's ~3 DB round trips × 450 vendors when it
+    should be ~2 total. Same exact precedence as _this_cycle_allocation()
+    (override_amount wins; else this one latest plan_run's allocation; else
+    0.0 if there's no plan_run or no allocation row for this vendor) —
+    just computed via two queries up front instead of inside the loop.
+    _this_cycle_allocation() itself is untouched (still used elsewhere,
+    e.g. the single-vendor payment-status path below) — this only changes
+    how finalize_plan() computes its own snapshot.
     """
     vendors = session.query(Vendor).order_by(Vendor.id).all()
+
+    prefix = f"model{model_number}"
+    latest_run = (
+        session.query(PlanRun)
+        .filter(PlanRun.model_used.like(f"{prefix}%"))
+        .order_by(PlanRun.created_at.desc(), PlanRun.id.desc())
+        .first()
+    )
+    allocation_by_vendor = {}
+    if latest_run is not None:
+        for allocation in (
+            session.query(PlanAllocation)
+            .filter(PlanAllocation.plan_run_id == latest_run.id)
+            .order_by(PlanAllocation.id)
+        ):
+            allocation_by_vendor.setdefault(allocation.vendor_id, float(allocation.allocated_amount))
+
     for vendor in vendors:
-        vendor.finalized_budget_amount = _this_cycle_allocation(session, vendor.id, model_number=model_number)
+        if vendor.override_amount is not None:
+            vendor.finalized_budget_amount = float(vendor.override_amount)
+        else:
+            vendor.finalized_budget_amount = allocation_by_vendor.get(vendor.id, 0.0)
     return len(vendors)
 
 
