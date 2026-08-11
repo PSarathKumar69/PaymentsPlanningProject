@@ -275,12 +275,14 @@ def test_minimum_funds_required_no_planning_month_is_400_when_nothing_resolvable
     assert resp.status_code == 400
 
 
-def _commit_upload_with_planning_month(client, excel_copy, planning_month):
-    # Vercel-migration task: commit-upload's default (no excel_path override)
-    # now writes the master workbook into this test's own isolated temp DB
-    # (PAYMENTS_DB_PATH), not a real file — no more need to monkeypatch
-    # upload_module.EXCEL_PATH/MASTER_EXCEL_BACKUP_PATH to redirect it away
-    # from the real master file, since there's no file involved at all.
+def _commit_upload_with_planning_month(client, excel_copy, tmp_path, monkeypatch, planning_month):
+    import backend.ingestion.upload as upload_module
+
+    fake_master = str(tmp_path / "master.xlsx")
+    shutil.copy(excel_copy, fake_master)
+    fake_backup = str(tmp_path / "master.backup.xlsx")
+    monkeypatch.setattr(upload_module, "EXCEL_PATH", fake_master)
+    monkeypatch.setattr(upload_module, "MASTER_EXCEL_BACKUP_PATH", fake_backup)
     with open(excel_copy, "rb") as f:
         resp = client.post(
             "/master-data/commit-upload",
@@ -291,18 +293,18 @@ def _commit_upload_with_planning_month(client, excel_copy, planning_month):
     return resp
 
 
-def test_minimum_funds_required_no_planning_month_resolves_from_persisted_config(seeded_client, excel_copy):
-    _commit_upload_with_planning_month(seeded_client, excel_copy, NM2_PLANNING_MONTH)
+def test_minimum_funds_required_no_planning_month_resolves_from_persisted_config(seeded_client, excel_copy, tmp_path, monkeypatch):
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
     resp = seeded_client.get("/models/5/minimum-funds-required")
     assert resp.status_code == 200
     assert resp.json()["planning_month"] == NM2_PLANNING_MONTH
 
 
-def test_current_planning_month_endpoint_reflects_persisted_config_then_latest_plan_run(seeded_client, excel_copy):
+def test_current_planning_month_endpoint_reflects_persisted_config_then_latest_plan_run(seeded_client, excel_copy, tmp_path, monkeypatch):
     resp = seeded_client.get("/models/5/current-planning-month")
     assert resp.json()["planning_month"] is None  # nothing resolvable yet
 
-    _commit_upload_with_planning_month(seeded_client, excel_copy, NM2_PLANNING_MONTH)
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
     resp = seeded_client.get("/models/5/current-planning-month")
     assert resp.json()["planning_month"] == NM2_PLANNING_MONTH
 
@@ -318,11 +320,11 @@ def test_current_planning_month_endpoint_reflects_persisted_config_then_latest_p
     assert resp.json()["planning_month"] == later_month
 
 
-def test_generate_plan_falls_back_to_persisted_planning_month_when_no_plan_run_exists(seeded_client, excel_copy):
+def test_generate_plan_falls_back_to_persisted_planning_month_when_no_plan_run_exists(seeded_client, excel_copy, tmp_path, monkeypatch):
     """Nothing explicit passed in the request body, and no PlanRun exists yet
     this cycle — must still resolve via the persisted config value set by a
     prior commit-upload, not 400."""
-    _commit_upload_with_planning_month(seeded_client, excel_copy, NM2_PLANNING_MONTH)
+    _commit_upload_with_planning_month(seeded_client, excel_copy, tmp_path, monkeypatch, NM2_PLANNING_MONTH)
     resp = seeded_client.post("/models/5/generate-plan-and-weekly-view", json={"available_funds": 100_000})
     assert resp.status_code == 200
     resp = seeded_client.get("/models/5/plan-runs")

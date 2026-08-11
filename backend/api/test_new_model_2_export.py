@@ -46,18 +46,6 @@ def excel_copy(tmp_path):
 def seeded_client(client, excel_copy):
     resp = client.post("/ingestion/load", json={"excel_path": excel_copy})
     assert resp.status_code == 200
-    # Vercel-migration task: /ingestion/load with an explicit excel_path
-    # never touches the DB-backed master workbook blob — but
-    # finalized-plan-export's own default (no override) now hard-requires
-    # it (it builds the export FROM the master workbook's own structure).
-    from backend.db.session import SessionLocal
-    from backend.ingestion.load_excel import set_workbook_bytes
-
-    session = SessionLocal()
-    with open(excel_copy, "rb") as f:
-        set_workbook_bytes(session, "current", f.read())
-    session.commit()
-    session.close()
     return client
 
 
