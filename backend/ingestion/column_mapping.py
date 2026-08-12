@@ -866,7 +866,14 @@ def find_duplicate_erp_codes(ws, sheet_map):
 # lacks a backfilled value) and must never block an upload or trigger an
 # AI-mapping confirmation prompt just because it's missing — see
 # find_unique_code_column()'s own docstring.
-UNIQUE_CODE_HEADER_CANDIDATES = ["Unique Code", "Unique ID", "Vendor Unique Code"]
+UNIQUE_CODE_HEADER_CANDIDATES = ["Unique Code", "Unique ID", "Vendor Unique Code", "Unique"]
+# "Unique" added 2026-08 — confirmed with Finance: the real production sheet
+# (Creditors Outstanding Apr-25 to Jul-26.xlsx) uses this bare header, not
+# "Unique Code". find_column() below is exact-match only (no fuzzy fallback
+# for this one), so the literal header text has to be listed here — it
+# showed up in commit-upload's own unmapped_columns on the real prod upload,
+# confirming this exact gap: the column existed but wasn't recognized, so
+# every vendor silently fell back to (entity, erp_code) matching instead.
 
 # Fuzzy near-duplicate threshold for Unique Code values (find_fuzzy_
 # duplicate_unique_codes() below) — Sarath's explicit call: flag likely
