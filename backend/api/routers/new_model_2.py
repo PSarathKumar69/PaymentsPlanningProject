@@ -825,11 +825,21 @@ def get_new_model_2_finalized_plan_export():
     else (see planner.py/plan_allocations.py's override endpoint) — blank
     for any week not present in that vendor's distribution, not 0.
 
-    Percentage = finalized_budget_amount / required_amount_v2() * 100 — the
-    exact same (budget, min_funds_required) pairing GET /vendors/payment-
-    tracking already computes, just against the finalized snapshot instead
-    of actual payments made, so this export always agrees with what Finance
-    already sees on screen.
+    Percentage = finalized_budget_amount / required_amount_v2() * 100.
+
+    Bug fix (this task): required_amount_v2() here is now anchored to
+    as_of=_month_minus_one(planning_month) — the SAME fixed cycle anchor
+    generate_plan() used to compute finalized_budget_amount in the first
+    place — not as_of=None ("today"). Before this fix, this percentage
+    silently drifted the longer it had been since Finance last clicked
+    Finalize, because "today" keeps moving while the budget snapshot
+    doesn't — confirmed on real prod data (V00036 showing 207.66%).
+
+    NOTE: GET /vendors/payment-tracking still uses as_of=None for its own
+    min_funds_required — that endpoint isn't scoped to one model/cycle the
+    way this one is, so there's no single unambiguous planning_month to
+    anchor it to without a separate design call. This export and that
+    on-screen table can therefore disagree now; flagged, not fixed here.
 
     Read-only: this only ever loads EXCEL_PATH and saves the modified copy
     to a fresh temp file — it must NEVER write back to EXCEL_PATH itself
@@ -876,10 +886,26 @@ def get_new_model_2_finalized_plan_export():
             ledger_by_vendor.setdefault(row.vendor_id, []).append(row)
         fallback_distributions = latest_week_distributions_for_vendors(session, finalized_ids)
 
+        # Bug fix (prod, confirmed 2026-08: Suggested Plan Percentage showing
+        # 200%+ for real vendors, e.g. V00036 at 207.66%) — as_of=None meant
+        # "today's real wall-clock date," a moving target that has nothing
+        # to do with the CYCLE finalized_budget_amount was actually snapshot
+        # against. Finalize computes its snapshot via generate_plan(), which
+        # every other required_amount_v2() call in this file anchors to
+        # as_of=_month_minus_one(planning_month) (the fixed cycle anchor,
+        # see lines 265/327/362/413/507/722/955 above) — this was the one
+        # holdout still using "today," so required_amount_v2()'s own
+        # oldest+second-month tranche window could land on a completely
+        # different pair of months than the one Finalize actually used,
+        # purely because of how many real days have passed since Finance
+        # clicked Finalize. Anchoring to the same fixed cycle month as every
+        # other call site makes this percentage stable regardless of what
+        # day the export happens to be downloaded.
+        as_of = _month_minus_one(planning_month)
         rows = []
         for vendor in finalized_vendors:
             ledger_rows = ledger_by_vendor.get(vendor.id, [])
-            min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=None, paid_so_far_override=0.0)
+            min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=as_of, paid_so_far_override=0.0)
             amount = float(vendor.finalized_budget_amount)
             percentage = round(amount / min_funds_required * 100, 2) if min_funds_required > MONEY_EPSILON else None
             # Bug fix: Vendor.week_distribution_plan (the "sticky" field) is
