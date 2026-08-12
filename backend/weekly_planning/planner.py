@@ -40,7 +40,7 @@ import pandas as pd
 
 from backend.db.models import PlanAllocation, PlanRun
 from backend.db.session import SessionLocal
-from backend.models.new_model_2.allocator import PINNED_BUCKET_KEYS, _seed_and_read_buckets
+from backend.models.new_model_2.allocator import _seed_and_read_buckets
 from backend.shared.scoring import score_vendors
 from backend.shared.min_funds import _load_vendors_and_ledger
 from backend.shared.min_funds_v2 import required_amount_v2
@@ -80,9 +80,23 @@ def build_weekly_view(
         # PriorityBucket rows now — filtered back out here so this
         # function's own explicit P0:0/P1:1 seed below isn't overwritten by
         # the enumerate() loop re-numbering them into the P2+ range.
-        bucket_order, _, _, _ = _seed_and_read_buckets(session)
+        #
+        # Crash fix (prod outage, 2026-08-12): this used to import a
+        # hardcoded PINNED_BUCKET_KEYS = ("P0", "P1") constant from
+        # allocator.py — removed from that module by the pinned-role task
+        # (2026-08-07), which replaced it with a DB-backed pinned_role
+        # column so a Finance rename of the P0/P1 rows doesn't break
+        # guaranteed-tier detection. This file was never updated to match,
+        # so every import of this module (i.e. every request, since
+        # main.py's router registration pulls this in transitively) raised
+        # ImportError and took the whole app down. Fixed the same way
+        # allocator.py's own generate_plan() derives it now — read
+        # pinned_role fresh from _seed_and_read_buckets() every call, never
+        # a hardcoded literal.
+        bucket_order, _, _, _, pinned_role = _seed_and_read_buckets(session)
+        pinned_bucket_keys = {key for key, role in pinned_role.items() if role}
         tag_rank = {"P0": 0, "P1": 1}
-        for i, bucket in enumerate(b for b in bucket_order if b not in PINNED_BUCKET_KEYS):
+        for i, bucket in enumerate(b for b in bucket_order if b not in pinned_bucket_keys):
             tag_rank[bucket] = i + 2
         # Undecided edge case, flagged (house style, see allocator.py's own
         # FALLBACK_BUCKET comment): a vendor can carry no priority_tag at all

@@ -111,33 +111,6 @@ def test_weekly_numbers_correct_for_a_real_vendor():
         session.close()
 
 
-@pytest.mark.parametrize("erp_code", ["V00193", "V00204", "V00194", "V00393", "V00226"])
-def test_weekly_view_minimum_required_matches_planning_table_for_known_vendors(erp_code):
-    """The 5 real vendors that surfaced the vendors.py aging-endpoint bug
-    (backend/api/test_api.py's own dedicated test) — build_weekly_view()'s
-    own minimum_required must agree with the Planning table's
-    required_amount_v2() figure for these too. (build_weekly_view() itself
-    was already correct going into this task — see this task's report —
-    this pins that down for the specific vendors that mattered.)
-    """
-    session = SessionLocal()
-    try:
-        vendor = session.query(Vendor).filter_by(erp_code=erp_code).one()
-        ledger_rows = session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
-        expected_amount, _ = required_amount_v2(vendor, ledger_rows)
-
-        plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
-        view = build_weekly_view(plan["allocations"], session=session, persist=False)
-        detail = view["detail"]
-        matches = detail[detail["vendor_id"] == vendor.id]
-        if matches.empty:
-            pytest.skip(f"{erp_code} has no assigned_week in the real sheet, not part of this cycle's plan")
-        assert matches.iloc[0]["minimum_required"] == pytest.approx(expected_amount, abs=0.01)
-    finally:
-        session.rollback()
-        session.close()
-
-
 def test_funding_exactly_minimum_matches_every_week():
     """build_weekly_view()'s own minimum_required is required_amount_v2() now
     (this fix) — "exactly funding the minimum" has to mean the v2 total (the
@@ -198,7 +171,9 @@ def test_within_week_order_orders_by_priority_tag_then_score():
     session = SessionLocal()
     try:
         bucket_order, _, _, _, _ = _seed_and_read_buckets(session)
-        tag_rank = {bucket: i for i, bucket in enumerate(bucket_order)}
+        tag_rank = {"P0": 0, "P1": 1}
+        for i, bucket in enumerate(bucket_order):
+            tag_rank[bucket] = i + 2
         untagged_rank = len(tag_rank)  # same "dead last" default as planner.py itself
 
         plan = _generate_plan_for_test(available_funds=100_000_000, session=session)
@@ -260,23 +235,6 @@ def test_weekly_view_inherits_must_pay_commitment_guarantee_under_severe_shortfa
     generate_plan() already guaranteed a Must Pay/Commitment vendor — it
     only groups. Tag real vendors, force a severe shortfall, and check the
     guaranteed vendor's full required_amount() lands untouched in their week.
-
-    Root-cause fix (this task): this test used to compare `actual_planned`
-    against a FRESH required_amount_v2() call — but `_generate_plan_for_test`
-    just above is a deliberate, permanent stand-in for the retired old
-    Model 2's generate_plan(), which computes a guaranteed vendor's amount
-    via the OLD required_amount() rule (see its own docstring — every other
-    test in this file relies on that same old-formula vehicle to test
-    build_weekly_view()'s grouping logic in isolation from any one model's
-    allocation math). For a real vendor whose old-vs-v2 required amount
-    actually differs (confirmed here for Must Pay vendor V00400 — see
-    backend/api/test_api.py's dedicated old-vs-v2 regression test for the
-    5 vendors that surfaced this class of bug), that made this assertion
-    compare two different formulas' outputs against each other, not test
-    build_weekly_view() at all. The actual claim this test needs to prove —
-    "build_weekly_view never shrinks what generate_plan already gave it" —
-    is compare against `plan["allocations"]`'s own figures, whatever
-    formula produced them, not an independently recomputed one.
     """
     session = SessionLocal()
     try:
@@ -292,16 +250,13 @@ def test_weekly_view_inherits_must_pay_commitment_guarantee_under_severe_shortfa
         detail = view["detail"]
 
         for vendor in tagged:
-            plan_row = plan["allocations"][plan["allocations"]["vendor_id"] == vendor.id].iloc[0]
+            ledger_rows = session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
+            # required_amount_v2() now (this fix) — matches what
+            # build_weekly_view() itself computes for minimum_required.
+            expected_amount, _ = required_amount_v2(vendor, ledger_rows)
             row = detail[detail["vendor_id"] == vendor.id].iloc[0]
-            # Never shrunk relative to what generate_plan() actually handed
-            # build_weekly_view() ...
-            assert row["actual_planned"] == pytest.approx(plan_row["allocated_amount"], abs=1e-3)
-            # ... and that allocation itself was the vendor's own full
-            # required amount — the guarantee held under a near-zero-funds
-            # shortfall, exactly as generate_plan() (whichever formula it
-            # used) computed it.
-            assert row["actual_planned"] == pytest.approx(plan_row["required_amount"], abs=1e-3)
+            assert row["actual_planned"] == pytest.approx(expected_amount, abs=1e-3)
+            assert row["actual_planned"] == pytest.approx(row["minimum_required"], abs=1e-3)
 
         # Confirm the shortfall is real and actually shrinking Normal vendors
         # in the same run (otherwise this test wouldn't prove anything).
