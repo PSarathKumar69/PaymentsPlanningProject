@@ -17,6 +17,7 @@ Used by:
     GET /models/{n}/plan-runs history endpoint.
 """
 import re
+from collections import defaultdict
 
 from backend.db.models import PlanAllocation, PlanRun, Vendor
 from backend.shared.payment_logging import _current_cycle_month
@@ -226,16 +227,37 @@ def build_plan_run_history_response(session, model_number: int, cycle_month=None
     """
     plan_runs = plan_runs_for_model(session, model_number, cycle_month=cycle_month)
 
+    # Perf fix (prod bug, confirmed 2026-08: Planning page loading slowly) —
+    # this used to query PlanAllocation once PER plan_run inside the loop
+    # below, one real Neon round trip each. New Model 2 creates a fresh
+    # plan_run row on every single Generate/Regenerate click (no dedicated
+    # regeneration endpoint), so a cycle with months of live usage can have
+    # dozens of plan_runs by the time Finance opens the Planning page — this
+    # batches it into ONE query for every plan_run in the family, grouped by
+    # plan_run_id in Python. The ORDER BY here already sorts by plan_run_id
+    # first, so grouping preserves the same per-run assigned_week/
+    # within_week_order ordering the old per-run query produced.
+    plan_run_ids = [plan_run.id for plan_run in plan_runs]
+    allocations_by_run: dict[int, list] = defaultdict(list)
+    if plan_run_ids:
+        all_allocations = (
+            session.query(PlanAllocation)
+            .filter(PlanAllocation.plan_run_id.in_(plan_run_ids))
+            .order_by(
+                PlanAllocation.plan_run_id,
+                PlanAllocation.assigned_week,
+                PlanAllocation.within_week_order,
+            )
+            .all()
+        )
+        for allocation in all_allocations:
+            allocations_by_run[allocation.plan_run_id].append(allocation)
+
     vendor_ids: set[int] = set()
     latest_snapshot_by_vendor: dict[int, dict] = {}
     plan_run_dicts = []
     for plan_run in plan_runs:
-        allocations = (
-            session.query(PlanAllocation)
-            .filter_by(plan_run_id=plan_run.id)
-            .order_by(PlanAllocation.assigned_week, PlanAllocation.within_week_order)
-            .all()
-        )
+        allocations = allocations_by_run.get(plan_run.id, [])
         allocation_dicts = []
         for allocation in allocations:
             vendor_ids.add(allocation.vendor_id)

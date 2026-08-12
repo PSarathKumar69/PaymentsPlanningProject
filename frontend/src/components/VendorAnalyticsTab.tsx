@@ -10,9 +10,7 @@ import {
   Filter,
   Search,
   Download,
-  Users,
-  Handshake,
-  Layers
+  Users
 } from "lucide-react";
 
 Chart.register(...registerables);
@@ -748,8 +746,10 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
       {/* MAIN BODY CONTENT */}
       <main className="py-6 flex flex-col gap-6 w-full relative z-10">
 
-        {/* ROW 1: 4 TOP KPI CARDS MATRIX */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        {/* ROW 1: 2 TOP KPI CARDS, 50/50 SPLIT (Funds Required This Month /
+            Payments This Month cards removed per Sarath's request — this
+            task) */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 gap-4">
 
           {/* CARD 1: Overall Debt */}
           <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
@@ -791,63 +791,14 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
             </div>
           </div>
 
-          {/* CARD 3: Funds Required This Month */}
-          <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
-            <div className="flex items-start justify-between">
-              <div className="w-10 h-10 rounded-full bg-emerald-50 text-[#0e7a45] border border-emerald-200/80 flex items-center justify-center shrink-0">
-                <Handshake className="w-5 h-5" />
-              </div>
-              {fundsTrend.length > 0 && (
-                <span className="text-[10px] text-[#0e7a45] bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
-                  {formatMonthLabel(fundsTrend[fundsTrend.length - 1].month)} cycle
-                </span>
-              )}
-            </div>
-            <div className="mt-4">
-              <span className="text-xs font-medium text-slate-500 block">Funds Required This Month</span>
-              <span className="text-2xl font-bold text-slate-900 tracking-tight block mt-0.5">
-                {fundsTrend.length > 0 ? formatINR(kpis.fundsRequired) : "—"}
-              </span>
-              <p className="text-[10px] text-slate-500 font-medium mt-1.5">
-                {fundsTrend.length > 0 ? "Minimum required for current cycle" : "No Generate Plan run yet this cycle"}
-              </p>
-            </div>
-          </div>
-
-          {/* CARD 4: Payments This Month */}
-          <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
-            <div className="flex items-start justify-between">
-              <div className="w-10 h-10 rounded-full bg-emerald-50 text-[#0e7a45] border border-emerald-200/80 flex items-center justify-center shrink-0">
-                <Layers className="w-5 h-5" />
-              </div>
-              <span className="text-xs font-medium text-[#0e7a45]">
-                {kpis.paidCoverageRatio.toFixed(1)}% covered
-              </span>
-            </div>
-            <div className="mt-4 flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-slate-500 block">Payments This Month (So Far)</span>
-              <span className="text-2xl font-bold text-[#0e7a45] tracking-tight block">
-                {formatINR(kpis.paidThisCycle)}
-              </span>
-              {/* Green Progress bar */}
-              <div className="w-full bg-emerald-100/80 h-2 rounded-full overflow-hidden mt-1">
-                <div
-                  className="bg-[#0e7a45] h-2 rounded-full transition-all duration-500"
-                  style={{ width: `${Math.min(100, kpis.paidCoverageRatio)}%` }}
-                />
-              </div>
-              <p className="text-[10px] text-[#0e7a45] font-medium mt-0.5">
-                {formatINR(Math.max(0, kpis.fundsRequired - kpis.paidThisCycle))} still required
-              </p>
-            </div>
-          </div>
-
         </section>
 
-        {/* ROW 2: 50/50 SPLIT (AGING PROFILE & LIQUIDITY SHORTFALL CHART) */}
-        <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* ROW 2: AGING PROFILE, full width (the Min Funds vs Expected
+            Funds chart that used to sit beside it was removed per Sarath's
+            request — this task) */}
+        <section className="grid grid-cols-1 gap-6">
 
-          {/* Left Block: Aging Profile */}
+          {/* Aging Profile */}
           <div className="bg-white border border-emerald-100/90 rounded-xl p-5 flex flex-col justify-between shadow-2xs">
             <div>
               <h3 className="text-sm font-bold text-gray-900 mb-4">Aging</h3>
@@ -886,22 +837,6 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
                 );
               })}
 
-            </div>
-          </div>
-
-          {/* Right Block: Bar Chart */}
-          <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs flex flex-col justify-between h-[290px]">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-gray-900">Min Funds vs Expected Funds</h3>
-            </div>
-            <div className="flex-1 relative mt-3 h-[185px]">
-              {fundsTrend.length > 0 ? (
-                <canvas ref={cashFlowChartRef} />
-              ) : (
-                <div className="h-full flex items-center justify-center text-xs text-slate-400">
-                  No Generate Plan runs recorded yet.
-                </div>
-              )}
             </div>
           </div>
 

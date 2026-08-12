@@ -685,6 +685,16 @@ def post_new_model_2_finalize():
         allocations = session.query(PlanAllocation).filter_by(plan_run_id=latest_run.id).all()
         available_funds = float(latest_run.funds_figure)
 
+        # Perf fix (prod bug, confirmed 2026-08: Finalize still slow after
+        # the Downloads-side fixes) — this used to run
+        # session.query(Vendor).filter_by(id=...).one() once per overridden
+        # vendor inside the loop below, one more real Neon round trip each.
+        # all_vendors is fetched right after this loop anyway (for the
+        # overridden/eligible split further down), so it's simply moved up
+        # here and reused as a dict lookup instead of re-querying per vendor.
+        all_vendors = session.query(Vendor).order_by(Vendor.id).all()
+        vendor_by_id = {v.id: v for v in all_vendors}
+
         total_committed = 0.0
         responsible: list[dict[str, Any]] = []
         for allocation in allocations:
@@ -693,7 +703,7 @@ def post_new_model_2_finalize():
             effective = override if override is not None else suggested
             total_committed += effective
             if override is not None and override > suggested + MONEY_EPSILON:
-                vendor = session.query(Vendor).filter_by(id=allocation.vendor_id).one()
+                vendor = vendor_by_id[allocation.vendor_id]
                 responsible.append(
                     {
                         "vendor_id": vendor.id,
@@ -704,7 +714,6 @@ def post_new_model_2_finalize():
                     }
                 )
 
-        all_vendors = session.query(Vendor).order_by(Vendor.id).all()
         overridden = [v for v in all_vendors if v.override_amount is not None]
         overridden_ids = {v.id for v in overridden}
         eligible_ids = {v.id for v in all_vendors} - overridden_ids
