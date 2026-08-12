@@ -259,6 +259,37 @@ def _find_vendor_row(ws, sheet_map, erp_code, entity):
     raise ValueError(f"vendor {erp_code!r} (entity {entity!r}) not found in the Excel sheet")
 
 
+def build_vendor_row_index(ws, sheet_map):
+    """Batched form of _find_vendor_row() above — one O(n) scan of the
+    sheet building a full (normalized_entity, erp_code) -> row lookup,
+    instead of calling _find_vendor_row() once per vendor inside a loop
+    (each call is its own O(n) scan -> O(n^2) total). Perf fix (prod bug,
+    confirmed 2026-08: finalized-plan-export taking 10+ seconds for ~450
+    vendors — this quadratic openpyxl cell-scan was part of it, alongside
+    the separate per-vendor DB round-trips fixed elsewhere in that same
+    endpoint).
+
+    Single-vendor callers (this module's own update_vendor_field()/
+    update_extra_field(), one edit at a time) keep calling
+    _find_vendor_row() directly — building this whole index for a single
+    lookup would be strictly more work, not less. Use this one instead
+    only where the same sheet is being looked up for many vendors in one
+    request (e.g. new_model_2.py's finalized-plan-export).
+
+    First occurrence wins on a duplicate (entity, erp_code) pair — same
+    "first-row-wins" convention load_excel.py's own upsert and
+    find_duplicate_erp_codes() already use, so a lookup here always
+    resolves to the same row load() would have kept."""
+    index = {}
+    for row in range(sheet_map.data_start_row, ws.max_row + 1):
+        erp_code = ws.cell(row=row, column=sheet_map.erp_code_col).value
+        if erp_code is None:
+            continue
+        entity = ws.cell(row=row, column=sheet_map.entity_col).value
+        index.setdefault((normalize_entity_text(entity), erp_code), row)
+    return index
+
+
 def _excel_cell_value(field, new_value):
     if field == "category":
         # .get(..., new_value): a custom category (Configuration-task) has

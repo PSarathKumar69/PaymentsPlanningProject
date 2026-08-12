@@ -28,11 +28,11 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func
 from starlette.background import BackgroundTask
 
-from backend.configuration.vendor_edits import _find_or_create_column, _find_vendor_row
+from backend.configuration.vendor_edits import _find_or_create_column, build_vendor_row_index
 from backend.db.models import AuditLog, MonthlyLedger, PlanAllocation, PlanRun, Vendor
 from backend.db.session import SessionLocal
 from backend.ingestion import column_mapping_store
-from backend.ingestion.column_mapping import build_sheet_map
+from backend.ingestion.column_mapping import build_sheet_map, normalize_entity_text
 from backend.ingestion.load_excel import EXCEL_PATH, sync_excel_path_from_db
 from backend.models.new_model_2.allocator import generate_plan
 from backend.month_end.rollover import _reset_vendor_cycle_state
@@ -47,7 +47,7 @@ from backend.shared.min_funds_v2 import (
     required_amount_v2,
 )
 from backend.shared.payment_logging import finalize_plan
-from backend.shared.plan_history import build_plan_run_history_response, latest_week_distribution_for_vendor
+from backend.shared.plan_history import build_plan_run_history_response, latest_week_distributions_for_vendors
 from backend.shared.planning_month_store import get_current_planning_month
 from backend.weekly_planning.planner import build_weekly_view
 
@@ -413,14 +413,19 @@ def get_new_model_2_min_funds_verification_export():
         as_of = _month_minus_one(planning_month)
 
         vendors = session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all()
+        # Perf fix (prod bug, confirmed 2026-08: this export taking 10+
+        # seconds): the ledger used to be re-queried per vendor inside the
+        # loop below (one extra Neon round trip each, ~450 of them) — now
+        # loaded once for every vendor up front and grouped in Python,
+        # same batching pattern min_funds.py's own _load_vendors_and_ledger()
+        # already uses elsewhere.
         ledger_by_vendor = {}
+        for row in session.query(MonthlyLedger).order_by(MonthlyLedger.vendor_id, MonthlyLedger.month):
+            ledger_by_vendor.setdefault(row.vendor_id, []).append(row)
         vendor_rows = []
         mb_to_label = {}
         for vendor in vendors:
-            ledger_rows = (
-                session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
-            )
-            ledger_by_vendor[vendor.id] = ledger_rows
+            ledger_rows = ledger_by_vendor.get(vendor.id, [])
             paid_so_far = float(vendor.paid_so_far_this_month)
             aging = compute_vendor_aging(ledger_rows, as_of=as_of, already_paid_this_cycle=paid_so_far)
             min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=as_of)
@@ -844,11 +849,27 @@ def get_new_model_2_finalized_plan_export():
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
+        # Perf fix (prod bug, confirmed 2026-08: this export taking 10+
+        # seconds): both loads below used to happen per vendor inside the
+        # loop that follows (each vendor's own ledger query, plus a
+        # latest-plan_run lookup for every vendor whose
+        # Vendor.week_distribution_plan was empty — per that field's own
+        # docstring, the near-always case) — up to ~900 extra Neon round
+        # trips for 450 finalized vendors. Both are now one query total,
+        # scoped to just the finalized vendors this export actually needs.
+        finalized_ids = [v.id for v in finalized_vendors]
+        ledger_by_vendor = {}
+        for row in (
+            session.query(MonthlyLedger)
+            .filter(MonthlyLedger.vendor_id.in_(finalized_ids))
+            .order_by(MonthlyLedger.vendor_id, MonthlyLedger.month)
+        ):
+            ledger_by_vendor.setdefault(row.vendor_id, []).append(row)
+        fallback_distributions = latest_week_distributions_for_vendors(session, finalized_ids)
+
         rows = []
         for vendor in finalized_vendors:
-            ledger_rows = (
-                session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
-            )
+            ledger_rows = ledger_by_vendor.get(vendor.id, [])
             min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=None, paid_so_far_override=0.0)
             amount = float(vendor.finalized_budget_amount)
             percentage = round(amount / min_funds_required * 100, 2) if min_funds_required > MONEY_EPSILON else None
@@ -860,9 +881,9 @@ def get_new_model_2_finalized_plan_export():
             # PlanAllocation row at generate time. Vendor's own sticky value
             # still wins when Finance HAS edited it directly (same
             # precedence planner.py itself uses when stamping a fresh
-            # allocation); latest_week_distribution_for_vendor() is only the
-            # fallback for the common case nobody has.
-            distribution = vendor.week_distribution_plan or latest_week_distribution_for_vendor(session, vendor.id) or {}
+            # allocation); fallback_distributions (batched above) is only
+            # the fallback for the common case nobody has.
+            distribution = vendor.week_distribution_plan or fallback_distributions.get(vendor.id) or {}
             week_amounts = [distribution.get(str(week)) for week in range(1, 6)]
             rows.append((vendor.erp_code, vendor.entity, amount, percentage, week_amounts))
 
@@ -891,11 +912,18 @@ def get_new_model_2_finalized_plan_export():
         # for Finalize itself (CLAUDE.md rule 2/docs/14) — skip just that
         # vendor's row write and keep going; every vendor still present in
         # the sheet still gets its real figures written.
+        #
+        # Perf fix (this task, alongside the DB-round-trip fixes above):
+        # _find_vendor_row() scans the whole sheet per call — calling it
+        # once per finalized vendor here was O(n) x O(n) = O(n^2) sheet
+        # scans (~450x450 for the real data). build_vendor_row_index()
+        # does the same scan ONCE and every vendor below is then an O(1)
+        # dict lookup.
+        vendor_row_index = build_vendor_row_index(ws, sheet_map)
         vendors_missing_from_sheet = []
         for erp_code, entity, amount, percentage, week_amounts in rows:
-            try:
-                row = _find_vendor_row(ws, sheet_map, erp_code, entity)
-            except ValueError:
+            row = vendor_row_index.get((normalize_entity_text(entity), erp_code))
+            if row is None:
                 vendors_missing_from_sheet.append(f"{erp_code} ({entity})")
                 continue
             for col, week_amount in zip(week_cols, week_amounts):

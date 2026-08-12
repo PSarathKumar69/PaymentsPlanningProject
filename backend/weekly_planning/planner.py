@@ -40,11 +40,11 @@ import pandas as pd
 
 from backend.db.models import PlanAllocation, PlanRun
 from backend.db.session import SessionLocal
-from backend.models.new_model_2.allocator import _seed_and_read_buckets
+from backend.models.new_model_2.allocator import PINNED_BUCKET_KEYS, _seed_and_read_buckets
 from backend.shared.scoring import score_vendors
 from backend.shared.min_funds import _load_vendors_and_ledger
 from backend.shared.min_funds_v2 import required_amount_v2
-from backend.shared.payment_logging import week_actual_paid
+from backend.shared.payment_logging import week_actual_paid_all_vendors
 from backend.weekly_planning.calendar_utils import week_for_date
 
 
@@ -71,15 +71,19 @@ def build_weekly_view(
         allocated_by_vendor = dict(zip(vendor_allocations["vendor_id"], vendor_allocations["allocated_amount"]))
         scores = score_vendors(session=session, as_of=as_of).set_index("vendor_id")["score"]
         # Within-week execution order rank (docs/06, confirmed with Sarath):
-        # Must Pay/Commitment first, then the real, DB-backed bucket_order
-        # in its own live sequence — never a hardcoded P0/P1/P2-P5 list
-        # (CLAUDE.md rule 7). bucket_order is already sorted by
-        # rotation_position (allocator.py's _seed_and_read_buckets(), which
-        # pinned rows default to but aren't locked into — pinned-role task),
-        # so a vendor's rank is simply its own bucket's position in that
-        # live sequence, no separate pinned-row special case needed.
-        bucket_order, _, _, _, _ = _seed_and_read_buckets(session)
-        tag_rank = {bucket: i for i, bucket in enumerate(bucket_order)}
+        # P0 (Must Pay) first, P1 (Commitment) second, then the real,
+        # DB-backed bucket_order (P2-P5 today) in its own live sequence —
+        # never a hardcoded P2-P5 list (CLAUDE.md rule 7).
+        #
+        # P0/P1-ceiling task: bucket_order itself now ALSO includes P0/P1
+        # (pinned at its own front, allocator.py) since they're real
+        # PriorityBucket rows now — filtered back out here so this
+        # function's own explicit P0:0/P1:1 seed below isn't overwritten by
+        # the enumerate() loop re-numbering them into the P2+ range.
+        bucket_order, _, _, _ = _seed_and_read_buckets(session)
+        tag_rank = {"P0": 0, "P1": 1}
+        for i, bucket in enumerate(b for b in bucket_order if b not in PINNED_BUCKET_KEYS):
+            tag_rank[bucket] = i + 2
         # Undecided edge case, flagged (house style, see allocator.py's own
         # FALLBACK_BUCKET comment): a vendor can carry no priority_tag at all
         # (allocator.py's own defensive-fallback comment confirms this
@@ -97,6 +101,14 @@ def build_weekly_view(
             (planning_month.year, planning_month.month) == (today.year, today.month)
         )
         current_week = week_for_date(today) if is_current_real_month else 0
+
+        # Perf fix (prod bug, confirmed 2026-08: "Generate Plan" taking
+        # 10+ seconds): computed ONCE for every vendor here instead of
+        # calling week_actual_paid(session, vendor.id) inside the loop
+        # below — that per-vendor version re-ran its own cycle-month
+        # lookup query too, so this was up to 2 extra Neon round trips per
+        # vendor (~900 for 450 vendors) before this fix.
+        week_actual_paid_by_vendor = week_actual_paid_all_vendors(session)
 
         rows = []
         for vendor in vendors:
@@ -119,8 +131,10 @@ def build_weekly_view(
                     "actual_planned": allocated_by_vendor.get(vendor.id, 0.0),
                     "score": scores.get(vendor.id, 0.0),
                     # Live, never stored redundantly — real payments already
-                    # carry their own week; this only aggregates them fresh.
-                    "week_actual_paid": week_actual_paid(session, vendor.id),
+                    # carry their own week; this only aggregates them fresh
+                    # (batched above, not per-vendor — see the perf-fix
+                    # comment there).
+                    "week_actual_paid": week_actual_paid_by_vendor.get(vendor.id, {}),
                 }
             )
         detail = pd.DataFrame(rows)

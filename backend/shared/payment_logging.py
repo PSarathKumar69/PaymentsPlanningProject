@@ -3,6 +3,7 @@
 Regeneration needs a real, live "how much has actually been paid this
 month" number per vendor — this is where that number gets written.
 """
+from collections import defaultdict
 from datetime import date
 
 from sqlalchemy import func
@@ -159,6 +160,42 @@ def week_actual_paid(session, vendor_id):
         .all()
     )
     return {str(week): float(total) for week, total in rows if week is not None}
+
+
+def week_actual_paid_all_vendors(session, cycle_month=None):
+    """Batched form of week_actual_paid() above — ONE query total instead
+    of one query per vendor. Perf fix (prod bug, confirmed 2026-08:
+    "Generate Plan" taking 10+ seconds): build_weekly_view()
+    (weekly_planning/planner.py) was calling week_actual_paid() once per
+    assigned vendor, and each of THOSE calls re-ran _current_cycle_month()'s
+    own full-table MAX() query too — up to 2 extra Neon round trips per
+    vendor, ~900 for 450 vendors, each one a real network hop now that this
+    runs against Postgres instead of local SQLite.
+
+    Returns {vendor_id: {week_str: total_paid}} — a vendor_id with no
+    payments this cycle is simply absent from the dict, same as the
+    per-vendor version returning {} for that vendor. Computed for every
+    vendor with a payment this cycle regardless of which vendor_ids the
+    caller actually needs — one unfiltered query is cheaper than a second
+    round trip to scope it, and callers just do a dict .get() per vendor.
+
+    cycle_month: optional override so a caller that already resolved it
+    this same request doesn't pay for a second identical MAX() query.
+    None (the default) resolves it fresh via _current_cycle_month(),
+    exactly like the per-vendor version always has."""
+    if cycle_month is None:
+        cycle_month = _current_cycle_month(session)
+    rows = (
+        session.query(Payment.vendor_id, Payment.week, func.sum(Payment.amount))
+        .filter(Payment.payment_date >= cycle_month)
+        .group_by(Payment.vendor_id, Payment.week)
+        .all()
+    )
+    result = defaultdict(dict)
+    for vendor_id, week, total in rows:
+        if week is not None:
+            result[vendor_id][str(week)] = float(total)
+    return result
 
 
 def _status_for(paid_so_far, cycle_allocation, opening_balance):

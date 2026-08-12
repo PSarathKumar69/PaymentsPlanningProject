@@ -161,6 +161,38 @@ def latest_week_distribution_for_vendor(session, vendor_id):
     return allocation.week_distribution_plan if allocation is not None else None
 
 
+def latest_week_distributions_for_vendors(session, vendor_ids):
+    """Batched form of latest_week_distribution_for_vendor() above — ONE
+    query for every id in `vendor_ids` instead of one query each. Perf fix
+    (prod bug, confirmed 2026-08: finalized-plan-export taking 10+ seconds):
+    the export was calling the per-vendor version once per finalized
+    vendor whenever Vendor.week_distribution_plan itself was empty — which
+    per that function's own docstring is the near-always case — so this
+    ran for almost every vendor, each one a real Neon round trip.
+
+    Same "latest plan_run, any model" precedence as the per-vendor
+    version: among every plan_run with an allocation row for a given
+    vendor, the one with the latest created_at wins (ORDER BY here, then
+    first-occurrence-per-vendor-id wins in the loop below — equivalent to
+    calling _latest_allocation_any_model() for each id, just in one round
+    trip). Returns {vendor_id: week_distribution_plan} — a vendor_id with
+    no allocation in any plan_run at all is simply absent from the dict,
+    same as the per-vendor version returning None for that id."""
+    if not vendor_ids:
+        return {}
+    rows = (
+        session.query(PlanAllocation.vendor_id, PlanAllocation.week_distribution_plan)
+        .join(PlanRun, PlanAllocation.plan_run_id == PlanRun.id)
+        .filter(PlanAllocation.vendor_id.in_(vendor_ids))
+        .order_by(PlanRun.created_at.desc(), PlanRun.id.desc())
+        .all()
+    )
+    result = {}
+    for vendor_id, week_distribution_plan in rows:
+        result.setdefault(vendor_id, week_distribution_plan)  # first-seen per id, given the ORDER BY above, is the latest
+    return result
+
+
 def build_plan_run_history_response(session, model_number: int, cycle_month=None) -> dict:
     """Shape returned by GET /models/{n}/plan-runs (model1.py/model2.py/
     model3.py) — see those routers' docstrings for the endpoint contract.
