@@ -122,4 +122,65 @@ describe('PlanningView — Verify Min Funds download button', () => {
     await userEvent.click(verifyButton);
     await waitFor(() => expect(downloadMinFundsVerificationExport).toHaveBeenCalledTimes(1));
   });
+
+  // Button-status task (Finance's ask): "Downloading…" while the export
+  // request is in flight, not just a silent wait.
+  it('shows "Downloading…" on the button while the export request is in flight', async () => {
+    generatePlanAndWeeklyView.mockResolvedValue({ plan: { allocations: [], leftover_remaining: 0 } });
+    let resolveDownload: (value: unknown) => void = () => {};
+    downloadMinFundsVerificationExport.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveDownload = resolve;
+        })
+    );
+
+    render(<PlanningView />);
+    await waitFor(() => expect(listVendors).toHaveBeenCalled());
+
+    await userEvent.click(screen.getByRole('button', { name: /cal min funds/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /generate plan/i })).toBeEnabled());
+
+    getAllVendorMinFundsRequired.mockResolvedValue({
+      total: 5000, breakdown: [{ vendor_id: 1, erp_code: 'V001', vendor_name: 'Acme Traders', category: 'normal', required_amount: 5000, rule: 'oldest' }],
+    });
+    await userEvent.click(screen.getByRole('button', { name: /generate plan/i }));
+    const verifyButton = await screen.findByRole('button', { name: /verify min funds/i });
+    await waitFor(() => expect(verifyButton).toBeEnabled());
+
+    await userEvent.click(verifyButton);
+
+    expect(await screen.findByRole('button', { name: /downloading…/i })).toBeDisabled();
+
+    resolveDownload({ blob: new Blob(['x']), filename: 'Min Funds Verification - Aug-2026.xlsx' });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /verify min funds/i })).not.toBeDisabled());
+  });
+
+  // Button-status task (Finance's ask): "Generating…" while Generate Plan's
+  // request is in flight.
+  it('shows "Generating…" on the button while generatePlanAndWeeklyView is in flight', async () => {
+    let resolveGenerate: (value: unknown) => void = () => {};
+    generatePlanAndWeeklyView.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveGenerate = resolve;
+        })
+    );
+
+    render(<PlanningView />);
+    await waitFor(() => expect(listVendors).toHaveBeenCalled());
+
+    await userEvent.click(screen.getByRole('button', { name: /cal min funds/i }));
+    const generateButton = await screen.findByRole('button', { name: /^generate plan$/i });
+    await waitFor(() => expect(generateButton).toBeEnabled());
+
+    await userEvent.click(generateButton);
+
+    expect(await screen.findByRole('button', { name: /generating…/i })).toBeDisabled();
+
+    resolveGenerate({ plan: { allocations: [], leftover_remaining: 0 } });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /^generate plan$/i })).not.toBeDisabled());
+  });
 });

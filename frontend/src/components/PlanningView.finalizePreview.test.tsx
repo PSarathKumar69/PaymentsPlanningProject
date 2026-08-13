@@ -143,4 +143,32 @@ describe('PlanningView — Finalize modal proactive signed funds preview', () =>
     expect(screen.queryByText(/left after this plan/i)).not.toBeInTheDocument();
     expect(finalizeNewModel2).not.toHaveBeenCalled();
   });
+
+  // Button-status task (Finance's ask): a full-page loading buffer while
+  // Finalize actually runs, not just a disabled button.
+  it('shows a full-page Finalizing overlay while the finalize call is in flight, then clears it', async () => {
+    getPlanRuns.mockResolvedValue({ plan_runs: [planRunWith(100000, 100000)], vendor_week_distribution_plans: {} });
+    let resolveFinalize: (value: unknown) => void = () => {};
+    finalizeNewModel2.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFinalize = resolve;
+        })
+    );
+    render(<PlanningView />);
+    await waitFor(() => expect(listVendors).toHaveBeenCalled());
+
+    await openFinalizeConfirm();
+    await userEvent.click(screen.getByRole('button', { name: /^finalize$/i }));
+
+    // Confirm modal closes immediately; the full-page overlay takes over.
+    expect(await screen.findByText('Finalizing plan…')).toBeInTheDocument();
+    expect(screen.queryByText('Finalize this plan?')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /finalizing…/i })).toBeDisabled();
+
+    resolveFinalize({ ok: true, total_committed: 100000, available_funds: 100000, vendor_count: 1 });
+
+    await waitFor(() => expect(screen.queryByText('Finalizing plan…')).not.toBeInTheDocument());
+    expect(await screen.findByRole('button', { name: /finalize plan/i })).not.toBeDisabled();
+  });
 });

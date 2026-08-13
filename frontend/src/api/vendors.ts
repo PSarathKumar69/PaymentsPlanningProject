@@ -10,8 +10,23 @@ export const getVendorAging = (id: number) => api.get<VendorAging>(`/vendors/${i
 export const getAllVendorsAging = () => api.get<Array<VendorAging & { vendor_id: number }>>('/vendors/aging');
 export const getVendorPaymentTracking = () => api.get<VendorPaymentTracking[]>('/vendors/payment-tracking');
 
+// Response shape mirrors backend/api/routers/vendors.py's patch_vendor() —
+// sibling_field/sibling_old_value/sibling_new_value are present when this
+// edit auto-derived its sibling (category<->priority_tag, backend/
+// configuration/vendor_edits.py::_derive_sibling()) server-side in the same
+// call; commitment_months_warning is the non-blocking "commitment_months
+// still unconfirmed" flag. Callers that only need old/new can ignore the rest.
+export interface VendorPatchResponse {
+  old_value: unknown;
+  new_value: unknown;
+  sibling_field?: string;
+  sibling_old_value?: unknown;
+  sibling_new_value?: unknown;
+  commitment_months_warning?: string;
+}
+
 export const patchVendor = (id: number, field: string, new_value: unknown) =>
-  api.patch<{ old_value: unknown; new_value: unknown }>(`/vendors/${id}`, { field, new_value });
+  api.patch<VendorPatchResponse>(`/vendors/${id}`, { field, new_value });
 
 export const getVendorPayments = (id: number) => api.get<Payment[]>(`/vendors/${id}/payments`);
 

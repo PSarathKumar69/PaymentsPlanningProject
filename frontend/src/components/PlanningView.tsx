@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Calendar, PiggyBank, Search, SlidersHorizontal, CheckCircle2, RefreshCw, RotateCcw, Users, AlertCircle, Handshake, Layers, Trash2, Filter, Download } from 'lucide-react';
+import { PiggyBank, Search, SlidersHorizontal, CheckCircle2, RefreshCw, RotateCcw, Users, AlertCircle, Handshake, Layers, Trash2, Filter, Download, UserX } from 'lucide-react';
 import { listVendors, getVendorAging, getAllVendorsAging, getVendorCategories, getVendorPaymentTracking, patchVendor } from '../api/vendors';
 import { getPlanRuns, getMinimumFundsRequired, getAllVendorMinFundsRequired, generatePlanAndWeeklyView, finalizeNewModel2, resetNewModel2Cycle, getCurrentPlanningMonth } from '../api/newModel2';
 import { downloadFinalizedPlanExport, downloadMinFundsVerificationExport } from '../api/planExport';
@@ -29,7 +29,7 @@ import {
   categoryBadgeClass,
   categoryLabel,
 } from '../constants/enums';
-import { formatMoney, formatMonthLong, formatPct } from '../utils/format';
+import { formatMoney, formatPct } from '../utils/format';
 import { VendorDetailModal } from './VendorDetailModal';
 import { CompanionPanel } from './CompanionPanel';
 import { ConfirmModal } from './ConfirmModal';
@@ -292,6 +292,12 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
   }, [availableFunds]);
   const [fundsLeft, setFundsLeft] = useState<number | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  // Button status states (Finance's ask — this task): Generate/Regenerate
+  // already had isGenerating; these three are new — Downloading… on both
+  // download buttons, a full-page overlay while Finalize actually runs.
+  const [isDownloadingMinFunds, setIsDownloadingMinFunds] = useState(false);
+  const [isDownloadingExport, setIsDownloadingExport] = useState(false);
+  const [isFinalizing, setIsFinalizing] = useState(false);
 
   // ---- search / filter -----------------------------------------------------
   // Empty set = "no filter applied for this section" (matches everything),
@@ -675,9 +681,16 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
     // closes here too. `ok`/`over_by` are still surfaced, just as a
     // warning toast instead of a modal that stays open and refuses to
     // proceed (CLAUDE.md rule 2: suggestion, never enforce).
+    //
+    // Button-status task (Finance's ask): a full-page loading overlay runs
+    // for the whole finalize+refresh round trip, not just the API call
+    // itself — Finance's complaint was the screen looking frozen/unclear
+    // while this runs, and refreshPaymentTracking() is part of the same
+    // wait as far as they're concerned.
+    setShowFinalizeConfirm(false);
+    setIsFinalizing(true);
     try {
       const data = await finalizeNewModel2();
-      setShowFinalizeConfirm(false);
       await refreshPaymentTracking();
       if (data.ok) {
         onNotify?.(
@@ -694,6 +707,8 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
       }
     } catch (e) {
       onNotify?.(friendlyErrorMessage(e), 'error');
+    } finally {
+      setIsFinalizing(false);
     }
   };
 
@@ -724,6 +739,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
   };
 
   const handleDownloadExport = async () => {
+    setIsDownloadingExport(true);
     try {
       const { blob, filename } = await downloadFinalizedPlanExport();
       const url = URL.createObjectURL(blob);
@@ -734,10 +750,13 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
       URL.revokeObjectURL(url);
     } catch (e) {
       onNotify?.(friendlyErrorMessage(e), 'error');
+    } finally {
+      setIsDownloadingExport(false);
     }
   };
 
   const handleDownloadMinFundsVerification = async () => {
+    setIsDownloadingMinFunds(true);
     try {
       const { blob, filename } = await downloadMinFundsVerificationExport();
       const url = URL.createObjectURL(blob);
@@ -748,6 +767,8 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
       URL.revokeObjectURL(url);
     } catch (e) {
       onNotify?.(friendlyErrorMessage(e), 'error');
+    } finally {
+      setIsDownloadingMinFunds(false);
     }
   };
 
@@ -797,27 +818,44 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
   // Category and V-Priority are two independent DB fields but one Finance
   // concept — changing either one keeps the other in lockstep (Must
   // Pay=P0, Commitment=P1, Inactive=P5, Normal=P2/P3/P4 default P2).
+  //
+  // Bug fix (this task — "can't change Commitment vendor to Normal, the
+  // dropdown doesn't work"): this used to ALSO independently re-derive the
+  // implied sibling tag client-side and fire a SECOND patchVendor() call
+  // for it. That was always redundant — backend/configuration/
+  // vendor_edits.py::update_vendor_field() already derives and writes the
+  // sibling field atomically in the SAME single-field PATCH (_derive_sibling(),
+  // returned as sibling_field/sibling_old_value/sibling_new_value on the
+  // response) — and it was actively harmful: the second call re-opened and
+  // re-saved the real Excel file a second time for no reason, entirely on
+  // the strength of a comparison against a value already stale by the time
+  // it ran (`vendor.priority_tag` captured before the first await). If that
+  // second, unnecessary call ever failed (a transient error, a concurrent
+  // edit elsewhere), the catch block fired and `refreshVendors()` never ran
+  // — so even though the category change had ALREADY succeeded server-side,
+  // the row kept showing the OLD category until the next full reload,
+  // which is exactly what looked like "the dropdown doesn't work." One
+  // single-field PATCH now does the whole job; the backend's own response
+  // already tells us if a sibling/commitment_months flag needs surfacing.
   const handleCategoryChange = async (vendor: Vendor, newCategory: string) => {
-    const impliedTag = displayedPriorityTag({ category: newCategory, priority_tag: vendor.priority_tag }, priorityBuckets);
     try {
-      await patchVendor(vendor.id, 'category', newCategory);
-      if (impliedTag !== vendor.priority_tag) {
-        await patchVendor(vendor.id, 'priority_tag', impliedTag);
-      }
+      const result = await patchVendor(vendor.id, 'category', newCategory);
       await Promise.all([refreshVendors(), refreshPaymentTracking()]);
+      if (result.commitment_months_warning) {
+        onNotify?.(result.commitment_months_warning, 'warning');
+      }
     } catch (e) {
       onNotify?.(friendlyErrorMessage(e), 'error');
     }
   };
 
   const handlePriorityTagChange = async (vendor: Vendor, newTag: string) => {
-    const impliedCategory = impliedCategoryForTag(newTag, priorityBuckets);
     try {
-      await patchVendor(vendor.id, 'priority_tag', newTag);
-      if (impliedCategory !== vendor.category) {
-        await patchVendor(vendor.id, 'category', impliedCategory);
-      }
+      const result = await patchVendor(vendor.id, 'priority_tag', newTag);
       await Promise.all([refreshVendors(), refreshPaymentTracking()]);
+      if (result.commitment_months_warning) {
+        onNotify?.(result.commitment_months_warning, 'warning');
+      }
     } catch (e) {
       onNotify?.(friendlyErrorMessage(e), 'error');
     }
@@ -979,7 +1017,7 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
           own big line below (Sarath's call: was icon-on-top-of-label-on-top-
           of-tiny-number, stacked three deep; text-2xl makes the actual
           figure the visually dominant thing on the card, not the icon). */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6">
         <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#107c41] flex items-center justify-center border border-emerald-200 shrink-0">
@@ -1016,11 +1054,24 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
           </div>
           <span className="text-2xl font-bold text-gray-900 tracking-tight">{vendors.filter((v) => v.category === VENDOR_CATEGORY.NORMAL).length}</span>
         </div>
+        {/* Added per Finance's ask (this task): count card for Inactive
+            (P5) vendors, same style/pattern as Must Pay/Commitment/Normal. */}
+        <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-full bg-gray-100 text-gray-500 flex items-center justify-center border border-gray-200 shrink-0">
+              <UserX className="w-4 h-4 text-gray-500" />
+            </div>
+            <span className="text-xs text-gray-500 font-medium">Inactive Vendors</span>
+          </div>
+          <span className="text-2xl font-bold text-gray-900 tracking-tight">{vendors.filter((v) => v.category === VENDOR_CATEGORY.INACTIVE).length}</span>
+        </div>
       </div>
 
-      {/* Four-card cycle flow (CLAUDE.md rule 4, docs/14's fixed order:
-          Min Funds -> Available Funds -> Funds Left -> Planning Month). */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+      {/* Three-card cycle flow (CLAUDE.md rule 4, docs/14's fixed order:
+          Min Funds -> Available Funds -> Funds Left). Planning Month card
+          removed per Finance's ask (this task) — Planning Month is still
+          tracked/used internally, just no longer shown as its own card. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* No icon (Sarath's call) — stacked top-to-bottom: top band
             (amount) ~70% of the card's height, bottom band the full-bleed
             green "Cal Min Funds" button spanning the entire width, ~30% of
@@ -1074,23 +1125,6 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
             <span className="text-xs text-gray-500 font-medium" title="Funds left over after this plan's actual allocation, not funds available for the next regeneration.">Funds Left</span>
           </div>
           <span className="text-xl font-bold text-gray-900 tracking-tight">{formatMoney(fundsLeft)}</span>
-        </div>
-
-        {/* Read-only (Main-tab upload-confirm task, section 4) — Finance
-            confirms Planning Month once, in the upload confirm modal;
-            this card just shows the resolved value, never asks again. */}
-        <div className="bg-white border border-gray-200/90 rounded-xl p-4 shadow-2xs flex flex-col gap-2">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#107c41] flex items-center justify-center border border-emerald-200 shrink-0">
-              <Calendar className="w-4 h-4 text-[#107c41]" />
-            </div>
-            <span className="text-xs text-gray-500 font-medium">
-              Planning Month{hasGeneratedThisCycle ? ' (locked this cycle)' : ''}
-            </span>
-          </div>
-          <span className="text-xl font-bold text-gray-900 tracking-tight truncate">
-            {planningMonth ? formatMonthLong(planningMonth) : '—'}
-          </span>
         </div>
       </div>
 
@@ -1207,35 +1241,37 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
             disabled={isGenerating || !fundsInputEnabled}
             className="px-3 py-1.5 bg-[#107c41] hover:bg-[#0d6535] disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
-            {hasGeneratedThisCycle ? 'Regenerate Plan' : 'Generate Plan'}
+            <RefreshCw className={`w-3.5 h-3.5 ${isGenerating ? 'animate-spin' : ''}`} />
+            {isGenerating
+              ? (hasGeneratedThisCycle ? 'Regenerating…' : 'Generating…')
+              : (hasGeneratedThisCycle ? 'Regenerate Plan' : 'Generate Plan')}
           </button>
           <button
             onClick={handleDownloadMinFundsVerification}
-            disabled={Object.keys(nm2MinFundsByVendorId).length === 0}
+            disabled={isDownloadingMinFunds || Object.keys(nm2MinFundsByVendorId).length === 0}
             title={Object.keys(nm2MinFundsByVendorId).length === 0 ? 'Calculate Minimum Funds Required first' : undefined}
             className="px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
-            <Download className="w-3.5 h-3.5" />
-            Verify Min Funds
+            <Download className={`w-3.5 h-3.5 ${isDownloadingMinFunds ? 'animate-bounce' : ''}`} />
+            {isDownloadingMinFunds ? 'Downloading…' : 'Verify Min Funds'}
           </button>
           <button
             onClick={handleFinalize}
-            disabled={!hasGeneratedThisCycle}
+            disabled={!hasGeneratedThisCycle || isFinalizing}
             title={!hasGeneratedThisCycle ? 'Generate a plan first' : undefined}
             className="px-3 py-1.5 bg-white border border-[#107c41] hover:bg-emerald-50/60 disabled:opacity-50 disabled:cursor-not-allowed text-[#107c41] rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
             <CheckCircle2 className="w-3.5 h-3.5" />
-            Finalize Plan
+            {isFinalizing ? 'Finalizing…' : 'Finalize Plan'}
           </button>
           <button
             onClick={handleDownloadExport}
-            disabled={!paymentRowsSorted.some((row) => row.budget > 0)}
+            disabled={isDownloadingExport || !paymentRowsSorted.some((row) => row.budget > 0)}
             title={!paymentRowsSorted.some((row) => row.budget > 0) ? 'Finalize a plan first' : undefined}
             className="px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
-            <Download className="w-3.5 h-3.5" />
-            Download Excel
+            <Download className={`w-3.5 h-3.5 ${isDownloadingExport ? 'animate-bounce' : ''}`} />
+            {isDownloadingExport ? 'Downloading…' : 'Download Excel'}
           </button>
           <button
             onClick={handleReset}
@@ -1652,6 +1688,24 @@ export const PlanningView: React.FC<PlanningViewProps> = ({ onNotify, refreshSig
           onConfirm={confirmReset}
           onCancel={() => setShowResetConfirm(false)}
         />
+      )}
+
+      {/* Full-page loading buffer while Finalize actually runs (Finance's
+          explicit ask, this task) — the confirm modal above closes the
+          moment Finance clicks through, then this overlay covers the whole
+          screen until finalizeNewModel2() + the payment-tracking refresh
+          both complete. */}
+      {isFinalizing && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center"
+        >
+          <div className="bg-white rounded-xl shadow-xl px-6 py-5 flex flex-col items-center gap-3">
+            <div className="w-10 h-10 border-4 border-emerald-100 border-t-[#107c41] rounded-full animate-spin" />
+            <span className="text-sm font-semibold text-gray-700">Finalizing plan…</span>
+          </div>
+        </div>
       )}
 
       <CompanionPanel planVendors={planVendorsForCompanion} />
