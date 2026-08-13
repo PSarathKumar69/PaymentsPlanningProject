@@ -9,13 +9,18 @@ import {
   LogOut,
 } from 'lucide-react';
 import { NavItemKey } from '../types';
-import { PLACEHOLDER_CURRENT_USER } from '../constants/currentUser';
+import { CurrentUser } from '../api/auth';
 
 interface SidebarProps {
   isCollapsed: boolean;
   setIsCollapsed: (value: boolean | ((prev: boolean) => boolean)) => void;
   activeNav: NavItemKey;
   setActiveNav: (nav: NavItemKey) => void;
+  // Login-credential task: the real signed-in user (backend/api/routers/
+  // auth.py's /auth/me), replacing the old PLACEHOLDER_CURRENT_USER
+  // stand-in — see constants/currentUser.ts's own docstring for why that
+  // was always meant to be swapped out once real auth landed.
+  currentUser: CurrentUser;
   onLogoutClick?: () => void;
 }
 
@@ -24,8 +29,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
   setIsCollapsed,
   activeNav,
   setActiveNav,
+  currentUser,
   onLogoutClick,
 }) => {
+  // Two-letter initials from the display name ("Pankaj Kalra" -> "PK"),
+  // same avatar-badge treatment the old placeholder used, just derived
+  // from a real name instead of a hardcoded single letter.
+  const initials = currentUser.display_name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]!.toUpperCase())
+    .join('') || currentUser.username.slice(0, 2).toUpperCase();
   const navItems: { key: NavItemKey; label: string; icon: React.ReactNode }[] = [
     {
       key: 'main',
@@ -117,16 +132,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="flex items-center gap-2.5 min-w-0">
             {/* Circular Avatar */}
             <div className="w-8 h-8 rounded-full bg-[#dcfce7] text-[#107c41] font-bold text-xs flex items-center justify-center shrink-0 border border-[#bbf7d0]">
-              {PLACEHOLDER_CURRENT_USER.initials}
+              {initials}
             </div>
 
             {!isCollapsed && (
               <div className="flex flex-col min-w-0 pr-1">
                 <span className="text-xs font-semibold text-gray-900 truncate leading-tight">
-                  {PLACEHOLDER_CURRENT_USER.name}
+                  {currentUser.display_name}
                 </span>
                 <span className="text-[11px] text-gray-500 truncate leading-tight">
-                  {PLACEHOLDER_CURRENT_USER.role}
+                  {currentUser.role}
                 </span>
               </div>
             )}

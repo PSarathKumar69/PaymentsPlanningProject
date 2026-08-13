@@ -42,7 +42,25 @@ def _fresh_app(tmp_path):
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(_fresh_app(tmp_path))
+    """Login-credential task: every route below is now behind
+    get_current_user (backend/api/main.py) — this fixture logs in a
+    throwaway test user so every existing test keeps hitting the real
+    protected routes exactly as before, instead of each test needing its
+    own login call."""
+    app = _fresh_app(tmp_path)
+    from backend.auth.security import create_user
+    from backend.db.session import SessionLocal
+
+    seed_session = SessionLocal()
+    try:
+        create_user(seed_session, "test_user", "test_password_123")
+    finally:
+        seed_session.close()
+
+    test_client = TestClient(app)
+    login = test_client.post("/auth/login", json={"username": "test_user", "password": "test_password_123"})
+    assert login.status_code == 200, login.text
+    return test_client
 
 
 @pytest.fixture

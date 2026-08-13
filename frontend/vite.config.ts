@@ -13,6 +13,7 @@ const API_BASE = process.env.VITE_API_BASE || 'http://localhost:8000'
 const API_PATH_PREFIXES = [
   '/vendors', '/models', '/plan-allocations', '/plan-runs', '/payments',
   '/master-data', '/config', '/audit-log', '/ai', '/ingestion', '/rollover', '/calendar', '/analytics',
+  '/auth', // Login-credential task: /auth/login, /auth/logout, /auth/me
 ]
 
 export default defineConfig({

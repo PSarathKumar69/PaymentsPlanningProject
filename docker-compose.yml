@@ -1,0 +1,29 @@
+# Docker task: convenience wrapper around `docker build`/`docker run` for
+# local use — `docker compose up --build`. Not meant for the real AWS
+# deployment (there you'd set DATABASE_URL to Neon and skip the volume
+# entirely — see Dockerfile's own comments).
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Required once DATABASE_URL is set (production Postgres) — safe to
+      # leave unset for this local-SQLite compose file, since
+      # backend/auth/security.py only enforces it in that case. Uncomment
+      # and set a real value if you switch this compose file to Postgres.
+      # - JWT_SECRET_KEY=change-me-to-a-long-random-string
+      - PAYMENTS_DB_PATH=/app/backend/db/app.db
+      # Only needed for the AI-assisted column-mapping step on Excel
+      # upload (backend/ai_layer/gemini_client.py) — login and everything
+      # else work without it. Uncomment and set your real key.
+      # - GEMINI_API_KEY=your-real-gemini-api-key
+    volumes:
+      # Keeps the local SQLite file (and whatever you seed into it via
+      # `docker compose exec app python -m backend.db.seed_users ...`)
+      # across `docker compose down`/`up` — without this, every fresh
+      # container starts from an empty database.
+      - payments-db:/app/backend/db
+
+volumes:
+  payments-db:

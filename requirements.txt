@@ -8,3 +8,5 @@ psycopg2-binary==2.9.10
 google-genai==2.8.0
 python-dotenv==1.2.2
 python-multipart==0.0.32
+bcrypt==5.0.0
+PyJWT==2.12.1

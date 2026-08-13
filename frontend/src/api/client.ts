@@ -80,6 +80,18 @@ function detailToMessage(detail: unknown, fallback: string): string {
   return fallback;
 }
 
+// Login-credential task: a session that expired (or got logged out in
+// another tab) mid-use surfaces here as a 401 on whatever call happens
+// next, same as it would on the very first request. Broadcasting it (App.tsx
+// listens) instead of just throwing the ApiError lets the app snap back to
+// the login page immediately, instead of leaving a logged-out user staring
+// at a component that keeps failing every retry with the same 401.
+function notifyUnauthorized(status: number, path: string) {
+  if (status === 401 && path !== '/auth/login' && path !== '/auth/me') {
+    window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+  }
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = { method, headers: {} };
   if (body !== undefined) {
@@ -89,6 +101,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    notifyUnauthorized(res.status, path);
     throw new ApiError(detailToMessage(data.detail, res.statusText));
   }
   return data as T;
@@ -105,6 +118,7 @@ async function upload<T>(path: string, file: File, extraFields?: Record<string, 
   const res = await fetch(path, { method: 'POST', body: formData });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    notifyUnauthorized(res.status, path);
     throw new ApiError(detailToMessage(data.detail, res.statusText));
   }
   return data as T;

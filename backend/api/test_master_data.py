@@ -29,7 +29,25 @@ def _fresh_app(tmp_path):
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(_fresh_app(tmp_path))
+    """Login-credential task: every route below is now behind
+    get_current_user (backend/api/main.py) — this fixture logs in a
+    throwaway test user so every existing test keeps hitting the real
+    protected routes exactly as before, instead of each test needing its
+    own login call."""
+    app = _fresh_app(tmp_path)
+    from backend.auth.security import create_user
+    from backend.db.session import SessionLocal
+
+    seed_session = SessionLocal()
+    try:
+        create_user(seed_session, "test_user", "test_password_123")
+    finally:
+        seed_session.close()
+
+    test_client = TestClient(app)
+    login = test_client.post("/auth/login", json={"username": "test_user", "password": "test_password_123"})
+    assert login.status_code == 200, login.text
+    return test_client
 
 
 @pytest.fixture
@@ -160,7 +178,17 @@ def test_extra_fields_endpoint_lists_real_unmapped_columns(seeded_client):
     resp = seeded_client.get("/master-data/extra-fields")
     assert resp.status_code == 200
     columns = {f["column_name"] for f in resp.json()}
-    assert {"Unique", "VN"} <= columns  # the real sheet's own genuinely-unmapped columns
+    # "Unique" fix (Main-page grid bug, 2026-08): once find_unique_code_column()
+    # recognizes a header, load_excel.py excludes it from the generic
+    # unmapped/passthrough set on purpose (it's now a dedicated,
+    # ingestion-populated field — see grid.py's "unique_code" column kind),
+    # so it must NOT show up here as a hand-editable extra field any more.
+    # This assertion used to require {"Unique", "VN"} — both are now either
+    # a recognized column ("Unique") or no longer present in the real sheet
+    # ("VN"); SPOC/Cash Flow Head/Tracking Head/Nature of Expense/Prioity
+    # are the sheet's actual genuinely-unmapped columns today.
+    assert "Unique" not in columns
+    assert {"SPOC", "Cash Flow Head"} <= columns
 
 
 def test_patch_extra_field_endpoint_writes_db_and_audit_log(seeded_client, tmp_path):
@@ -172,16 +200,19 @@ def test_patch_extra_field_endpoint_writes_db_and_audit_log(seeded_client, tmp_p
     # confirms the route wires body.excel_path through, not a real-file check.
     shutil.copy(EXCEL_PATH, excel_copy_2)
 
+    # "SPOC", not "Unique": "Unique" is a recognized, dedicated column now
+    # (see the sibling test above) — SPOC is a genuinely-unmapped column in
+    # the real sheet, so it's the correct stand-in for "edit a real extra field".
     resp = seeded_client.patch(
         f"/master-data/extra-fields/{vendor_id}",
-        json={"column_name": "Unique", "new_value": "test-value", "excel_path": excel_copy_2},
+        json={"column_name": "SPOC", "new_value": "test-value", "excel_path": excel_copy_2},
     )
     assert resp.status_code == 200
     assert resp.json()["new_value"] == "test-value"
 
     resp = seeded_client.get("/audit-log", params={"vendor_id": vendor_id})
     assert resp.status_code == 200
-    assert any(e["field_name"] == "Unique" and e["new_value"] == "test-value" for e in resp.json()["items"])
+    assert any(e["field_name"] == "SPOC" and e["new_value"] == "test-value" for e in resp.json()["items"])
 
 
 def test_commit_upload_endpoint_then_revert_endpoint(seeded_client, excel_copy, tmp_path, monkeypatch):

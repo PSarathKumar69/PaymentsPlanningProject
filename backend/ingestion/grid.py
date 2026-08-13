@@ -31,6 +31,7 @@ from backend.ingestion.column_mapping import (
     build_sheet_map,
     find_column,
     find_duplicate_erp_codes,
+    find_unique_code_column,
     format_header_value,
     resolve_header,
     unmapped_header_columns,
@@ -38,7 +39,7 @@ from backend.ingestion.column_mapping import (
 from backend.configuration.extra_fields import list_extra_fields
 
 
-def _describe_columns(ws, sheet_map, category_col, commitment_months_col, assigned_week_col, priority_tag_col, unmapped):
+def _describe_columns(ws, sheet_map, category_col, commitment_months_col, assigned_week_col, priority_tag_col, unique_code_col, unmapped):
     payable_month_by_col = {col: month for month, col in sheet_map.payable_cols}
     payment_month_by_col = {col: month for month, col in sheet_map.payment_cols}
     week_number_by_col = {col: wk for wk, col in sheet_map.week_cols}
@@ -82,6 +83,18 @@ def _describe_columns(ws, sheet_map, category_col, commitment_months_col, assign
             columns.append({"header": header, "kind": "assigned_week", "field": "assigned_week", "editable": False})
         elif c == priority_tag_col:
             columns.append({"header": header, "kind": "priority_tag", "field": "priority_tag", "editable": False})
+        elif c == unique_code_col:
+            # Bug fix (grid never learned about the Unique Code column when
+            # that feature was added to load_excel.py/column_mapping.py):
+            # this used to fall through to the generic "extra" branch below,
+            # which reads from VendorExtraField (only ever populated by a
+            # Finance edit made IN this grid) instead of the real
+            # Vendor.unique_code value ingestion already stores — so every
+            # row showed a blank, editable box no matter what the sheet
+            # actually had. Read-only here, same as erp_code/entity/
+            # vendor_name: it's sheet-driven at ingestion, not hand-edited
+            # cell by cell in this grid.
+            columns.append({"header": header, "kind": "unique_code", "editable": False})
         elif c in unmapped_by_col:
             columns.append({"header": header, "kind": "extra", "column_name": unmapped_by_col[c], "editable": True})
         # else: a header cell that's none of the above shouldn't happen —
@@ -133,8 +146,10 @@ def build_master_grid(session, excel_path=None):
     commitment_months_col = find_column(ws, resolve_header("commitment_months", header_overrides), sheet_map.header_row)
     assigned_week_col = find_column(ws, resolve_header("assigned_week", header_overrides), sheet_map.header_row)
     priority_tag_col = find_column(ws, resolve_header("priority_tag", header_overrides), sheet_map.header_row)
+    unique_code_col = find_unique_code_column(ws, sheet_map.header_row)
     unmapped = unmapped_header_columns(
-        ws, sheet_map, extra_cols=(category_col, commitment_months_col, assigned_week_col, priority_tag_col)
+        ws, sheet_map,
+        extra_cols=(category_col, commitment_months_col, assigned_week_col, priority_tag_col, unique_code_col),
     )
 
     # Go-live "show every row" task: recomputed fresh on every call (cheap
@@ -150,7 +165,7 @@ def build_master_grid(session, excel_path=None):
         for r in g["rows"][1:]
     ]
     columns = _describe_columns(
-        ws, sheet_map, category_col, commitment_months_col, assigned_week_col, priority_tag_col, unmapped
+        ws, sheet_map, category_col, commitment_months_col, assigned_week_col, priority_tag_col, unique_code_col, unmapped
     )
     extra_widgets = {f["column_name"]: {"widget": f["widget"], "options": f["options"]} for f in list_extra_fields(session)}
 
@@ -203,6 +218,8 @@ def build_master_grid(session, excel_path=None):
                 values[h] = vendor.assigned_week
             elif kind == "priority_tag":
                 values[h] = vendor.priority_tag  # already a plain string (or None)
+            elif kind == "unique_code":
+                values[h] = vendor.unique_code
             elif kind == "extra":
                 values[h] = extra_values.get(col["column_name"])
         vendors_out.append({"vendor_id": vendor.id, "erp_code": vendor.erp_code, "values": values})

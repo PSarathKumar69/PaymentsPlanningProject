@@ -448,3 +448,24 @@ class MasterExcelBlob(Base):
     content: Mapped[bytes] = mapped_column(LargeBinary)
     backup_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class User(Base):
+    """Login-credential task: the small, explicit allowlist of who may sign
+    in at all — restricted to specific named Finance users, not "anyone
+    with a Google account," per that task's own requirement. No signup
+    flow/UI on purpose: rows are created once via
+    backend/db/seed_users.py, by hand, by whoever administers the app.
+
+    password_hash is a bcrypt hash (backend/auth/security.py) — the
+    plaintext password is never persisted anywhere once seeding is done.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String)
+    display_name: Mapped[str] = mapped_column(String)
+    role: Mapped[str] = mapped_column(String, default="Finance Admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

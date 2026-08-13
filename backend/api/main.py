@@ -11,18 +11,20 @@ a session — those own a short-lived plain SessionLocal() directly instead).
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+from backend.auth.dependencies import get_current_user
 from backend.ingestion.ai_column_mapper import AIMappingUnavailableError
 
 from .routers import (
     ai_layer,
     analytics,
     audit_log,
+    auth,
     calendar,
     configuration,
     ingestion,
@@ -37,6 +39,12 @@ from .routers import (
 
 app = FastAPI(title="Vendor Payment Planning & Prioritization Automation")
 
+# Login-credential task: every real data route below requires a signed-in
+# Finance user (see backend/auth/). /auth/* itself is deliberately excluded
+# — /login is how the cookie gets minted in the first place, and /logout
+# and /me both need to run even when there's no valid session yet.
+_require_login = [Depends(get_current_user)]
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 
@@ -50,23 +58,47 @@ def ai_mapping_unavailable_handler(request: Request, exc: AIMappingUnavailableEr
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
-app.include_router(vendors.router)
-app.include_router(calendar.router)
-app.include_router(new_model_2.router)
-app.include_router(weekly_planning.router)
-app.include_router(payments.router)
-app.include_router(plan_allocations.router)
-app.include_router(plan_runs.router)
-app.include_router(configuration.router)
-app.include_router(ingestion.router)
-app.include_router(master_data.router)
-app.include_router(audit_log.router)
-app.include_router(ai_layer.router)
-app.include_router(analytics.router)
+app.include_router(auth.router)
+
+app.include_router(vendors.router, dependencies=_require_login)
+app.include_router(calendar.router, dependencies=_require_login)
+app.include_router(new_model_2.router, dependencies=_require_login)
+app.include_router(weekly_planning.router, dependencies=_require_login)
+app.include_router(payments.router, dependencies=_require_login)
+app.include_router(plan_allocations.router, dependencies=_require_login)
+app.include_router(plan_runs.router, dependencies=_require_login)
+app.include_router(configuration.router, dependencies=_require_login)
+app.include_router(ingestion.router, dependencies=_require_login)
+app.include_router(master_data.router, dependencies=_require_login)
+app.include_router(audit_log.router, dependencies=_require_login)
+app.include_router(ai_layer.router, dependencies=_require_login)
+app.include_router(analytics.router, dependencies=_require_login)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.get("/", include_in_schema=False)
+@app.get("/test-ui", include_in_schema=False)
 def serve_test_ui():
     return FileResponse(os.path.join(STATIC_DIR, "test_ui.html"))
+
+
+# Docker task: on Vercel the frontend is its own separate "service"
+# (vercel.json's rewrites), never served by this app — but a single Docker
+# image has no second service to hand it off to, so this app serves the
+# built React app (frontend/npm run build's dist/) itself when that
+# directory is present. Registered last on purpose: every route/router
+# above (including /test-ui and the API routers) is matched first, so
+# nothing here can ever shadow a real API path — this only ever catches
+# whatever's left over, exactly like vercel.json's own final `/(.*)  ->
+# frontend` rewrite rule.
+FRONTEND_DIST_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
+if os.path.isdir(FRONTEND_DIST_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST_DIR, "assets")), name="frontend-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_frontend(full_path: str):
+        # A refresh on any "page" of the app (it's a single-page app with no
+        # real client-side routes today, but this keeps working if that
+        # changes) still returns the same index.html, same as a normal SPA
+        # deployment — the React app itself decides what to render.
+        return FileResponse(os.path.join(FRONTEND_DIST_DIR, "index.html"))

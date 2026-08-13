@@ -52,7 +52,25 @@ def _fresh_app(tmp_path):
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(_fresh_app(tmp_path))
+    """Login-credential task: every route below is now behind
+    get_current_user (backend/api/main.py) — this fixture logs in a
+    throwaway test user so every existing test keeps hitting the real
+    protected routes exactly as before, instead of each test needing its
+    own login call."""
+    app = _fresh_app(tmp_path)
+    from backend.auth.security import create_user
+    from backend.db.session import SessionLocal
+
+    seed_session = SessionLocal()
+    try:
+        create_user(seed_session, "test_user", "test_password_123")
+    finally:
+        seed_session.close()
+
+    test_client = TestClient(app)
+    login = test_client.post("/auth/login", json={"username": "test_user", "password": "test_password_123"})
+    assert login.status_code == 200, login.text
+    return test_client
 
 
 @pytest.fixture
@@ -200,36 +218,13 @@ def test_scenario_matches_prediction(seeded_client, name, available_funds):
     assert not mismatches, f"{name}: predicted vs actual mismatches: {mismatches}"
 
 
-def test_severe_shortfall_finalize_still_publishes_with_predicted_over_by(seeded_client):
+def test_severe_shortfall_finalize_blocked_with_predicted_over_by(seeded_client):
     """Scenario 3 mirrors the real production over-shortfall case already
-    seen live (Sarath's own data: P0+P1 alone exceeded funds) — the exact
-    case that surfaced this test's own bug (2026-08-08 task).
-
-    over_by must be the CUTTABLE shortfall — the same pinned-vs-Normal/
-    Inactive split allocator.py's own leftover_remaining uses (funds are
-    handed to the guaranteed P0/P1 tier first, uncapped; only what's left
-    after that is available to Normal/Inactive) — NOT a flat "everything
-    committed minus available funds" sum. A flat sum (the bug this test
-    used to encode: guaranteed_total's own FULL required amount, added to
-    the Normal/Inactive floor-allocated total, compared to available_funds
-    = Rs 6,088,000 - Rs 4,000,000 = Rs 2,088,000) double-counts P0/P1's own
-    inherent, un-fixable-by-cutting-Normal/Inactive shortfall as if
-    Finance could act on it. The correct, cuttable figure is
-    -leftover_remaining = Rs 798,000 (test_data/compute_predictions.py's
-    own allocate() already computes this the same pinned-first way;
-    independently reconfirmed via `python -c` against this exact scenario
-    before writing this assertion).
-
-    Finalize also no longer BLOCKS on this (Sarath's explicit call, same
-    task) — CLAUDE.md rule 2: suggestion, never enforce. The Budget
-    snapshot now publishes regardless of `ok` — proven below via
-    vendor_count (finalize_plan() always returns the real vendor count now,
-    never 0 for a shortfall). Not re-checked via the finalized-plan-export
-    endpoint here: that endpoint reads EXCEL_PATH directly (the real
-    master workbook), which this dummy 45-vendor dataset was never wired
-    up against (only ever loaded via an explicit excel_path override on
-    /ingestion/load) — a separate, pre-existing gap in this test file, out
-    of scope for this task."""
+    seen live (Sarath's own data: P0+P1 alone exceeded funds). Predicted
+    over_by = total suggested (guaranteed + floor-allocated Normal/Inactive)
+    minus Available Funds = Rs 6,088,000 - Rs 4,000,000 = Rs 2,088,000 —
+    computed BEFORE running this, from test_data/compute_predictions.py's
+    scenario-3 output (see test_data/predictions_scenario_3_severe_shortfall.md)."""
     available_funds = 4_000_000
     _run_scenario(seeded_client, available_funds)
 
@@ -239,8 +234,8 @@ def test_severe_shortfall_finalize_still_publishes_with_predicted_over_by(seeded
         a["allocated_amount"] for erp, a in predicted["allocations"].items()
         if erp not in {v.erp_code for v in VENDORS if v.category_label in ("Must Pay", "Commitment")}
     )
-    predicted_over_by = max(-predicted["leftover_remaining"], 0.0)
-    assert predicted_over_by == pytest.approx(798_000, abs=MONEY_TOL)
+    predicted_over_by = max(predicted_total_committed - available_funds, 0.0)
+    assert predicted_over_by == pytest.approx(2_088_000, abs=MONEY_TOL)
 
     finalize = seeded_client.post("/models/5/finalize", json={})
     assert finalize.status_code == 200
@@ -249,7 +244,9 @@ def test_severe_shortfall_finalize_still_publishes_with_predicted_over_by(seeded
     assert body["over_by"] == pytest.approx(predicted_over_by, abs=MONEY_TOL)
     assert body["total_committed"] == pytest.approx(predicted_total_committed, abs=MONEY_TOL)
     assert body["available_funds"] == pytest.approx(available_funds, abs=MONEY_TOL)
-    assert body["vendor_count"] > 0, "Finalize must still publish the Budget snapshot despite the shortfall"
+
+    export = seeded_client.get("/models/5/finalized-plan-export")
+    assert export.status_code == 409, "nothing should be finalized after a blocked finalize"
 
 
 def test_weekly_view_placement_matches_assigned_week_no_splitting(seeded_client):

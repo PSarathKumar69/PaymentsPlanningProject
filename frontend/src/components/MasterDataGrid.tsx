@@ -92,8 +92,27 @@ export const MasterDataGrid: React.FC<MasterDataGridProps> = ({ onNotify, refres
   }, [grid, filterText]);
 
   const isStickyCol = (col: GridColumn) => STICKY_WIDTH[col.kind] != null;
+  // Bug fix: a sticky column has a FIXED pixel width (STICKY_WIDTH above),
+  // but with whitespace-nowrap and no overflow clipping, a vendor name
+  // longer than its box (very common — "FIRSTMERIDIAN GLOBAL SERVICES
+  // PRIVATE LIMITED" is nowhere near 200px) simply spilled past the box's
+  // edge and visually bled over whatever scrolling column happened to be
+  // underneath it — looked like columns "colliding" while scrolling.
+  // overflow: hidden + textOverflow: ellipsis clips it at the box's own
+  // edge instead; maxWidth (not just width) is needed too, since a plain
+  // width on a table cell is only a hint — a cell still grows to fit its
+  // content unless maxWidth also caps it.
   const stickyCellStyle = (col: GridColumn): React.CSSProperties =>
-    isStickyCol(col) ? { left: stickyLeftOffset(col.kind), width: STICKY_WIDTH[col.kind], minWidth: STICKY_WIDTH[col.kind] } : {};
+    isStickyCol(col)
+      ? {
+          left: stickyLeftOffset(col.kind),
+          width: STICKY_WIDTH[col.kind],
+          minWidth: STICKY_WIDTH[col.kind],
+          maxWidth: STICKY_WIDTH[col.kind],
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+        }
+      : {};
 
   // "No data yet" fix — before any vendor has ever been ingested (fresh
   // environment, or DB/master file wiped), show a friendly placeholder in
@@ -216,6 +235,11 @@ export const MasterDataGrid: React.FC<MasterDataGridProps> = ({ onNotify, refres
                         key={c.header}
                         className={`py-2 px-3 whitespace-nowrap border-b border-gray-100 ${isStickyCol(c) ? 'sticky z-1 bg-inherit' : ''}`}
                         style={stickyCellStyle(c)}
+                        // Full value on hover — the fixed-width sticky
+                        // columns now clip long text with an ellipsis
+                        // (see stickyCellStyle), so this is the only way
+                        // to still see e.g. a long vendor name in full.
+                        title={isStickyCol(c) ? String(row.values[c.header] ?? '') : undefined}
                       >
                         {renderCell(c, row)}
                       </td>

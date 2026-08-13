@@ -1,0 +1,32 @@
+# Docker task: keep the build context (and the image) to source + the one
+# real master-data file the app actually needs at startup (data/) — never
+# local dev DB snapshots, node_modules, or anything test/venv-related.
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+**/test_*.py
+**/*_test.py
+backend/_tmp_guardrail_probe_test.py
+backend/ingestion/verify_ai_first_mapping_manually.py
+
+# Local SQLite dev DB + every one-off backup snapshot — the container
+# creates its own schema fresh (backend/db/session.py's init_db()); baking
+# in a stale dev DB (or, worse, someone's local data) would be wrong either
+# way.
+backend/db/*.db
+backend/db/*.db.backup_*
+backend/db/*.bak-erpfix-*
+
+# Frontend: only frontend/dist (built inside the image's own build stage)
+# is ever copied into the final image — node_modules and other build
+# artifacts on the host are irrelevant/wrong to ship.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+.git/
+.venv/
+venv/
+*.egg-info/
+.env
+.env.*
