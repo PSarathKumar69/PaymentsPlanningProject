@@ -43,4 +43,16 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/', timeout=2)" || exit 1
 
-CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# AWS App Runner (and any single-trusted-reverse-proxy AWS setup) terminates
+# TLS in front of this container and forwards plain HTTP with
+# X-Forwarded-Proto/X-Forwarded-For set. Without --proxy-headers, uvicorn/
+# Starlette never learn the original request was HTTPS (request.url.scheme
+# stays "http", client IP stays the proxy's own) — wrong for anything that
+# inspects scheme or client IP (redirects, logging, security headers).
+# --forwarded-allow-ips=* is safe here specifically because App Runner's
+# network model means the proxy is the ONLY thing that can reach this
+# container directly; it is not a wildcard trust of arbitrary internet
+# traffic. COOKIE_SECURE itself stays driven by DATABASE_URL (unrelated),
+# so this doesn't change cookie behavior — it fixes scheme/client-IP
+# correctness for everything else running behind that same proxy.
+CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

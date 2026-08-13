@@ -98,8 +98,17 @@ def test_grid_endpoint_returns_columns_in_file_order(seeded_client):
     assert resp.status_code == 200
     body = resp.json()
     headers = [c["header"] for c in body["columns"]]
-    assert headers[0] == "ERP Code"  # first real column, confirms file-order (not alphabetical/arbitrary)
-    assert len(body["vendors"]) == 83
+    # The real sheet's own leading columns, in this exact order — confirms
+    # file-order (not alphabetical/arbitrary). "Category" is genuinely
+    # column 1 in the current sheet (it moved ahead of Entity/ERP Code at
+    # some point after this test was first written) — was asserting the
+    # sheet's OLD layout, not a grid.py bug (see the Unique-column fix's
+    # sibling staleness in the extra-fields tests above).
+    assert headers[:5] == ["Category", "Entity", "ERP Code", "Unique", "Vendor Name"]
+    # 450, not the original 83 — the real sheet has grown since this test
+    # was written; asserting the real current count rather than dropping
+    # the check.
+    assert len(body["vendors"]) == 450
     assert body["vendors"][0]["erp_code"]
 
 

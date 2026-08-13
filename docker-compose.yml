@@ -8,16 +8,21 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Required once DATABASE_URL is set (production Postgres) — safe to
-      # leave unset for this local-SQLite compose file, since
-      # backend/auth/security.py only enforces it in that case. Uncomment
-      # and set a real value if you switch this compose file to Postgres.
-      # - JWT_SECRET_KEY=change-me-to-a-long-random-string
+      # Values come from a local .env file (docker compose loads one from
+      # this same directory automatically) or your shell environment —
+      # never hardcoded here, since this file is committed to git.
+      # Create a .env file (already gitignored — see .gitignore/.env.example)
+      # with the real values; the ${VAR} syntax below substitutes them in.
+      #
+      # JWT_SECRET_KEY: required once DATABASE_URL is set (production
+      # Postgres) — safe to leave unset for this local-SQLite compose file,
+      # since backend/auth/security.py only enforces it in that case.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-}
       - PAYMENTS_DB_PATH=/app/backend/db/app.db
-      # Only needed for the AI-assisted column-mapping step on Excel
-      # upload (backend/ai_layer/gemini_client.py) — login and everything
-      # else work without it. Uncomment and set your real key.
-      # - GEMINI_API_KEY=your-real-gemini-api-key
+      # GEMINI_API_KEY: only needed for the AI-assisted column-mapping step
+      # on Excel upload (backend/ai_layer/gemini_client.py) — login and
+      # everything else work without it.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
       # Keeps the local SQLite file (and whatever you seed into it via
       # `docker compose exec app python -m backend.db.seed_users ...`)

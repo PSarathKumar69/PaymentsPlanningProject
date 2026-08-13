@@ -1,33 +1,24 @@
+# Secrets: never commit these. Real values live in a local .env file
+# (docker compose reads it automatically) or your shell environment —
+# .env.example documents what's needed, with placeholders only.
 .env
-__pycache__/
-*.pyc
+.env.*
+!.env.example
+
+# Python
+**/__pycache__/
+**/*.pyc
 .pytest_cache/
+.venv/
+venv/
+*.egg-info/
 
-# Databases — generated locally by ingestion/tests, never pushed
-*.db
-*.db.backup_*
-*.db.bak
-*.bak-erpfix-*
-demo.db*
+# Local SQLite dev DB + one-off backup snapshots
+backend/db/*.db
+backend/db/*.db.backup_*
+backend/db/*.bak-erpfix-*
 
-# Excel backups the app writes on config edits (docs/11 write-back rule)
-*.xlsx.bak_*
-
-# Real vendor data — never pushed; drop the actual file in data/ locally
-data/*.xlsx
-
-# OS / editor cruft
-.DS_Store
-.vscode/
-.idea/
-
-# Frontend / Vercel
-node_modules/
+# Frontend build artifacts
+frontend/node_modules/
 frontend/dist/
-frontend/.vercel/
-.vercel/
-
-# Local-only tooling / dangerous scripts — never pushed
-reset_realdb.py
-_claude_verify_snapshot.tar.gz
-.claude/
+frontend/.vite/

@@ -11,7 +11,7 @@ a session — those own a short-lived plain SessionLocal() directly instead).
 import os
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -95,8 +95,29 @@ FRONTEND_DIST_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "fronten
 if os.path.isdir(FRONTEND_DIST_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST_DIR, "assets")), name="frontend-assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def serve_frontend(full_path: str):
+    # Bug fix (found while regression-testing the Unique-column fix):
+    # a GET-only catch-all doesn't actually keep "nothing here can ever
+    # shadow a real API path" true for REMOVED/mistyped API paths on other
+    # methods — Starlette's router treats "the path pattern matches, the
+    # method doesn't" as 405 Method Not Allowed, not 404, regardless of
+    # what serve_frontend's body does (the mismatch is decided before the
+    # function ever runs). That's how e.g. the old POST /ai/ask, gone from
+    # ai_layer.py, started reporting 405 instead of 404 the moment this
+    # catch-all was added. Fix: declare every method on this route (so
+    # Starlette never sees a method mismatch here to begin with), and
+    # decide 404-vs-serve inside the function instead — a path whose first
+    # segment matches a real router's own prefix, or any non-GET request,
+    # 404s like a genuinely unmatched route should.
+    _KNOWN_API_PREFIXES = {
+        r.path.strip("/").split("/")[0]
+        for r in app.routes
+        if getattr(r, "path", None) not in (None, "/", "/{full_path:path}") and r.path.strip("/")
+    }
+
+    @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+    def serve_frontend(full_path: str, request: Request):
+        if request.method != "GET" or full_path.split("/")[0] in _KNOWN_API_PREFIXES:
+            raise HTTPException(status_code=404)
         # A refresh on any "page" of the app (it's a single-page app with no
         # real client-side routes today, but this keeps working if that
         # changes) still returns the same index.html, same as a normal SPA
