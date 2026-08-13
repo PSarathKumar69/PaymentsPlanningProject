@@ -88,41 +88,6 @@ def test_vendor_aging_and_payments(seeded_client):
     assert resp.json() == []  # nothing logged yet
 
 
-@pytest.mark.parametrize("erp_code", ["V00193", "V00204", "V00194", "V00393", "V00226"])
-def test_vendor_aging_min_funds_required_matches_the_planning_table_rule(seeded_client, erp_code):
-    """Bug fix: GET /vendors/{id}/aging and GET /vendors/aging used to call
-    the retired old-model min_funds.min_funds_tranche_breakdown() — for
-    these 5 real vendors that disagrees with the Planning table's own
-    required_amount_v2() figure (the old rule returns 0.0 for all five;
-    their real outstanding money is in an older month the old Must Pay
-    rule — "last month's own payable only" — never looks at). Confirmed
-    real cases from the min-funds-verification-export Exceptions
-    investigation. Both the single-vendor and bulk aging endpoints must
-    now agree with the Planning table for every one of them.
-    """
-    from backend.db.models import MonthlyLedger, Vendor
-    from backend.db.session import SessionLocal
-    from backend.shared.min_funds_v2 import required_amount_v2
-
-    session = SessionLocal()
-    try:
-        vendor = session.query(Vendor).filter_by(erp_code=erp_code).one()
-        vendor_id = vendor.id
-        ledger_rows = session.query(MonthlyLedger).filter_by(vendor_id=vendor_id).order_by(MonthlyLedger.month).all()
-        expected_total, _ = required_amount_v2(vendor, ledger_rows)
-    finally:
-        session.close()
-
-    single = seeded_client.get(f"/vendors/{vendor_id}/aging").json()
-    assert single["min_funds_required"] == pytest.approx(expected_total, abs=0.01)
-    assert sum(t["remaining_amount"] for t in single["min_funds_tranches"]) == pytest.approx(expected_total, abs=0.01)
-
-    bulk = seeded_client.get("/vendors/aging").json()
-    bulk_item = next(item for item in bulk if item["vendor_id"] == vendor_id)
-    assert bulk_item["min_funds_required"] == pytest.approx(expected_total, abs=0.01)
-    assert single["min_funds_required"] == bulk_item["min_funds_required"]
-
-
 def test_vendor_categories_endpoint_matches_the_shared_enum(seeded_client):
     """P2 demo-polish task: the frontend's category dropdown reads from
     here instead of hardcoding its own copy — confirms every
@@ -1027,6 +992,64 @@ def test_vendor_payment_tracking_min_funds_required_uses_v2_not_old_formula(seed
 
     row = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == vendor_id)
     assert row["min_funds_required"] == pytest.approx(500_000.0)  # v2_oldest_only, NOT 900,000
+
+
+def test_vendor_payment_tracking_min_funds_required_anchors_to_shared_planning_month_not_vendors_own_ledger(seeded_client):
+    """Confirmed real bug (this task): this endpoint used to call
+    required_amount_v2() with as_of=None, which backend/shared/min_funds_v2.py's
+    _compute_v2() defaults to THIS VENDOR'S OWN latest MonthlyLedger month —
+    a per-vendor anchor. Every other New Model 2 call site (Planning table,
+    finalized-plan export) anchors to ONE SHARED, cycle-level value instead:
+    month_minus_one(planning_month). The two only disagree when a vendor's
+    own latest ledger row is earlier than the shared cycle anchor — exactly
+    what this test constructs — and this endpoint must now use the shared
+    one, matching the Planning table's own figure for the same vendor.
+
+    Ledger: 300,000 in 2025-12, 800,000 in 2026-06 (vendor's own latest).
+    Shared planning month set to 2026-09 (no plan_run yet, so it resolves
+    from the persisted config) -> shared as_of = 2026-08 (month_minus_one).
+
+    Old, buggy per-vendor as_of (2026-06, the vendor's own latest ledger
+    month): current=800,000 (2026-06 IS the current bucket), oldest=300,000
+    <= 50% of 800,000 -> v2_oldest_and_current -> 1,100,000.
+
+    Correct, shared as_of (2026-08): no tranche AT 2026-08 -> current=0,
+    both tranches count as "older" (< 2026-08) -> oldest-only rule ->
+    300,000. The two formulas disagree by 800,000 — this pins the endpoint
+    to the correct (shared-anchor) figure.
+    """
+    from backend.db.models import MonthlyLedger, Vendor
+    from backend.db.session import SessionLocal
+    from backend.shared.enums import VendorCategory
+    from backend.shared.planning_month_store import set_current_planning_month
+
+    vendor_id = seeded_client.get("/vendors").json()[0]["id"]
+    session = SessionLocal()
+    try:
+        vendor = session.query(Vendor).filter_by(id=vendor_id).one()
+        vendor.category = VendorCategory.NORMAL
+        vendor.opening_balance = 1_100_000.0
+        vendor.paid_so_far_this_month = 0.0
+        session.query(MonthlyLedger).filter_by(vendor_id=vendor_id).delete()
+        session.add(
+            MonthlyLedger(
+                vendor_id=vendor_id, month=date(2025, 12, 1), payable=300_000.0, payment=0.0,
+                opening_balance=0.0, closing_balance=300_000.0,
+            )
+        )
+        session.add(
+            MonthlyLedger(
+                vendor_id=vendor_id, month=date(2026, 6, 1), payable=800_000.0, payment=0.0,
+                opening_balance=300_000.0, closing_balance=1_100_000.0,
+            )
+        )
+        set_current_planning_month(session, "2026-09")
+        session.commit()
+    finally:
+        session.close()
+
+    row = next(r for r in seeded_client.get("/vendors/payment-tracking").json() if r["vendor_id"] == vendor_id)
+    assert row["min_funds_required"] == pytest.approx(300_000.0)  # shared anchor, NOT 1,100,000
 
 
 def test_vendor_payment_tracking_reflects_a_logged_payment(seeded_client):

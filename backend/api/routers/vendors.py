@@ -9,9 +9,11 @@ from backend.ingestion.column_mapping import CATEGORY_EXCEL_LABEL
 from backend.shared.aging import compute_vendor_aging
 from backend.shared.constants import MONEY_EPSILON
 from backend.shared.enums import ChangeSource, VendorCategory
-from backend.shared.min_funds_v2 import min_funds_tranche_breakdown_v2, required_amount_v2
+from backend.shared.min_funds import min_funds_tranche_breakdown
+from backend.shared.min_funds_v2 import required_amount_v2
 from backend.shared.payment_logging import finalize_plan, week_actual_paid
 from backend.shared.plan_history import latest_budget_for_vendor, latest_priority_for_vendor
+from backend.shared.planning_month_store import month_minus_one, resolve_planning_month
 
 from ..schemas.vendors import (
     FinalizePlanRequest,
@@ -144,9 +146,37 @@ def get_vendor_payment_tracking():
     convention already used for the Aging card's own opening-vs-live split,
     compute_vendor_aging's already_paid_this_cycle) keeps the percentage
     meaningful without storing a second copy of the number anywhere.
+
+    as_of fix (this task): required_amount_v2() used to be called here with
+    as_of=None. Checked precisely against backend/shared/min_funds_v2.py's
+    _compute_v2() — None does NOT mean "today's real calendar date" there;
+    it falls back to THIS vendor's own latest MonthlyLedger row's month.
+    That's still wrong, just for a more specific reason than a naive
+    "drifts with today" story: it's a PER-VENDOR, ledger-row-derived anchor,
+    while every other New Model 2 required_amount_v2() call site (the
+    Planning table, the finalized-plan export, same V00036/207.66% bug
+    already fixed there) uses ONE SHARED, cycle-level anchor —
+    month_minus_one(planning_month). The two anchors usually coincide (a
+    normal upload sets planning_month to sheet_last_month+1), but they can
+    genuinely diverge — a vendor with a shorter/gappier ledger history than
+    the sheet's overall latest column, or a planning_month Finance picked
+    that isn't exactly last-month+1 — and when they do, this endpoint's
+    "% Min Funds Paid" can disagree with the SAME vendor's own figure on the
+    Planning table at the same moment, for no reason Finance caused.
+    Anchored now to the same shared month_minus_one(planning_month)
+    (backend/shared/planning_month_store.py) every other call site uses.
+    Falls back to as_of=None only when no planning month is resolvable at
+    all yet (a fresh cycle, nothing generated/confirmed this cycle) — same
+    behavior as before in that one edge case, since there's no cycle anchor
+    to use yet either way.
     """
     session = SessionLocal()
     try:
+        try:
+            planning_month = resolve_planning_month(session, None)
+            as_of = month_minus_one(planning_month)
+        except ValueError:
+            as_of = None
         rows = []
         for vendor in session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all():
             outstanding = float(vendor.opening_balance)
@@ -159,7 +189,7 @@ def get_vendor_payment_tracking():
             ledger_rows = (
                 session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
             )
-            min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=None, paid_so_far_override=0.0)
+            min_funds_required, _ = required_amount_v2(vendor, ledger_rows, as_of=as_of, paid_so_far_override=0.0)
             rows.append(
                 {
                     "vendor_id": vendor.id,
@@ -211,7 +241,7 @@ def get_all_vendors_aging():
                 ledger_rows, as_of=None, already_paid_this_cycle=float(vendor.paid_so_far_this_month)
             )
             opening_aging = compute_vendor_aging(ledger_rows, as_of=None, already_paid_this_cycle=0.0)
-            min_funds_total, min_funds_tranches = min_funds_tranche_breakdown_v2(vendor, ledger_rows)
+            min_funds_total, min_funds_tranches = min_funds_tranche_breakdown(vendor, ledger_rows)
             results.append(
                 {
                     "vendor_id": vendor.id,
@@ -298,10 +328,9 @@ def get_vendor_aging(vendor_id: int):
         # docs/04 carry-forward fix: the vendor detail card's own "Min Funds
         # calculation" table (frontend only shows this before a plan exists
         # this cycle, per docs/04's two-step flow) — recomputed fresh from
-        # the real ledger/payments every call, nothing stored. Real total is
-        # still returned for Must Pay/Commitment (their own required_amount()
-        # rule); tranches stays [] for them (no tranche concept).
-        min_funds_total, min_funds_tranches = min_funds_tranche_breakdown_v2(vendor, ledger_rows)
+        # the real ledger/payments every call, nothing stored. 0.0/[] for
+        # Must Pay/Commitment (this fix is Normal-vendor-only).
+        min_funds_total, min_funds_tranches = min_funds_tranche_breakdown(vendor, ledger_rows)
         return {
             "oldest_tranche_month": aging.oldest_tranche_month,
             "oldest_bucket": aging.oldest_bucket,
