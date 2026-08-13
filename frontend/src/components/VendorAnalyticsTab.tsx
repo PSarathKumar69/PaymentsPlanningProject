@@ -2,15 +2,14 @@ import React, { useState, useMemo, useEffect, useCallback, useRef } from "react"
 import { getAnalyticsDashboard, getAnalyticsFundsTrend, downloadAnalyticsExport } from "../api/analytics";
 import { ApiError } from "../api/client";
 import { AnalyticsDashboard, AnalyticsVendor, FundsTrendPoint } from "../types";
+import { VENDOR_CATEGORY, CATEGORY_LABEL, CATEGORY_BADGE_CLASS } from "../constants/enums";
 import { Chart, registerables } from "chart.js/auto";
 import {
-  TrendingUp,
   X,
   AlertCircle,
   Filter,
   Search,
-  Download,
-  Users
+  Download
 } from "lucide-react";
 
 Chart.register(...registerables);
@@ -41,7 +40,26 @@ function formatMonthLabel(iso: string): string {
   return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "short", year: "numeric" });
 }
 
-const EMPTY_DASHBOARD: AnalyticsDashboard = { vendors: [], months: [], aggregates: [], aging_totals: {} };
+const EMPTY_DASHBOARD: AnalyticsDashboard = {
+  vendors: [],
+  months: [],
+  aggregates: [],
+  aging_totals: {},
+  total_outstanding: 0,
+  outstanding_by_category: {}
+};
+
+// Fixed display order for the Outstanding-by-category breakdown card —
+// mirrors backend/analytics/calculations.py's _OUTSTANDING_CATEGORY_ORDER.
+// Labels/colors come from constants/enums.ts (CLAUDE.md rule 7 — shared
+// vocabulary, not re-typed here). "Normal" is already P2/P3/P4 vendors
+// summed as one bucket (Finance's explicit ask), not three separate lines.
+const OUTSTANDING_CATEGORY_KEYS = [
+  VENDOR_CATEGORY.MUST_PAY,
+  VENDOR_CATEGORY.COMMITMENT,
+  VENDOR_CATEGORY.NORMAL,
+  VENDOR_CATEGORY.INACTIVE
+];
 const AGING_BUCKET_LABELS = ["0-30", "31-60", "61-90", "91-120", "120+"];
 const AGING_BUCKET_STYLES: Record<string, { bg: string; border: string; text: string; labelText: string }> = {
   "0-30": { bg: "bg-[#e8f5e9]", border: "border-emerald-200", text: "text-[#0e7a45]", labelText: "text-[#0e7a45]" },
@@ -103,7 +121,16 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
     }
   };
 
-  const { vendors, months, aggregates, aging_totals: agingTotals } = dashboard;
+  const {
+    vendors,
+    months,
+    aggregates,
+    aging_totals: agingTotals,
+    // Defensive defaults — guards a stale cached/older-shape API response
+    // (e.g. mid-deploy) from throwing rather than just showing ₹0/blank.
+    total_outstanding: totalOutstanding = 0,
+    outstanding_by_category: outstandingByCategory = {}
+  } = dashboard;
 
   // Search filter state for vendor table
   const [searchTerm, setSearchTerm] = useState("");
@@ -159,46 +186,13 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
   const vendorConsistencyChartInstance = useRef<Chart | null>(null);
   const vendorTrendChartInstance = useRef<Chart | null>(null);
 
-  // KPI Calculations — sourced from the backend's own cumulative aggregates
-  // (current vs. previous month) and the funds-trend endpoint's latest real
-  // PlanRun point, rather than re-summing 14 months of per-vendor history
-  // client-side the way the old mock-data version did.
-  const kpis = useMemo(() => {
-    const current = aggregates[aggregates.length - 1];
-    const prev = aggregates[aggregates.length - 2];
-
-    const currentDebt = current?.cumulative_debt ?? 0;
-    const prevDebt = prev?.cumulative_debt ?? 0;
-    const debtDiff = currentDebt - prevDebt;
-
-    const currentPaidCumulative = current?.cumulative_paid ?? 0;
-    const prevPaidCumulative = prev?.cumulative_paid ?? 0;
-    const paidDiff = currentPaidCumulative - prevPaidCumulative;
-
-    // Decision #1: only real Generate Plan cycles — no invented figure when
-    // nothing's been generated yet this month.
-    const latestTrend = fundsTrend[fundsTrend.length - 1];
-    const fundsRequired = latestTrend?.min_funds_required ?? 0;
-    const availableFunds = latestTrend?.available_funds ?? 0;
-    const fundsShortfall = Math.max(0, fundsRequired - availableFunds);
-
-    // Decision #2: the open month's total payment already reflects live
-    // paid_so_far_this_month (backend/analytics/calculations.py), so this
-    // is "Payments This Month (So Far)" without any further adjustment here.
-    const paidThisCycle = current?.total_payment ?? 0;
-    const paidCoverageRatio = fundsRequired > 0 ? (paidThisCycle / fundsRequired) * 100 : 0;
-
-    return {
-      currentDebt,
-      debtDiff,
-      currentPaidCumulative,
-      paidDiff,
-      fundsRequired,
-      fundsShortfall,
-      paidThisCycle,
-      paidCoverageRatio
-    };
-  }, [aggregates, fundsTrend]);
+  // KPI card 2's per-category breakdown, in Finance's fixed display order —
+  // total_outstanding/outstanding_by_category come straight from the
+  // backend (backend/analytics/calculations.py), no client-side re-summing.
+  const outstandingRows = useMemo(
+    () => OUTSTANDING_CATEGORY_KEYS.map((key) => ({ key, amount: outstandingByCategory[key] ?? 0 })),
+    [outstandingByCategory]
+  );
 
   const totalAgingSum = useMemo(() => {
     return AGING_BUCKET_LABELS.reduce((sum, label) => sum + (agingTotals[label] ?? 0), 0) || 1;
@@ -746,48 +740,44 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
       {/* MAIN BODY CONTENT */}
       <main className="py-6 flex flex-col gap-6 w-full relative z-10">
 
-        {/* ROW 1: 2 TOP KPI CARDS, 50/50 SPLIT (Funds Required This Month /
-            Payments This Month cards removed per Sarath's request — this
-            task) */}
+        {/* ROW 1: 2 TOP KPI CARDS, 50/50 SPLIT. Overall Debt/Overall Paid to
+            Date replaced per Finance's ask (this task) with Total
+            Outstanding + a Must Pay/Commitment/Normal/Inactive breakdown. */}
         <section className="grid grid-cols-1 sm:grid-cols-2 gap-4">
 
-          {/* CARD 1: Overall Debt */}
+          {/* CARD 1: Total Outstanding — sum across every vendor. */}
           <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
             <div className="flex items-start justify-between">
               <div className="w-10 h-10 rounded-full bg-emerald-50 text-[#0e7a45] border border-emerald-200/80 flex items-center justify-center shrink-0">
                 <AlertCircle className="w-5 h-5" />
               </div>
-              <span className="flex items-center text-[10px] text-[#0e7a45] bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                <TrendingUp className="w-3 h-3 mr-1" />
-                Up
-              </span>
             </div>
             <div className="mt-4">
-              <span className="text-xs font-medium text-slate-500 block">Overall Debt</span>
+              <span className="text-xs font-medium text-slate-500 block">Total Outstanding</span>
               <span className="text-2xl font-bold text-slate-900 tracking-tight block mt-0.5">
-                {formatINR(kpis.currentDebt)}
+                {formatINR(totalOutstanding)}
               </span>
-              <p className="text-[10px] text-emerald-700 font-medium mt-1.5">
-                + {formatINR(kpis.debtDiff)} vs last month
-              </p>
+              <p className="text-[10px] text-slate-400 font-medium mt-1.5">Across all vendors, right now</p>
             </div>
           </div>
 
-          {/* CARD 2: Overall Paid to Date */}
-          <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
-            <div className="flex items-start justify-between">
-              <div className="w-10 h-10 rounded-full bg-emerald-50 text-[#0e7a45] border border-emerald-200/80 flex items-center justify-center shrink-0">
-                <Users className="w-5 h-5" />
-              </div>
-            </div>
-            <div className="mt-4">
-              <span className="text-xs font-medium text-slate-500 block">Overall Paid to Date</span>
-              <span className="text-2xl font-bold text-slate-900 tracking-tight block mt-0.5">
-                {formatINR(kpis.currentPaidCumulative)}
-              </span>
-              <p className="text-[10px] text-emerald-700 font-medium mt-1.5">
-                + {formatINR(kpis.paidDiff)} disbursed globally
-              </p>
+          {/* CARD 2: Outstanding by category — Must Pay / Commitment /
+              Normal (P2+P3+P4 summed) / Inactive. */}
+          <div className="bg-white border border-emerald-100/90 rounded-xl p-5 shadow-2xs hover:shadow-md transition-all relative overflow-hidden flex flex-col">
+            <span className="text-xs font-medium text-slate-500 block mb-3">Outstanding by Category</span>
+            <div className="flex flex-col gap-2.5">
+              {outstandingRows.map(({ key, amount }) => (
+                <div key={key} className="flex items-center justify-between gap-3">
+                  <span
+                    className={`text-[11px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${CATEGORY_BADGE_CLASS[key] ?? "bg-gray-50 text-gray-600"}`}
+                  >
+                    {CATEGORY_LABEL[key] ?? key}
+                  </span>
+                  <span className="text-sm font-bold text-slate-900 tracking-tight truncate">
+                    {formatINR(amount)}
+                  </span>
+                </div>
+              ))}
             </div>
           </div>
 

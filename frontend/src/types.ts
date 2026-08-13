@@ -422,6 +422,11 @@ export interface AnalyticsDashboard {
   months: string[];
   aggregates: AnalyticsMonthAggregate[];
   aging_totals: Record<string, number>;
+  // KPI-card revamp (this task) — replaces the old Overall Debt/Overall
+  // Paid to Date cards. Keyed by category: must_pay/commitment/normal/
+  // inactive — normal already sums P2/P3/P4 vendors together.
+  total_outstanding: number;
+  outstanding_by_category: Record<string, number>;
 }
 
 export interface FundsTrendPoint {

@@ -64,6 +64,9 @@ def test_dashboard_is_empty_shape_with_no_vendors(session):
     assert result["months"] == []
     assert result["aggregates"] == []
     assert set(result["aging_totals"].values()) == {0.0}
+    assert result["total_outstanding"] == 0.0
+    assert set(result["outstanding_by_category"].values()) == {0.0}
+    assert set(result["outstanding_by_category"]) == {"must_pay", "commitment", "normal", "inactive"}
 
 
 def test_months_span_sheet_start_through_latest_ledger_month_not_a_fixed_count(session):
@@ -138,6 +141,44 @@ def test_aging_totals_sum_every_vendors_own_buckets(session):
     # as_of = latest ledger month = the bill's own month -> "0-30" bucket.
     assert result["aging_totals"]["0-30"] == pytest.approx(200.0)
     assert sum(result["aging_totals"].values()) == pytest.approx(200.0)
+
+
+# ---- KPI-card revamp (this task): total_outstanding / outstanding_by_category --
+
+
+def test_outstanding_grouped_by_category_normal_sums_p2_p3_p4_together(session):
+    """Finance's explicit ask: Normal's outstanding figure is P2/P3/P4
+    vendors summed as ONE bucket, not three. Vendor.category is already
+    'normal' for all three priority tags (see VendorCategory docstring), so
+    the group-by naturally satisfies this — this test locks that in."""
+    must_pay = _vendor(session, "V1", "Must Pay Co", opening_balance=100.0)
+    must_pay.category = VendorCategory.MUST_PAY
+    commitment = _vendor(session, "V2", "Commitment Co", opening_balance=200.0)
+    commitment.category = VendorCategory.COMMITMENT
+    normal_p2 = _vendor(session, "V3", "Normal P2 Co", opening_balance=50.0)
+    normal_p2.category = VendorCategory.NORMAL
+    normal_p2.priority_tag = "P2"
+    normal_p3 = _vendor(session, "V4", "Normal P3 Co", opening_balance=30.0)
+    normal_p3.category = VendorCategory.NORMAL
+    normal_p3.priority_tag = "P3"
+    normal_p4 = _vendor(session, "V5", "Normal P4 Co", opening_balance=20.0)
+    normal_p4.category = VendorCategory.NORMAL
+    normal_p4.priority_tag = "P4"
+    inactive = _vendor(session, "V6", "Inactive Co", opening_balance=400.0)
+    inactive.category = VendorCategory.INACTIVE
+    inactive.priority_tag = "P5"
+    for v in (must_pay, commitment, normal_p2, normal_p3, normal_p4, inactive):
+        _ledger(session, v, date(2026, 1, 1), payable=0, payment=0)
+    session.commit()
+
+    result = get_analytics_dashboard(session=session)
+    by_cat = result["outstanding_by_category"]
+    assert by_cat["must_pay"] == pytest.approx(100.0)
+    assert by_cat["commitment"] == pytest.approx(200.0)
+    assert by_cat["normal"] == pytest.approx(50.0 + 30.0 + 20.0)  # P2+P3+P4 summed as one
+    assert by_cat["inactive"] == pytest.approx(400.0)
+    assert result["total_outstanding"] == pytest.approx(100.0 + 200.0 + 100.0 + 400.0)
+    assert result["total_outstanding"] == pytest.approx(sum(by_cat.values()))
 
 
 # ---- Decision #2: open-month Paid substitution ------------------------------

@@ -59,6 +59,8 @@ const dashboardFixture = {
     cumulative_paid: 500 * (i + 1),
   })),
   aging_totals: { '0-30': 1000, '31-60': 4000, '61-90': 0, '91-120': 0, '120+': 0 },
+  total_outstanding: 6500,
+  outstanding_by_category: { must_pay: 2000, commitment: 1500, normal: 2500, inactive: 500 },
 };
 
 const fundsTrendFixture = {
@@ -95,6 +97,26 @@ describe('VendorAnalyticsTab', () => {
     render(<VendorAnalyticsTab />);
     await screen.findByText('Acme Traders');
     expect(screen.queryByText(/liquidity health/i)).not.toBeInTheDocument();
+  });
+
+  it('renders Total Outstanding + Outstanding by Category cards, not Overall Debt/Overall Paid to Date', async () => {
+    render(<VendorAnalyticsTab />);
+    await screen.findByText('Acme Traders');
+    expect(screen.queryByText('Overall Debt')).not.toBeInTheDocument();
+    expect(screen.queryByText('Overall Paid to Date')).not.toBeInTheDocument();
+
+    expect(screen.getByText('Total Outstanding')).toBeInTheDocument();
+    expect(screen.getByText('₹6,500')).toBeInTheDocument(); // dashboardFixture.total_outstanding
+
+    expect(screen.getByText('Outstanding by Category')).toBeInTheDocument();
+    expect(screen.getByText('Must pay')).toBeInTheDocument();
+    expect(screen.getByText('₹2,000')).toBeInTheDocument(); // must_pay
+    expect(screen.getByText('Commitment')).toBeInTheDocument();
+    expect(screen.getByText('₹1,500')).toBeInTheDocument(); // commitment
+    expect(screen.getByText('Normal')).toBeInTheDocument(); // normal — P2/P3/P4 summed as one row
+    expect(screen.getByText('₹2,500')).toBeInTheDocument(); // normal
+    expect(screen.getByText('Inactive')).toBeInTheDocument();
+    expect(screen.getByText('₹500')).toBeInTheDocument(); // inactive
   });
 
   it('Download Excel triggers a real export request', async () => {

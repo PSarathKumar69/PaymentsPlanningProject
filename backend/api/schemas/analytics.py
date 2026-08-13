@@ -50,6 +50,12 @@ class AnalyticsDashboardResponse(BaseModel):
     months: list[date]
     aggregates: list[AnalyticsMonthAggregate]
     aging_totals: dict[str, float]
+    # KPI-card revamp (this task) — replaces the old Overall Debt/Overall
+    # Paid to Date cards. outstanding_by_category is keyed by Vendor.category
+    # (must_pay/commitment/normal/inactive) — normal already sums P2/P3/P4
+    # vendors together, per Finance's explicit ask.
+    total_outstanding: float
+    outstanding_by_category: dict[str, float]
 
 
 class FundsTrendPoint(BaseModel):

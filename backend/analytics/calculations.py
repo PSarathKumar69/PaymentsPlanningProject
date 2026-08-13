@@ -29,9 +29,24 @@ from backend.db.session import SessionLocal
 from backend.ingestion import column_mapping_store
 from backend.shared.aging import AGING_BUCKETS, compute_vendor_aging
 from backend.shared.constants import NEW_MODEL_2_PLAN_RUN_LABEL
+from backend.shared.enums import VendorCategory
 from backend.shared.min_funds import live_outstanding_balance
 
 _EMPTY_AGING_TOTALS = {label: 0.0 for label, _, _ in AGING_BUCKETS}
+
+# Analytics KPI-card revamp (this task, replacing Overall Debt/Overall Paid
+# to Date per Finance's ask): outstanding is grouped by Vendor.category —
+# NORMAL already IS the P2/P3/P4 vendors summed together (VendorCategory
+# docstring, backend/shared/enums.py), so a straight group-by here already
+# gives Finance's "Normal(P2,P3,P4) outstanding" bucket with no extra
+# priority_tag-level merging needed. Fixed key order Must Pay -> Commitment
+# -> Normal -> Inactive, matching how Finance listed them.
+_OUTSTANDING_CATEGORY_ORDER = [
+    VendorCategory.MUST_PAY.value,
+    VendorCategory.COMMITMENT.value,
+    VendorCategory.NORMAL.value,
+    VendorCategory.INACTIVE.value,
+]
 
 
 def _month_range(start: date, end: date) -> list[date]:
@@ -60,7 +75,14 @@ def get_analytics_dashboard(session=None):
     try:
         vendors = session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all()
         if not vendors:
-            return {"vendors": [], "months": [], "aggregates": [], "aging_totals": dict(_EMPTY_AGING_TOTALS)}
+            return {
+                "vendors": [],
+                "months": [],
+                "aggregates": [],
+                "aging_totals": dict(_EMPTY_AGING_TOTALS),
+                "total_outstanding": 0.0,
+                "outstanding_by_category": {c: 0.0 for c in _OUTSTANDING_CATEGORY_ORDER},
+            }
 
         vendor_ids = [v.id for v in vendors]
         ledger_rows = (
@@ -70,7 +92,14 @@ def get_analytics_dashboard(session=None):
             .all()
         )
         if not ledger_rows:
-            return {"vendors": [], "months": [], "aggregates": [], "aging_totals": dict(_EMPTY_AGING_TOTALS)}
+            return {
+                "vendors": [],
+                "months": [],
+                "aggregates": [],
+                "aging_totals": dict(_EMPTY_AGING_TOTALS),
+                "total_outstanding": 0.0,
+                "outstanding_by_category": {c: 0.0 for c in _OUTSTANDING_CATEGORY_ORDER},
+            }
 
         ledger_by_vendor = defaultdict(list)
         for row in ledger_rows:
@@ -84,6 +113,15 @@ def get_analytics_dashboard(session=None):
         month_payable_totals = {m: 0.0 for m in months}
         month_payment_totals = {m: 0.0 for m in months}
         vendor_payload = []
+        # KPI-card revamp (this task): total outstanding + outstanding grouped
+        # by category, replacing the old Overall Debt/Overall Paid to Date
+        # cards. A category outside the 4 known values (shouldn't happen —
+        # Vendor.category is set from VendorCategory everywhere it's written
+        # — see backend/shared/enums.py) is still summed into total_outstanding
+        # but flagged into its own "other" bucket rather than silently
+        # dropped (no-silent-drops convention).
+        outstanding_by_category = {c: 0.0 for c in _OUTSTANDING_CATEGORY_ORDER}
+        total_outstanding = 0.0
 
         for vendor in vendors:
             rows = ledger_by_vendor.get(vendor.id, [])
@@ -91,6 +129,13 @@ def get_analytics_dashboard(session=None):
             aging = compute_vendor_aging(rows, as_of=latest_month, already_paid_this_cycle=paid_so_far)
             for label, amount in aging.bucket_balances.items():
                 aging_totals[label] += amount
+
+            outstanding = live_outstanding_balance(vendor)
+            total_outstanding += outstanding
+            if vendor.category in outstanding_by_category:
+                outstanding_by_category[vendor.category] += outstanding
+            else:
+                outstanding_by_category[vendor.category] = outstanding_by_category.get(vendor.category, 0.0) + outstanding
 
             by_month = {row.month: row for row in rows}
             history = []
@@ -110,7 +155,7 @@ def get_analytics_dashboard(session=None):
                     "vendor_id": vendor.id,
                     "erp_code": vendor.erp_code,
                     "vendor_name": vendor.vendor_name,
-                    "outstanding_balance": live_outstanding_balance(vendor),
+                    "outstanding_balance": outstanding,
                     "aging_buckets": aging.bucket_balances,
                     "oldest_bucket": aging.oldest_bucket,
                     "oldest_bucket_months_back": aging.oldest_bucket_months_back,
@@ -136,7 +181,14 @@ def get_analytics_dashboard(session=None):
                 }
             )
 
-        return {"vendors": vendor_payload, "months": months, "aggregates": aggregates, "aging_totals": aging_totals}
+        return {
+            "vendors": vendor_payload,
+            "months": months,
+            "aggregates": aggregates,
+            "aging_totals": aging_totals,
+            "total_outstanding": total_outstanding,
+            "outstanding_by_category": outstanding_by_category,
+        }
     finally:
         if owns_session:
             session.close()
