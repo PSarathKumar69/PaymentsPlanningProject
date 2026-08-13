@@ -11,6 +11,7 @@ import { getAuditLog } from '../api/auditLog';
 import { AuditLogEntry, PriorityBucket } from '../types';
 import { ApiError } from '../api/client';
 import { ToastVariant } from './NotificationToast';
+import { PasswordChangeCard } from './PasswordChangeCard';
 import { formatAuditValue, formatTimestamp } from '../utils/format';
 import { AUDIT_SOURCE_OPTIONS, auditFieldLabel, auditSourceBadgeClass, auditSourceLabel } from '../constants/enums';
 
@@ -239,6 +240,9 @@ export const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ onNotify }) 
           <p className="text-xs text-gray-500">Priority buckets and every override, in one place.</p>
         </div>
       </div>
+
+      {/* ---- Change password ---------------------------------------------- */}
+      <PasswordChangeCard onNotify={onNotify} />
 
       {/* ---- Categories / priority tags ---------------------------------- */}
       <div className="bg-white border border-gray-200/90 rounded-xl p-5 shadow-xs flex flex-col gap-3 w-full">

@@ -1,12 +1,13 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { MainTab } from './components/MainTab';
 import { PlanningView } from './components/PlanningView';
 import { ConfigurationTab } from './components/ConfigurationTab';
+import { LoginPage } from './components/LoginPage';
 import { NotificationToast, ToastVariant } from './components/NotificationToast';
 import VendorAnalyticsTab from './components/VendorAnalyticsTab';
 import { NavItemKey } from './types';
-import { PLACEHOLDER_CURRENT_USER } from './constants/currentUser';
+import { CurrentUser, fetchCurrentUser, logout } from './api/auth';
 
 export default function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -23,6 +24,47 @@ export default function App() {
     setToastMessage(msg);
   };
 
+  // Login-credential task: gate the whole app behind a real session
+  // instead of the old PLACEHOLDER_CURRENT_USER stand-in. `authChecked`
+  // stays false only for the one initial /auth/me round trip, so a page
+  // reload never flashes the login page before we actually know whether
+  // the existing cookie is still valid.
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    fetchCurrentUser().then((user) => {
+      setCurrentUser(user);
+      setAuthChecked(true);
+    });
+  }, []);
+
+  // A session that expires (or gets logged out in another tab) mid-use
+  // surfaces as a 401 on whatever the user does next — api/client.ts
+  // broadcasts that instead of leaving the app stuck retrying against a
+  // dead cookie.
+  useEffect(() => {
+    const onUnauthorized = () => setCurrentUser(null);
+    window.addEventListener('auth:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('auth:unauthorized', onUnauthorized);
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+    } finally {
+      setCurrentUser(null);
+    }
+  };
+
+  if (!authChecked) {
+    return <div className="min-h-screen w-screen bg-[#eef2ef]" />;
+  }
+
+  if (!currentUser) {
+    return <LoginPage onLoginSuccess={setCurrentUser} />;
+  }
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#eef2ef] font-['Inter',system-ui,sans-serif] p-3 gap-3">
       <Sidebar
@@ -30,7 +72,8 @@ export default function App() {
         setIsCollapsed={setIsSidebarCollapsed}
         activeNav={activeNav}
         setActiveNav={setActiveNav}
-        onLogoutClick={() => notify(`Logged out ${PLACEHOLDER_CURRENT_USER.name} (Demo).`)}
+        currentUser={currentUser}
+        onLogoutClick={handleLogout}
       />
 
       <main className="flex-1 flex flex-col h-full bg-[#f0f4f1] rounded-2xl relative overflow-y-auto thin-scrollbar overscroll-contain px-6 md:px-12 py-4">
