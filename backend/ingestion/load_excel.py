@@ -37,7 +37,6 @@ from backend.ingestion.column_mapping import (
     find_column,
     find_duplicate_erp_codes,
     find_duplicate_unique_codes,
-    find_fuzzy_duplicate_unique_codes,
     find_unique_code_column,
     normalize_entity_text,
     parse_assigned_week_order,
@@ -266,15 +265,22 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
                 )
         data_quality_notes.extend(duplicate_erp_code_notes)
 
-    # Unique Code duplicate detection (this task) — flag-only, never
-    # auto-drops a row (Sarath's explicit call, unlike the erp_code
-    # first-row-wins skip above): exact duplicates are reported so Finance
-    # can see two rows will collapse into one vendor (see
-    # find_duplicate_unique_codes()'s docstring for why that happens
-    # naturally once Unique Code is the matching key); fuzzy near-
-    # duplicates (stdlib difflib) are reported so Finance can catch a
-    # likely typo before it silently creates two vendors that should have
-    # been one. No-op (empty lists) whenever unique_code_col is None.
+    # Unique Code duplicate detection — flag-only, never auto-drops a row
+    # (Sarath's explicit call, unlike the erp_code first-row-wins skip
+    # above): exact duplicates are reported so Finance can see two rows
+    # will collapse into one vendor (see find_duplicate_unique_codes()'s
+    # docstring for why that happens naturally once Unique Code is the
+    # matching key). No-op (empty list) whenever unique_code_col is None.
+    #
+    # EXACT MATCH ONLY (Sarath's explicit decision, 2026-08-13): a fuzzy/
+    # difflib-similarity duplicate check used to run here too
+    # (find_fuzzy_duplicate_unique_codes(), now removed from
+    # column_mapping.py entirely) and was producing ~5,471 near-useless
+    # warnings on the real production sheet — most vendor codes share a
+    # formulaic prefix (e.g. "ARSV00400", "ARSV00401", ...) that scores as
+    # "similar" under any generic string-similarity ratio despite being
+    # completely distinct, real vendor identities. Duplicate detection is
+    # now exact-string-match on the Unique Code column only.
     unique_code_notes = []
     for group in find_duplicate_unique_codes(ws, sheet_map, unique_code_col):
         rows = group["rows"]
@@ -283,12 +289,6 @@ def load(excel_path=EXCEL_PATH, session=None, header_overrides=None, sheet_start
             f"({[r['row'] for r in rows]}, vendors {[r['vendor_name'] for r in rows]}) — these rows will "
             "collapse into a single vendor since Unique Code is now the matching key; Finance should assign "
             "distinct codes if that isn't intended."
-        )
-    for pair in find_fuzzy_duplicate_unique_codes(ws, sheet_map, unique_code_col):
-        unique_code_notes.append(
-            f"Unique Code {pair['unique_code_a']!r} (row {pair['row_a']}, {pair['vendor_name_a']!r}) is a likely "
-            f"typo of {pair['unique_code_b']!r} (row {pair['row_b']}, {pair['vendor_name_b']!r}) — "
-            f"{pair['similarity']:.0%} similar; not auto-merged, Finance should confirm which one is correct."
         )
     if unique_code_notes:
         data_quality_notes.extend(unique_code_notes)

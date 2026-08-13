@@ -875,16 +875,6 @@ UNIQUE_CODE_HEADER_CANDIDATES = ["Unique Code", "Unique ID", "Vendor Unique Code
 # confirming this exact gap: the column existed but wasn't recognized, so
 # every vendor silently fell back to (entity, erp_code) matching instead.
 
-# Fuzzy near-duplicate threshold for Unique Code values (find_fuzzy_
-# duplicate_unique_codes() below) — Sarath's explicit call: flag likely
-# typos, never auto-merge/auto-drop. 0.85 is a starting point (same
-# difflib.SequenceMatcher().ratio() scale as _HEADER_FUZZY_MATCH_RATIO
-# above), tune down if real Finance data shows this misses genuine typos,
-# tune up if it's too noisy on genuinely-different-but-similar-looking
-# codes.
-UNIQUE_CODE_FUZZY_MATCH_RATIO = 0.85
-
-
 def find_unique_code_column(ws, header_row):
     """Column index for Finance's new optional vendor-identity column, or
     None if this sheet doesn't have it yet. Tries each confirmed header
@@ -913,6 +903,19 @@ def find_duplicate_unique_codes(ws, sheet_map, unique_code_col):
     created/matched, since Unique Code is now tried first) — reported here
     purely so Finance can see it happened and fix the source data, not
     silently hidden.
+
+    EXACT MATCH ONLY (Sarath's explicit decision, 2026-08-13): duplicate
+    Unique Codes are only ever flagged on a literal exact string match
+    (after strip()) of this column's value — never a fuzzy/similarity
+    score. A difflib-based find_fuzzy_duplicate_unique_codes() used to run
+    alongside this and got removed entirely: on the real production sheet
+    it produced ~5,471 near-useless warnings, because most vendor codes
+    share a formulaic prefix (e.g. "ARSV00400", "ARSV00401", ...) that
+    scores as "similar" under any generic string-similarity ratio even
+    though the codes are completely distinct, real vendor identities. That
+    made the fuzzy note channel pure noise Finance had no way to act on —
+    worse than not flagging at all. This function's own exact-match rule is
+    unaffected and remains the only Unique Code duplicate check.
 
     `unique_code_col`: None (sheet has no Unique Code column at all)
     short-circuits to an empty list — nothing to detect."""
@@ -943,54 +946,6 @@ def find_duplicate_unique_codes(ws, sheet_map, unique_code_col):
             ],
         })
     return duplicates
-
-
-def find_fuzzy_duplicate_unique_codes(ws, sheet_map, unique_code_col, threshold=UNIQUE_CODE_FUZZY_MATCH_RATIO):
-    """[{"unique_code_a":, "unique_code_b":, "similarity":, "row_a":, "vendor_name_a":, "row_b":, "vendor_name_b":}, ...]
-    for every pair of DIFFERENT Unique Code values on the sheet that are
-    close typos of each other — same stdlib difflib.SequenceMatcher
-    technique _fuzzy_alias_match() above already uses for header-name
-    typos, applied here to the CODE VALUES themselves (e.g. "VC-1042" vs
-    "VC-10042"). Flag-only, same as find_duplicate_unique_codes() above:
-    never changes which vendor a row matches, purely a data-quality note
-    for Finance to review by hand.
-
-    Compares each DISTINCT code value's first occurrence against every
-    other distinct value's first occurrence, case-insensitively — an exact
-    (or case-only) duplicate is find_duplicate_unique_codes()'s job above,
-    not this one, so those pairs are skipped here rather than trivially
-    reported at ~1.0 similarity.
-
-    `unique_code_col`: None short-circuits to an empty list."""
-    if unique_code_col is None:
-        return []
-    first_row_by_code = {}
-    for row in range(sheet_map.data_start_row, ws.max_row + 1):
-        raw = ws.cell(row=row, column=unique_code_col).value
-        if raw is None or str(raw).strip() == "":
-            continue
-        code = str(raw).strip()
-        first_row_by_code.setdefault(code, row)
-
-    codes = list(first_row_by_code.keys())
-    fuzzy_pairs = []
-    for i, code_a in enumerate(codes):
-        for code_b in codes[i + 1:]:
-            if code_a.casefold() == code_b.casefold():
-                continue  # exact/case-only match — find_duplicate_unique_codes()'s job, not this
-            ratio = difflib.SequenceMatcher(None, code_a.casefold(), code_b.casefold()).ratio()
-            if ratio >= threshold:
-                row_a, row_b = first_row_by_code[code_a], first_row_by_code[code_b]
-                fuzzy_pairs.append({
-                    "unique_code_a": code_a,
-                    "unique_code_b": code_b,
-                    "similarity": round(ratio, 3),
-                    "row_a": row_a,
-                    "vendor_name_a": ws.cell(row=row_a, column=sheet_map.vendor_name_col).value,
-                    "row_b": row_b,
-                    "vendor_name_b": ws.cell(row=row_b, column=sheet_map.vendor_name_col).value,
-                })
-    return fuzzy_pairs
 
 
 def to_number(raw):

@@ -519,16 +519,23 @@ def test_unique_code_exact_duplicate_flags_and_collapses_but_also_hits_the_same_
         session.close()
 
 
-def test_unique_code_fuzzy_typo_flagged_never_merges_and_respects_threshold(tmp_path):
-    """Scenario 6: "VC-1042" vs "VC-10042" is a 0.933 difflib ratio (computed
-    independently, well above the 0.85 threshold) — must produce a fuzzy
-    note, naming both rows/vendors and a similarity percentage, and must
-    NOT merge them (two different exact codes -> two separate vendors,
-    flag-only). "VC-1042" vs "ZQ-9987" (ratio 0.143, confirmed independently
-    well below threshold) must produce no fuzzy note at all.
-    """
+def test_unique_code_near_identical_but_not_exact_codes_produce_no_note(tmp_path):
+    """Duplicate Unique Code detection is EXACT MATCH ONLY (Sarath's
+    explicit decision, 2026-08-13). A fuzzy/difflib-similarity duplicate
+    check used to also run here (find_fuzzy_duplicate_unique_codes(), now
+    removed from column_mapping.py entirely) and was producing ~5,471
+    near-useless warnings on the real production sheet — most vendor codes
+    share a formulaic prefix (e.g. "ARSV00400" vs "ARSV00401") that scores
+    as "similar" under any generic string-similarity ratio despite being
+    completely distinct, real vendor identities.
+
+    This locks in the fix: two rows with different-but-similar-looking
+    Unique Codes ("VC-1042" vs "VC-10042" — a 0.933 difflib ratio, well
+    above the old 0.85 threshold) must produce NO note at all now, and
+    must NOT be merged (two distinct exact codes -> two separate vendors,
+    same as any other non-matching pair)."""
     fixtures_dir = os.path.join(os.path.dirname(__file__), "test_fixtures")
-    path = str(tmp_path / "fuzzy.xlsx")
+    path = str(tmp_path / "similar_not_exact.xlsx")
     shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path)
 
     from backend.ingestion.column_mapping import build_sheet_map
@@ -544,30 +551,14 @@ def test_unique_code_fuzzy_typo_flagged_never_merges_and_respects_threshold(tmp_
     from backend.db.session import SessionLocal
 
     report = load(excel_path=path)
-    fuzzy_notes = [n for n in report["data_quality_notes"] if "typo" in n]
-    assert len(fuzzy_notes) == 1
-    assert "VC-1042" in fuzzy_notes[0] and "VC-10042" in fuzzy_notes[0]
-    assert "93%" in fuzzy_notes[0]
+    assert not any("typo" in n or "similar" in n for n in report["data_quality_notes"])
 
     session = SessionLocal()
     try:
-        assert session.query(Vendor).count() == 2  # not merged — flag-only
+        assert session.query(Vendor).count() == 2  # different exact codes -> never merged
         assert {v.is_active for v in session.query(Vendor).all()} == {True}
     finally:
         session.close()
-
-    # Below-threshold pair produces no fuzzy note at all.
-    path2 = str(tmp_path / "no_fuzzy.xlsx")
-    shutil.copy(os.path.join(fixtures_dir, "single_header_row_sheet.xlsx"), path2)
-    wb2 = openpyxl.load_workbook(path2)
-    ws2 = wb2.active
-    sheet_map2 = build_sheet_map(ws2)
-    _add_unique_code_column(ws2, sheet_map2, {2: "VC-1042", 3: "ZQ-9987"})
-    wb2.save(path2)
-
-    load2 = _fresh_uc_db_and_load()
-    report2 = load2(excel_path=path2)
-    assert not any("typo" in n for n in report2["data_quality_notes"])
 
 
 @pytest.mark.parametrize("header_text", ["Unique ID", "Vendor Unique Code"])
