@@ -1536,6 +1536,123 @@ def test_config_priority_buckets_crud_round_trip(seeded_client):
     assert "P6" not in {b["bucket_key"] for b in resp.json()}
 
 
+def test_config_priority_bucket_floor_edit_flows_through_http_into_generate_plan(seeded_client):
+    """Finance's real question (this task, via Sarath): "if I change a
+    bucket's ceiling/floor %, will the system actually use it?" —
+    end-to-end confirmation THROUGH THE REAL HTTP LAYER, not just the
+    already-covered function-level tests (test_allocator.py's
+    test_editing_p0_floor_below_100_percent_actually_cuts_must_pay_under_shortfall
+    and friends, which call update_bucket()/generate_plan() directly in
+    Python, never through FastAPI). Confirms: (1) the PUT endpoint that
+    Finance's Configuration-tab UI actually calls, (2) the GET-plan
+    endpoint that Finance's Planning-tab UI actually calls, and (3) no
+    caching/staleness in between — same TestClient session throughout,
+    generating a plan, editing, then generating again.
+
+    A severe shortfall (2% of the real 100%-required total) reliably
+    drives every unlocked bucket down to its OWN floor and no further
+    (docs/14 rule 6 — confirmed already at the function level by
+    test_exceptional_shortfall_flagged_not_ground_below_floor, same 0.02
+    multiplier) — the cleanest way to isolate FLOOR's effect specifically,
+    since at this shortfall level bucket_pct == floor_pct exactly,
+    regardless of ceiling.
+    """
+    resp = seeded_client.get("/models/5/minimum-funds-required", params={"planning_month": NM2_PLANNING_MONTH})
+    assert resp.status_code == 200
+    total_required = resp.json()["total"]
+    severe_shortfall_funds = total_required * 0.02
+
+    baseline = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": severe_shortfall_funds, "planning_month": NM2_PLANNING_MONTH},
+    )
+    assert baseline.status_code == 200
+    assert baseline.json()["plan"]["bucket_pct"]["P2"] == pytest.approx(0.25)  # P2's seeded default floor
+
+    resp = seeded_client.put("/config/priority-buckets/P2", json={"floor_pct": 0.40})
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is True
+
+    after_edit = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": severe_shortfall_funds, "planning_month": NM2_PLANNING_MONTH},
+    )
+    assert after_edit.status_code == 200
+    # The real regression this pins down: without this, a stale/cached
+    # bucket table would still show 0.25 here even after the PUT above.
+    assert after_edit.json()["plan"]["bucket_pct"]["P2"] == pytest.approx(0.40)
+    # And every OTHER bucket is untouched by P2's edit — this isn't a
+    # global re-seed, just the one row Finance actually changed.
+    assert after_edit.json()["plan"]["bucket_pct"]["P3"] == pytest.approx(0.25)
+    assert after_edit.json()["plan"]["bucket_pct"]["P4"] == pytest.approx(0.25)
+
+
+def test_config_priority_bucket_ceiling_edit_flows_through_http_into_generate_plan(seeded_client):
+    """Same end-to-end HTTP proof as the floor test above, for CEILING
+    specifically — a raised ceiling only has a visible effect on
+    bucket_pct in the shortfall window where funds fall short of paying
+    every vendor 100% but still comfortably cover every bucket's ceiling
+    total (docs/14 — below that window nothing needs a ceiling at all;
+    at/below it, the cutting rotation grinds past ceiling toward floor and
+    a raised ceiling is masked). Window computed directly via
+    required_amount_v2() against the real seeded vendors/ledger — same
+    technique test_allocator.py's
+    test_topup_raises_a_vendor_above_its_bucket_ceiling_in_shortfall
+    already uses at the function level; here it's just picking a valid
+    `available_funds` for the HTTP calls below, not the thing under test.
+    """
+    from backend.db.models import Vendor as VendorModel
+    from backend.db.session import SessionLocal
+    from backend.shared.enums import VendorCategory
+    from backend.shared.min_funds import _load_vendors_and_ledger
+    from backend.shared.min_funds_v2 import required_amount_v2
+
+    session = SessionLocal()
+    try:
+        vendors, ledger = _load_vendors_and_ledger(session)
+        guaranteed_total = 0.0
+        normal_required_total = 0.0
+        # Default seeded ceilings (allocator.py's _BUCKET_SEED) — P2's own
+        # will be overridden by the edit below; P3/P4/P5 stay at default.
+        default_ceiling = {"P2": 0.95, "P3": 0.90, "P4": 0.85, "P5": 0.50}
+        ceiling_total = 0.0
+        for v in vendors:
+            amount, _ = required_amount_v2(v, ledger[v.id])
+            if v.category == VendorCategory.NORMAL:
+                bucket = v.priority_tag if v.priority_tag is not None else "P5"
+                normal_required_total += amount
+                ceiling_total += amount * default_ceiling.get(bucket, 0.85)
+            else:
+                guaranteed_total += amount
+    finally:
+        session.rollback()
+        session.close()
+
+    # Strictly between ceiling_total and 100%-of-normal — bucket_pct lands
+    # exactly on ceiling with no further cutting needed (same window the
+    # function-level reference test uses).
+    funds_left = (ceiling_total + normal_required_total) / 2
+    available_funds = guaranteed_total + funds_left
+
+    baseline = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": NM2_PLANNING_MONTH},
+    )
+    assert baseline.status_code == 200
+    assert baseline.json()["plan"]["bucket_pct"]["P2"] == pytest.approx(0.95)  # P2's seeded default ceiling
+
+    resp = seeded_client.put("/config/priority-buckets/P2", json={"ceiling_pct": 0.60})
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is True
+
+    after_edit = seeded_client.post(
+        "/models/5/generate-plan-and-weekly-view",
+        json={"available_funds": available_funds, "planning_month": NM2_PLANNING_MONTH},
+    )
+    assert after_edit.status_code == 200
+    assert after_edit.json()["plan"]["bucket_pct"]["P2"] == pytest.approx(0.60)
+
+
 def test_config_priority_bucket_remove_blocked_when_vendor_tagged(seeded_client, tmp_path):
     patch_excel = str(tmp_path / "priority_bucket_patch.xlsx")
     shutil.copy(EXCEL_PATH, patch_excel)

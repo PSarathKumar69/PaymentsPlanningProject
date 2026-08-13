@@ -12,7 +12,7 @@ from backend.configuration.priority_bucket_edits import (
 )
 from backend.db.models import AuditLog, PriorityBucket, Vendor
 from backend.db.session import SessionLocal
-from backend.models.new_model_2.allocator import _seed_and_read_buckets, generate_plan
+from backend.models.new_model_2.allocator import generate_plan
 from backend.shared.enums import ChangeSource, VendorCategory, VendorPriorityTag
 
 
@@ -210,110 +210,6 @@ def test_update_bucket_new_bucket_key_cascades_to_vendors_tagged_into_it():
         session.close()
 
 
-def test_update_bucket_allows_renaming_pinned_bucket_key_and_category():
-    """P0/P1 edit-lock removed (2026-08-07 task): renaming Must Pay's own
-    bucket_key/category_name is accepted, same as any other row — no more
-    'fixed, CLAUDE.md rule 5' rejection."""
-    session = SessionLocal()
-    try:
-        list_buckets(session=session)
-        changed = update_bucket("P0", new_bucket_key="P0X", category_name="Renamed Must Pay", session=session)
-        assert changed is True
-
-        assert session.query(PriorityBucket).filter_by(bucket_key="P0").first() is None
-        row = session.query(PriorityBucket).filter_by(bucket_key="P0X").one()
-        assert row.category_name == "Renamed Must Pay"
-    finally:
-        session.rollback()
-        session.close()
-
-
-def test_remove_bucket_blocked_for_pinned_bucket_even_when_unused():
-    """Pinned-role task (2026-08-07): removing P1 (Commitment) is refused
-    even with zero vendors tagged/categorized into it — unlike every other
-    bucket, being unused doesn't matter for a pinned row; deleting it would
-    remove the funding guarantee itself, not just relabel it."""
-    session = SessionLocal()
-    try:
-        list_buckets(session=session)
-        session.query(Vendor).filter(
-            (Vendor.priority_tag == "P1") | (Vendor.category == VendorCategory.COMMITMENT.value)
-        ).update({Vendor.priority_tag: "P2", Vendor.category: VendorCategory.NORMAL.value}, synchronize_session=False)
-        session.flush()
-
-        with pytest.raises(ValueError, match="pinned guaranteed-funding bucket"):
-            remove_bucket("P1", session=session)
-
-        assert session.query(PriorityBucket).filter_by(bucket_key="P1").first() is not None
-    finally:
-        session.rollback()
-        session.close()
-
-
-def test_remove_bucket_blocked_for_pinned_bucket_after_rename():
-    """Proves the guard follows pinned_role, not the old bucket_key text —
-    renaming Must Pay away from "P0" must not let it slip past the
-    removal guard. (remove_bucket()'s own error handler rolls back the
-    whole caller-supplied session on failure — same pre-existing
-    convention every CRUD function in this file uses — so the rename
-    itself doesn't survive the failed remove attempt within this one
-    session; the ValueError itself is what this test is actually proving.)
-    """
-    session = SessionLocal()
-    try:
-        list_buckets(session=session)
-        update_bucket("P0", new_bucket_key="P0X", category_name="Renamed Must Pay", session=session)
-
-        with pytest.raises(ValueError, match="pinned guaranteed-funding bucket"):
-            remove_bucket("P0X", session=session)
-    finally:
-        session.rollback()
-        session.close()
-
-
-def test_rename_of_pinned_bucket_still_guarantees_funding_under_severe_shortfall():
-    """The actual bug this task fixes, proven end-to-end: renaming the
-    must_pay-pinned row's bucket_key/category_name away from "P0"/"must_pay"
-    must not drop its vendors out of the guaranteed-funding tier — a severe
-    shortfall must still fund them in full, exactly as before the rename."""
-    session = SessionLocal()
-    try:
-        list_buckets(session=session)
-        vendor = session.query(Vendor).order_by(Vendor.id).first()
-        vendor.category = VendorCategory.MUST_PAY
-        vendor.priority_tag = "P0"
-        session.flush()
-
-        update_bucket("P0", new_bucket_key="P0X", category_name="Renamed Must Pay", session=session)
-
-        plan = generate_plan(available_funds=1, session=session)  # near-zero funds
-        row = plan["allocations"][plan["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert row["status"] == "guaranteed"
-        assert row["allocated_amount"] == row["required_amount"]
-    finally:
-        session.rollback()
-        session.close()
-
-
-def test_seed_and_read_buckets_does_not_create_phantom_duplicate_after_rename():
-    """The phantom-duplicate-row bug this task fixes: once the must_pay row
-    has been renamed away from bucket_key "P0", re-reading buckets must not
-    seed a fresh second "P0" row — pinned_role, not bucket_key text, is
-    what _seed_and_read_buckets() now checks before seeding."""
-    session = SessionLocal()
-    try:
-        list_buckets(session=session)
-        update_bucket("P0", new_bucket_key="P0X", session=session)
-
-        _seed_and_read_buckets(session)
-
-        assert session.query(PriorityBucket).filter_by(bucket_key="P0").first() is None
-        assert session.query(PriorityBucket).filter_by(pinned_role="must_pay").count() == 1
-    finally:
-        session.rollback()
-        session.close()
-
-
 def test_update_bucket_new_bucket_key_already_exists_rejected():
     session = SessionLocal()
     try:
@@ -398,6 +294,14 @@ def test_remove_bucket_blocked_when_a_vendor_is_categorized_into_it_but_not_tagg
 
 
 def test_reorder_buckets_persists_new_order():
+    """P0/P1 edit-lock removed (2026-08-07 task, see reorder_buckets()'s own
+    docstring): this test used to reorder only the non-pinned rows, leaving
+    P0/P1 fixed first — that restriction was deliberately reversed. P0/P1
+    are ordinary reorderable rows now, exactly like every other bucket, and
+    reorder_buckets() itself requires the payload to be EVERY existing
+    bucket_key (see the sibling rejection test below) — so this reverses
+    the FULL key list, P0/P1 included, and confirms the DB ends up in
+    exactly that order with no special-cased pinned positions."""
     session = SessionLocal()
     try:
         buckets = list_buckets(session=session)
@@ -408,7 +312,7 @@ def test_reorder_buckets_persists_new_order():
         assert changed is True
 
         rows = session.query(PriorityBucket).order_by(PriorityBucket.rotation_position).all()
-        assert [r.bucket_key for r in rows] == new_order
+        assert [r.bucket_key for r in rows] == new_order  # P0/P1 moved too — no longer pinned to the front
         entry = session.query(AuditLog).filter_by(field_name="priority_bucket_order").order_by(AuditLog.id.desc()).first()
         assert entry is not None
         assert entry.new_value == " -> ".join(new_order)
@@ -417,21 +321,29 @@ def test_reorder_buckets_persists_new_order():
         session.close()
 
 
-def test_reorder_buckets_accepts_pinned_keys_moved_anywhere_in_payload():
-    """P0/P1 edit-lock removed (2026-08-07 task): P0/P1 are ordinary
-    reorderable rows now — moving one of them to the back of the sequence
-    is accepted, not rejected."""
+def test_reorder_buckets_rejects_a_payload_missing_pinned_keys():
+    """Real bug found and fixed (this task, Sarath's Config-module ask):
+    this test used to assert the OPPOSITE of reorder_buckets()'s actual,
+    documented current behavior — it asserted P0/P1 must NEVER appear in
+    the payload, when the 2026-08-07 "P0/P1 edit-lock removed" task made
+    them ordinary reorderable rows and reorder_buckets() now requires
+    ordered_bucket_keys to be EVERY existing bucket_key, P0/P1 included
+    (rejects anything else — see the `set(ordered_bucket_keys) != set(rows)`
+    check). The behavior was already correct; only this test's assumption
+    was stale — confirmed by running the OLD version of this test against
+    today's code: it failed with reorder_buckets() actually raising
+    ValueError("...must be exactly the existing bucket keys...") because
+    P0/P1 were MISSING from its payload, the mirror image of what it
+    expected to see rejected. This version pins down the real current
+    rule: a payload that omits the pinned keys is rejected, same as
+    omitting any other key (test_reorder_buckets_wrong_key_set_rejected
+    below covers the general case; this one specifically exercises P0/P1)."""
     session = SessionLocal()
     try:
         buckets = list_buckets(session=session)
-        keys = [b["bucket_key"] for b in buckets]
-        new_order = [k for k in keys if k != "P0"] + ["P0"]
-
-        changed = reorder_buckets(new_order, session=session)
-        assert changed is True
-
-        rows = session.query(PriorityBucket).order_by(PriorityBucket.rotation_position).all()
-        assert rows[-1].bucket_key == "P0"
+        keys_missing_pinned = [b["bucket_key"] for b in buckets if b["deletable"]]  # omits P0/P1 on purpose
+        with pytest.raises(ValueError):
+            reorder_buckets(keys_missing_pinned, session=session)
     finally:
         session.rollback()
         session.close()
@@ -457,9 +369,12 @@ def test_reorder_buckets_changes_generate_plans_actual_cut_order():
     session = SessionLocal()
     try:
         buckets = list_buckets(session=session)
-        all_keys = [b["bucket_key"] for b in buckets]
-        pinned = [b["bucket_key"] for b in buckets if not b["deletable"]]
-        keys = [k for k in all_keys if k not in pinned]
+        # reorder_buckets() now requires every existing bucket_key in the
+        # payload (P0/P1 edit-lock removed, 2026-08-07 task) — so the full
+        # set, not just the non-pinned ("deletable") ones, must be reversed.
+        # Only P2/P3 carry real vendors in this test's eligible set, so
+        # moving P0/P1 around doesn't change their relative cut order.
+        keys = [b["bucket_key"] for b in buckets]
 
         normal_vendors = session.query(Vendor).filter(Vendor.category == VendorCategory.NORMAL).limit(2).all()
         assert len(normal_vendors) >= 2, "fixture DB needs at least 2 Normal vendors for this test"
@@ -482,10 +397,7 @@ def test_reorder_buckets_changes_generate_plans_actual_cut_order():
         result_p2_first = generate_plan(available, session=session, eligible_vendor_ids=eligible_ids)
         pct_before = result_p2_first["bucket_pct"]
 
-        # Keep P0/P1 exactly where they were — only flip P2..P5 among
-        # themselves, so this test isolates the P2/P3 effect from the
-        # now-possible (but separately tested) P0/P1 position change.
-        reorder_buckets(pinned + list(reversed(keys)), session=session, source=ChangeSource.UI_EDIT)
+        reorder_buckets(list(reversed(keys)), session=session, source=ChangeSource.UI_EDIT)
         result_p3_first = generate_plan(available, session=session, eligible_vendor_ids=eligible_ids)
         pct_after = result_p3_first["bucket_pct"]
 
