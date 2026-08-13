@@ -270,6 +270,23 @@ def _apply_leftover_topup(normal_allocations, leftover, bucket_order=_DEFAULT_TE
                 step_amount = r["required_amount"] * PCT_STEP
                 if leftover < step_amount - MONEY_EPSILON:
                     continue  # doesn't fit this vendor's next step — try the rest of the bucket
+                # Real bug (this task — Sarath's report: "Funds Left" showing
+                # a negative value after Generate Plan). MONEY_EPSILON above
+                # is a "close enough to try" tolerance — it lets a step
+                # through when leftover is only a rounding hair short of a
+                # full step, not a license to actually SPEND money that
+                # isn't there. Without this cap, a leftover sitting anywhere
+                # in (step_amount - MONEY_EPSILON, step_amount) still took
+                # the FULL step_amount, pushing the running leftover total
+                # (and the real sum of allocated_amount across every vendor)
+                # past available_funds by up to MONEY_EPSILON — "Funds Left"
+                # is that same leftover, unclamped, so it rendered as a
+                # small negative number. Capping the step to whatever's
+                # actually left keeps leftover from ever going negative and
+                # keeps the real allocated total from ever exceeding
+                # available_funds, while leaving the tolerance above
+                # (deciding whether to attempt this step at all) untouched.
+                step_amount = min(step_amount, leftover)
                 new_allocated = r["allocated_amount"] + step_amount
                 if new_allocated > cap + MONEY_EPSILON:
                     logger.warning(

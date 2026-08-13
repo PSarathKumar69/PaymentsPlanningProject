@@ -11,7 +11,7 @@ from backend.shared.constants import MONEY_EPSILON
 from backend.shared.enums import ChangeSource, VendorCategory
 from backend.shared.min_funds import min_funds_tranche_breakdown
 from backend.shared.min_funds_v2 import required_amount_v2
-from backend.shared.payment_logging import finalize_plan, week_actual_paid
+from backend.shared.payment_logging import _current_cycle_month, finalize_plan, week_actual_paid, week_actual_paid_all_vendors
 from backend.shared.plan_history import latest_budget_for_vendor, latest_priority_for_vendor
 from backend.shared.planning_month_store import month_minus_one, resolve_planning_month
 
@@ -177,6 +177,18 @@ def get_vendor_payment_tracking():
             as_of = month_minus_one(planning_month)
         except ValueError:
             as_of = None
+        # Perf fix (this task — Sarath's report: "Planning page loading
+        # lazily"): this loop used to call week_actual_paid(session,
+        # vendor.id) per vendor, and THAT re-ran _current_cycle_month()'s
+        # own full-table MAX(MonthlyLedger.month) scan every single time —
+        # same N+1 shape as the already-fixed "Generate Plan taking 10+
+        # seconds" prod bug documented on week_actual_paid_all_vendors()'s
+        # own docstring (backend/shared/payment_logging.py), just never
+        # applied here. One cycle_month resolution + one batched Payment
+        # aggregation query up front, reused for every vendor below,
+        # instead of ~2 extra Neon round trips per vendor.
+        cycle_month = _current_cycle_month(session)
+        week_actual_paid_by_vendor = week_actual_paid_all_vendors(session, cycle_month=cycle_month)
         rows = []
         for vendor in session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all():
             outstanding = float(vendor.opening_balance)
@@ -185,7 +197,7 @@ def get_vendor_payment_tracking():
             # tracks against the real payments table directly (week_actual_paid's
             # own aggregation), not a cached running total, even though the
             # two are always kept in lockstep by log_payment() today.
-            actual_paid = sum(week_actual_paid(session, vendor.id).values())
+            actual_paid = sum(week_actual_paid_by_vendor.get(vendor.id, {}).values())
             ledger_rows = (
                 session.query(MonthlyLedger).filter_by(vendor_id=vendor.id).order_by(MonthlyLedger.month).all()
             )
@@ -232,6 +244,12 @@ def get_all_vendors_aging():
     """
     session = SessionLocal()
     try:
+        # Perf fix (this task — same N+1 as GET /vendors/payment-tracking
+        # above): one batched Payment aggregation up front instead of one
+        # week_actual_paid() call (and one full-table MAX(MonthlyLedger.month)
+        # scan inside it) per vendor.
+        cycle_month = _current_cycle_month(session)
+        week_actual_paid_by_vendor = week_actual_paid_all_vendors(session, cycle_month=cycle_month)
         results = []
         for vendor in session.query(Vendor).filter(Vendor.is_active.isnot(False)).order_by(Vendor.id).all():
             ledger_rows = (
@@ -253,7 +271,7 @@ def get_all_vendors_aging():
                     "oldest_bucket_amount": aging.oldest_bucket_amount,
                     "oldest_bucket_amount_opening": opening_aging.oldest_bucket_amount,
                     "monthly_breakdown": aging.monthly_breakdown,
-                    "week_actual_paid": week_actual_paid(session, vendor.id),
+                    "week_actual_paid": week_actual_paid_by_vendor.get(vendor.id, {}),
                     "min_funds_required": min_funds_total,
                     "min_funds_tranches": min_funds_tranches,
                 }

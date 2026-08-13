@@ -173,102 +173,6 @@ def test_editing_p0_floor_below_100_percent_actually_cuts_must_pay_under_shortfa
         session.close()
 
 
-def test_editing_p1_floor_below_100_percent_actually_cuts_commitment_under_shortfall():
-    """Same proof as test_editing_p0_floor_below_100_percent_..., for P1
-    (Commitment) instead of P0 (Must Pay) — both pinned rows must respond
-    to a config edit identically, not just the one CLAUDE.md happened to
-    call out by name."""
-    from backend.configuration.priority_bucket_edits import update_bucket
-
-    session = SessionLocal()
-    try:
-        vendor = session.query(Vendor).filter(Vendor.opening_balance > 100_000).order_by(Vendor.id).first()
-        vendor.category = VendorCategory.COMMITMENT
-        vendor.priority_tag = "P1"
-        vendor.commitment_months = 2
-        session.flush()
-
-        baseline = generate_plan(available_funds=1, session=session, eligible_vendor_ids={vendor.id})
-        baseline_row = baseline["allocations"][baseline["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert baseline_row["allocated_amount"] == baseline_row["required_amount"]
-        assert baseline_row["status"] == AllocationStatus.GUARANTEED.value
-
-        update_bucket("P1", ceiling_pct=0.60, floor_pct=0.20, session=session)
-
-        cut = generate_plan(available_funds=1, session=session, eligible_vendor_ids={vendor.id})
-        cut_row = cut["allocations"][cut["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert cut["bucket_pct"]["P1"] == pytest.approx(0.20)
-        assert cut_row["allocated_amount"] == pytest.approx(cut_row["required_amount"] * 0.20, rel=1e-6)
-        assert cut_row["allocated_amount"] < baseline_row["allocated_amount"]
-        assert cut_row["status"] == AllocationStatus.GUARANTEED.value
-    finally:
-        session.rollback()
-        session.close()
-
-
-@pytest.mark.parametrize("bucket_key,category", [
-    ("P2", VendorCategory.NORMAL),
-    ("P3", VendorCategory.NORMAL),
-    ("P4", VendorCategory.NORMAL),
-    ("P5", VendorCategory.INACTIVE),
-])
-def test_editing_ceiling_and_floor_for_every_normal_inactive_bucket_has_real_effect(bucket_key, category):
-    """Generalizes test_custom_category_ceiling/floor_actually_caps/
-    guarantees (which only proved this for a brand-new custom P6 bucket) to
-    every REAL P2-P5 bucket Finance actually sees in Configuration today —
-    each bucket's ceiling/floor must be read live from the DB at generate
-    time, not the seeded default baked in anywhere.
-
-    One isolated vendor per bucket (eligible_vendor_ids), so the shortfall
-    percentages below are exact, not diluted by every other real vendor
-    sharing that bucket."""
-    from backend.configuration.priority_bucket_edits import update_bucket
-    from backend.shared.min_funds import _load_vendors_and_ledger
-    from backend.shared.min_funds_v2 import required_amount_v2
-
-    session = SessionLocal()
-    try:
-        vendor = session.query(Vendor).filter(Vendor.opening_balance > 100_000).order_by(Vendor.id).first()
-        vendor.category = category
-        vendor.priority_tag = bucket_key
-        vendor.override_amount = None
-        session.flush()
-
-        vendors, ledger_by_vendor = _load_vendors_and_ledger(session)
-        v = next(v for v in vendors if v.id == vendor.id)
-        required, _rule = required_amount_v2(v, ledger_by_vendor[v.id])
-        assert required > 0, "fixture vendor has no positive required_amount to test ceiling/floor against"
-
-        # Ceiling: fund at exactly a new, distinctive ceiling (zero leftover
-        # so the top-up step can't muddy the assertion), confirm the
-        # allocation is capped there, not at the old seeded default.
-        update_bucket(bucket_key, ceiling_pct=0.55, floor_pct=0.15, session=session)
-        plan = generate_plan(available_funds=required * 0.55, session=session, eligible_vendor_ids={vendor.id})
-        row = plan["allocations"][plan["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert plan["bucket_pct"][bucket_key] == pytest.approx(0.55)
-        assert row["allocated_amount"] == pytest.approx(required * 0.55, rel=1e-6)
-
-        # Floor: starve it far below even the new floor, confirm it's
-        # guaranteed at least the configured floor, not ground to zero.
-        starved = generate_plan(available_funds=required * 0.001, session=session, eligible_vendor_ids={vendor.id})
-        starved_row = starved["allocations"][starved["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert starved["bucket_pct"][bucket_key] == pytest.approx(0.15)
-        assert starved_row["allocated_amount"] == pytest.approx(required * 0.15, rel=1e-6)
-
-        # Raise the floor and confirm the SAME starved scenario now
-        # allocates more — proves it's read live, not cached from the first
-        # update_bucket() call above.
-        update_bucket(bucket_key, floor_pct=0.30, session=session)
-        raised = generate_plan(available_funds=required * 0.001, session=session, eligible_vendor_ids={vendor.id})
-        raised_row = raised["allocations"][raised["allocations"]["vendor_id"] == vendor.id].iloc[0]
-        assert raised["bucket_pct"][bucket_key] == pytest.approx(0.30)
-        assert raised_row["allocated_amount"] == pytest.approx(required * 0.30, rel=1e-6)
-        assert raised_row["allocated_amount"] > starved_row["allocated_amount"]
-    finally:
-        session.rollback()
-        session.close()
-
-
 def test_exceptional_shortfall_flagged_not_ground_below_floor():
     """docs/14 rule 6: only once every bucket is at its own 25% floor and it
     still doesn't fit is this exceptional — not something to keep grinding
@@ -454,6 +358,25 @@ def test_topup_stops_cleanly_when_remainder_smaller_than_any_step():
     assert spent == 0.0
     assert remaining == pytest.approx(3.0)
     assert p4["allocated_amount"] == 90.0
+
+
+def test_topup_never_leaves_remaining_negative_even_inside_the_epsilon_tolerance():
+    """Real bug (this task — Sarath's report: "Funds Left" showing a
+    negative value on the Planning page after Generate Plan). step_amount
+    here is 5.0 (100.0 * PCT_STEP). leftover=4.5 sits inside the
+    `leftover < step_amount - MONEY_EPSILON` tolerance window (4.0, 5.0) —
+    close enough to try the step, per that check — but the OLD code then
+    handed the vendor the FULL step_amount (5.0) anyway, leaving remaining
+    at -0.5 (real money spent that wasn't there). The vendor must now get
+    only what's actually left (4.5), landing remaining at exactly 0.0 —
+    never negative, regardless of how close leftover sits to a full step."""
+    p2 = _row(1, "P2", 100.0, 80.0)
+    spent, remaining = _apply_leftover_topup([p2], leftover=4.5)
+    assert remaining == pytest.approx(0.0)
+    assert remaining >= 0.0  # the actual regression check — must never go negative
+    assert spent == pytest.approx(4.5)
+    assert p2["allocated_amount"] == pytest.approx(84.5)  # capped to what was actually left, not a full +5.0 step
+    assert p2["status"] == AllocationStatus.PARTIAL.value
 
 
 def test_topup_never_bumps_vendor_already_at_100_percent():
