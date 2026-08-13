@@ -69,6 +69,37 @@ const AGING_BUCKET_STYLES: Record<string, { bg: string; border: string; text: st
   "120+": { bg: "bg-[#1b5e20]", border: "border-emerald-950", text: "text-white", labelText: "text-[#1b5e20]" },
 };
 
+// Vendor-detail modal's Aging row (this task): unlike the two uses of
+// AGING_BUCKET_STYLES above (the dashboard-wide Aging KPI card and the
+// vendor table's fixed 5 aging columns — both legitimately fixed-bucket,
+// since they aggregate/tabulate ACROSS vendors), a single vendor's own
+// aging row should show every real bucket that vendor has, not lump
+// everything 4+ months back into one "120+" catch-all — the backend
+// already computes this per-month via monthly_breakdown (see
+// backend/shared/aging.py's compute_vendor_aging), it just wasn't used
+// here. Styling is keyed by real months_back (0,1,2,3,4+) rather than by
+// label text, since monthly_breakdown's labels are dynamic real day-ranges
+// ("121-150", "151-180", ...) with no fixed set to key a lookup table by.
+// Tier 4 (4+ months back) reuses the same darkest-green styling for every
+// bucket that old or older — Finance already reads dark green as "old",
+// however old exactly; there's no product ask for an unbounded color ramp.
+const AGING_TIER_STYLES: { bg: string; border: string; text: string; labelText: string }[] = [
+  { bg: "bg-[#e8f5e9]", border: "border-emerald-200", text: "text-[#0e7a45]", labelText: "text-[#0e7a45]" },
+  { bg: "bg-[#c8e6c9]", border: "border-emerald-300", text: "text-emerald-900", labelText: "text-emerald-800" },
+  { bg: "bg-[#81c784]", border: "border-emerald-400", text: "text-emerald-950", labelText: "text-emerald-900" },
+  // FIX (this task): the old "91-120"/"120+" entries above set labelText to
+  // a dark color (near-illegible on "91-120"'s medium green) or literally
+  // the SAME color as the background ("120+" — an invisible label,
+  // confirmed the "no name" box Sarath flagged). Light labelText on both
+  // dark tiers here fixes both.
+  { bg: "bg-[#388e3c]", border: "border-emerald-700", text: "text-white", labelText: "text-emerald-50" },
+  { bg: "bg-[#1b5e20]", border: "border-emerald-950", text: "text-white", labelText: "text-emerald-50" },
+];
+
+function agingTierStyle(monthsBack: number) {
+  return AGING_TIER_STYLES[Math.min(monthsBack, AGING_TIER_STYLES.length - 1)];
+}
+
 interface VendorAnalyticsTabProps {
   // Bump this from the parent after a successful upload to force a reload —
   // same refreshSignal convention as MasterDataGrid.tsx/PlanningView.tsx.
@@ -1014,26 +1045,40 @@ export default function VendorAnalyticsTab({ refreshSignal }: VendorAnalyticsTab
             {/* Scrollable Modal Body */}
             <div className="p-6 flex flex-col gap-6 overflow-y-auto max-h-[calc(92vh-100px)]">
 
-              {/* Aging buckets, side by side — same aging_buckets data the
-                  main Aging card sums into aging_totals, scoped to just
-                  this vendor. */}
+              {/* Aging buckets, one box per REAL bucket this vendor actually
+                  has (this task) — no longer capped at the coarse 5-bucket
+                  aging_buckets summary (0-30/31-60/61-90/91-120/120+), which
+                  lumps every bucket 4+ months back into one unlabeled-
+                  looking "120+" catch-all (that box's label text color was
+                  literally identical to its background — see
+                  AGING_TIER_STYLES above). Sourced from monthly_breakdown
+                  instead (backend/shared/aging.py's compute_vendor_aging
+                  already computes one real day-range bucket per calendar
+                  month back to this vendor's own oldest outstanding
+                  tranche) — reversed here (newest first) to keep the same
+                  freshest -> oldest, left -> right reading order the old
+                  fixed row used. flex-wrap, not a fixed grid-cols-5, since
+                  the bucket count now varies vendor to vendor. */}
               <div>
                 <h4 className="text-[10px] font-bold text-[#0e7a45] uppercase tracking-wider mb-2">Aging</h4>
-                <div className="grid grid-cols-5 gap-2.5">
-                  {AGING_BUCKET_LABELS.map((label) => {
-                    const styles = AGING_BUCKET_STYLES[label];
-                    const amount = selectedVendor.aging_buckets[label] ?? 0;
-                    return (
-                      <div
-                        key={label}
-                        className={`${styles.bg} border ${styles.border} rounded-lg py-2.5 px-1 flex flex-col items-center gap-1`}
-                      >
-                        <span className={`text-[9px] font-semibold uppercase tracking-wide ${styles.labelText}`}>{label}</span>
-                        <span className={`text-[11px] font-bold font-mono ${styles.text}`}>{formatINRAbbr(amount)}</span>
-                      </div>
-                    );
-                  })}
-                </div>
+                {selectedVendor.monthly_breakdown.length === 0 ? (
+                  <p className="text-xs text-slate-400">No outstanding balance.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2.5">
+                    {[...selectedVendor.monthly_breakdown].reverse().map((row) => {
+                      const styles = agingTierStyle(row.months_back);
+                      return (
+                        <div
+                          key={row.months_back}
+                          className={`${styles.bg} border ${styles.border} rounded-lg py-2.5 px-2 flex flex-col items-center gap-1 min-w-[64px]`}
+                        >
+                          <span className={`text-[9px] font-semibold uppercase tracking-wide whitespace-nowrap ${styles.labelText}`}>{row.label}</span>
+                          <span className={`text-[11px] font-bold font-mono ${styles.text}`}>{formatINRAbbr(row.amount)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               {/* Per-month breakdown, oldest -> newest — same monthly_breakdown

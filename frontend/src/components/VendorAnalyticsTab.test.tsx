@@ -28,14 +28,14 @@ const dashboardFixture = {
       oldest_bucket_months_back: 1,
       oldest_bucket_amount: 4000,
       history: THREE_MONTHS.map((month, i) => ({ month, payable: 1000 * (i + 1), payment: 500 * (i + 1) })),
-      monthly_breakdown: THREE_MONTHS.map((month, i) => ({
-        months_back: THREE_MONTHS.length - 1 - i,
-        month,
-        label: month,
-        amount: 111 * (i + 1),
-        payable: 222 * (i + 1),
-        payment: 333 * (i + 1),
-      })),
+      // Oldest -> newest (months_back descending to 0), real day-range
+      // labels — same shape backend/shared/aging.py's compute_vendor_aging
+      // actually returns, not a placeholder.
+      monthly_breakdown: THREE_MONTHS.map((month, i) => {
+        const monthsBack = THREE_MONTHS.length - 1 - i; // 2, 1, 0
+        const label = monthsBack === 0 ? '0-30' : monthsBack === 1 ? '31-60' : '61-90';
+        return { months_back: monthsBack, month, label, amount: 1000 * (i + 1), payable: 2000 * (i + 1), payment: 3000 * (i + 1) };
+      }),
     },
     {
       vendor_id: 2,
@@ -165,16 +165,68 @@ describe('VendorAnalyticsTab', () => {
     expect(screen.queryByText(/oldest bucket concentration/i)).not.toBeInTheDocument();
   });
 
-  it('opening a vendor detail shows its aging buckets side by side with amounts', async () => {
+  it('opening a vendor detail shows EVERY real aging bucket (not a fixed 5), with amounts', async () => {
+    // Real bug (this task): the modal's Aging row used to be hardcoded to
+    // exactly 5 boxes (0-30/31-60/61-90/91-120/120+) sourced from the
+    // coarse aging_buckets summary — so anything 4+ months back was
+    // silently lumped into one "120+" box, which also had an invisible
+    // label (label text color == box background color). It's now sourced
+    // from monthly_breakdown, one box per real bucket, newest first.
     render(<VendorAnalyticsTab />);
     await userEvent.click(await screen.findByText('Acme Traders'));
 
     await screen.findByText('Monthly Breakdown');
     const modal = document.querySelector('.fixed.inset-0') as HTMLElement;
+    // Scoped to the Aging row itself, not the whole modal — the Monthly
+    // Breakdown table below shows the SAME row.amount values (just via
+    // formatINR instead of formatINRAbbr, which render identically under
+    // ₹1 lakh), so an unscoped query would match twice.
+    const agingRow = within(modal).getByText('0-30').closest('.flex-wrap') as HTMLElement;
+    expect(within(agingRow).getByText('31-60')).toBeInTheDocument();
+    expect(within(agingRow).getByText('61-90')).toBeInTheDocument(); // the old row would never show this — always capped at 5 fixed labels
+    expect(within(agingRow).getByText('₹3,000')).toBeInTheDocument(); // newest (0-30)
+    expect(within(agingRow).getByText('₹2,000')).toBeInTheDocument(); // 31-60
+    expect(within(agingRow).getByText('₹1,000')).toBeInTheDocument(); // oldest (61-90)
+  });
+
+  it('opening a vendor detail with more than 5 real months of aging shows all of them, oldest last', async () => {
+    const manyMonths = Array.from({ length: 7 }, (_, i) => `2026-0${(i % 9) + 1}-01`);
+    getAnalyticsDashboard.mockReset().mockResolvedValue({
+      ...dashboardFixture,
+      vendors: [
+        {
+          ...dashboardFixture.vendors[0],
+          monthly_breakdown: manyMonths.map((month, i) => {
+            const monthsBack = manyMonths.length - 1 - i; // 6..0 — well past the old 5-bucket cap
+            const label = monthsBack === 0 ? '0-30' : `${monthsBack * 30 + 1}-${(monthsBack + 1) * 30}`;
+            return { months_back: monthsBack, month, label, amount: 100 * (i + 1), payable: 0, payment: 0 };
+          }),
+        },
+        dashboardFixture.vendors[1],
+      ],
+    });
+    render(<VendorAnalyticsTab />);
+    await userEvent.click(await screen.findByText('Acme Traders'));
+
+    await screen.findByText('Monthly Breakdown');
+    const modal = document.querySelector('.fixed.inset-0') as HTMLElement;
+    // 7 real buckets, well past the old fixed 5 — every one of them present.
     expect(within(modal).getByText('0-30')).toBeInTheDocument();
     expect(within(modal).getByText('31-60')).toBeInTheDocument();
-    expect(within(modal).getByText('₹1,000')).toBeInTheDocument(); // Acme's 0-30 aging_buckets amount
-    expect(within(modal).getByText('₹4,000')).toBeInTheDocument(); // Acme's 31-60 aging_buckets amount
+    expect(within(modal).getByText('61-90')).toBeInTheDocument();
+    expect(within(modal).getByText('91-120')).toBeInTheDocument();
+    expect(within(modal).getByText('121-150')).toBeInTheDocument();
+    expect(within(modal).getByText('151-180')).toBeInTheDocument();
+    expect(within(modal).getByText('181-210')).toBeInTheDocument(); // the oldest bucket — never shown by the old fixed row
+  });
+
+  it('opening a vendor detail with no outstanding balance shows a plain message, not an empty row', async () => {
+    render(<VendorAnalyticsTab />);
+    await userEvent.click(await screen.findByText('Beta Corp'));
+
+    await screen.findByText('Monthly Breakdown');
+    const modal = document.querySelector('.fixed.inset-0') as HTMLElement;
+    expect(within(modal).getAllByText('No outstanding balance.').length).toBeGreaterThanOrEqual(1);
   });
 
   it('vendors table shows all 5 aging bucket columns with amounts, scrollable alongside the month columns', async () => {
